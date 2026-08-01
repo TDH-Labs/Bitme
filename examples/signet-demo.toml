@@ -1,0 +1,19 @@
+# Demo config for M1 manual testing. These are throwaway test keys (deterministic
+# dummy seeds), NOT real wallet keys - do not use for anything but local testing.
+network = "signet"
+timelock_blocks = 12960
+
+[keys.satochip]
+master_fingerprint = "4ba43603"
+derivation_path = "48h/1h/0h/2h"
+xpub = "tpubDDwf2gdFxFahr9RUtDQCuZmsx34CfdZ7RALAirwC2FGeLBzW1TDiEpqFeRdxLdZD7rfsbZHYwSaT6CLM3TAcYRw6xfRv4U6KCQt4Zuhvjkz"
+
+[keys.server]
+master_fingerprint = "8dfc9b34"
+derivation_path = "48h/1h/0h/2h"
+xpub = "tpubDEXiq2SVhhqALktxfVFgj3C9M3T2G7xL11iezYg2LJAf245YkNyqp2K9TrvHABDCp2232k34UegU4aKEtUZNigit8EEqoLNe2JKMzMiLwYq"
+
+[keys.mobile]
+master_fingerprint = "56c4fac3"
+derivation_path = "48h/1h/0h/2h"
+xpub = "tpubDEg3kqr2jo5ergkJbFqRHvCpiob7wR7Hi44J7y987G1JZfbzBND77XKTyPZzGvh3uyDf8kexMJnFD9W8FuraJ4wLMsx6YuZVXRSRRcx6QdD"
