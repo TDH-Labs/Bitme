@@ -52,12 +52,21 @@ pub enum OutputKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpendingPath {
-    /// Every input is consistent only with SATOCHIP + SERVER signing immediately.
+    /// Every input's nSequence is too low to satisfy `older(N)`, so the only combination that
+    /// can possibly spend it is SATOCHIP + SERVER. This is the only path this service
+    /// currently co-signs.
     Hot,
-    /// Every input is consistent only with SATOCHIP + MOBILE signing after the timelock.
+    /// Every input's nSequence satisfies `older(N)` and a MOBILE signature is already present,
+    /// so this is one of the two recovery combinations - either SATOCHIP + MOBILE (this
+    /// service isn't needed at all) or MOBILE + SERVER (the lost-SATOCHIP path).
+    ///
+    /// This service refuses to co-sign these today: it fails closed. Co-signing the
+    /// MOBILE + SERVER combination is what makes a destroyed SATOCHIP survivable, and it needs
+    /// its own policy (a full-balance sweep is the legitimate use, so the ordinary per-tx caps
+    /// are the wrong gate) - see the README's roadmap.
     Recovery,
     /// Inputs disagree, or at least one input's PSBT state (partial sigs + nSequence) so far
-    /// doesn't yet rule out either path. Refuse to guess.
+    /// doesn't yet rule out more than one combination. Refuse to guess.
     Ambiguous,
 }
 
@@ -243,9 +252,10 @@ fn classify_input_path(
     let older_satisfied = Satisfier::<bitcoin::PublicKey>::check_older(&sequence, required);
 
     if !older_satisfied {
-        // The RECOVERY branch's `older(N)` check is a consensus-level constraint on this
-        // input's nSequence: if it isn't met, no witness for that branch can ever be valid,
-        // regardless of what gets signed. HOT has no such constraint.
+        // `older(N)` guards the whole MOBILE branch, and it's a consensus-level constraint on
+        // this input's nSequence: if it isn't met, no witness using MOBILE can ever be valid,
+        // regardless of what gets signed. That leaves SATOCHIP + SERVER as the only possible
+        // combination, so this is unambiguously HOT.
         return InputPath::Hot;
     }
 

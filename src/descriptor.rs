@@ -1,14 +1,30 @@
 //! Constructs and parses the wallet's miniscript descriptor.
 //!
-//! Policy (see README for the derivation): SATOCHIP is required for every spend. It is paired
-//! either with SERVER for an immediate ("HOT") spend, or with MOBILE after a relative timelock
-//! for the ("RECOVERY") spend that lets the user move funds even if this service is gone:
+//! Policy: **any two of the three keys can spend, but any spend involving the MOBILE key waits
+//! `N` blocks.**
 //!
-//!   wsh(and_v(v:pk(SATOCHIP),or_d(pk(SERVER),and_v(v:pk(MOBILE),older(N)))))
+//!   wsh(thresh(2,pk(SATOCHIP),s:pk(SERVER),snj:and_v(v:pk(MOBILE),older(N))))
 //!
-//! This mirrors the two-of-three structure described in LedgerHQ/resigner's README
-//! (`and_v(v:pk(user),or_d(pk(service),older(N)))`), extended so the recovery branch also
-//! requires MOBILE rather than SATOCHIP alone - our recovery path is 2-of-2, not 1-of-1.
+//! Which gives exactly three spending combinations:
+//!
+//!   - SATOCHIP + SERVER, immediately - the "HOT" path, and the only one this service
+//!     co-signs on demand, subject to the policy engine.
+//!   - SATOCHIP + MOBILE, after `N` blocks - recovery when *this service* is gone.
+//!   - MOBILE + SERVER, after `N` blocks - recovery when the *SATOCHIP* is gone.
+//!
+//! That third combination is the reason for this shape. An earlier revision made SATOCHIP
+//! mandatory in both branches
+//! (`and_v(v:pk(SATOCHIP),or_d(pk(SERVER),and_v(v:pk(MOBILE),older(N))))`), which meant losing
+//! the SATOCHIP seed lost the funds outright - a single point of catastrophic failure with no
+//! recourse. Every single-device loss is now survivable, which is the property Bitkey's 2-of-3
+//! has and that one lacked.
+//!
+//! The timelock on the MOBILE branch is what keeps this service meaningful: the *only* way to
+//! spend without waiting `N` blocks is SATOCHIP + SERVER, so the policy engine cannot be
+//! side-stepped for day-to-day spending. And unlike Bitkey - whose "Delay & Notify" waiting
+//! period is enforced by their server and therefore evaporates if that server is compromised or
+//! shut down - this delay is a consensus rule. It holds even if this service is rooted, seized,
+//! or deleted.
 
 use std::str::FromStr;
 
@@ -44,9 +60,15 @@ fn key_expr(key: &KeySpec) -> Result<String> {
     }
 }
 
-/// Builds the raw descriptor string `wsh(and_v(v:pk(A),or_d(pk(B),and_v(v:pk(C),older(N)))))`
-/// from three already-formatted key expressions. Shared by the production builder and by
-/// tests, so the policy shape used in tests can never drift from the one actually deployed.
+/// Builds the raw descriptor string
+/// `wsh(thresh(2,pk(A),s:pk(B),snj:and_v(v:pk(C),older(N))))` from three already-formatted key
+/// expressions. Shared by the production builder and by tests, so the policy shape used in
+/// tests can never drift from the one actually deployed.
+///
+/// The `s:`/`snj:` wrappers are miniscript type-system coercions (`thresh` needs every branch
+/// to leave a 0-or-1 on the stack); this exact form is what rust-miniscript's own policy
+/// compiler emits for `thresh(2,pk(A),pk(B),and(pk(C),older(N)))`, kept literal here so the
+/// deployed script is deterministic rather than dependent on a compiler's cost heuristics.
 pub fn policy_string(
     satochip_expr: &str,
     server_expr: &str,
@@ -54,7 +76,7 @@ pub fn policy_string(
     timelock_blocks: u16,
 ) -> String {
     format!(
-        "wsh(and_v(v:pk({satochip_expr}),or_d(pk({server_expr}),and_v(v:pk({mobile_expr}),older({timelock_blocks})))))"
+        "wsh(thresh(2,pk({satochip_expr}),s:pk({server_expr}),snj:and_v(v:pk({mobile_expr}),older({timelock_blocks}))))"
     )
 }
 
@@ -289,9 +311,10 @@ mod tests {
 
         assert_eq!(built.multipath.desc_type(), DescriptorType::Wsh);
         let s = built.multipath.to_string();
-        assert!(s.starts_with("wsh(and_v(v:pk("), "got: {s}");
-        assert!(s.contains(",or_d(pk("), "got: {s}");
-        assert!(s.contains(",older(12960)))))"), "got: {s}");
+        assert!(s.starts_with("wsh(thresh(2,pk("), "got: {s}");
+        assert!(s.contains(",s:pk("), "got: {s}");
+        assert!(s.contains(",snj:and_v(v:pk("), "got: {s}");
+        assert!(s.contains(",older(12960))))"), "got: {s}");
         assert!(s.contains("<0;1>/*"), "got: {s}");
 
         // Round-trips through the parser byte-for-byte (proves it's a valid, canonical

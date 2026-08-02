@@ -1,7 +1,8 @@
 # Demo config for manual testing against a signet node. These are throwaway test keys
 # (deterministic dummy seeds), NOT real wallet keys - do not use for anything but local testing.
 network = "signet"
-timelock_blocks = 12960
+timelock_blocks = 4320          # ~30 days. See README: this is a CONSENSUS rule baked
+                                # into the address, so changing it later needs an on-chain sweep.
 
 [keys.satochip]
 master_fingerprint = "4ba43603"
