@@ -16,6 +16,7 @@ use std::io::{BufRead, Write};
 
 use anyhow::{bail, Context, Result};
 use bitcoin::bip32::{DerivationPath, Xpub};
+use nostr_sdk::prelude::FromBech32;
 
 use crate::config::ChainNetwork;
 
@@ -70,6 +71,19 @@ pub struct NotifyAnswer {
 }
 
 #[derive(Debug, Clone)]
+pub enum NostrNsecAnswer {
+    File(String),
+    EnvVar(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct NostrTransportAnswer {
+    pub nsec: NostrNsecAnswer,
+    pub relays: Vec<String>,
+    pub allowed_npubs: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct WizardAnswers {
     pub network: ChainNetwork,
     pub timelock_blocks: u16,
@@ -86,6 +100,10 @@ pub struct WizardAnswers {
     pub notify: NotifyAnswer,
     pub recovery_hold_seconds: i64,
     pub recovery_destination_whitelist: Option<Vec<String>>,
+    /// `None` means "not configured" - `cosigner serve` just runs HTTP only, same as an absent
+    /// `[nostr_transport]` section. Optional and off by default in the wizard itself: setting it
+    /// up needs relay URLs and device npubs the user may not have decided on yet.
+    pub nostr_transport: Option<NostrTransportAnswer>,
 }
 
 // --- low-level prompt primitives -------------------------------------------------------------
@@ -211,6 +229,62 @@ fn prompt_optional_list<R: BufRead, W: Write>(
         return Ok(None);
     }
     Ok(Some(raw.split(',').map(|s| s.trim().to_string()).collect()))
+}
+
+/// Like [`prompt_optional_list`], but loops until at least one non-empty entry is given - for
+/// lists where "none" isn't a valid answer (relay URLs, allowed npubs).
+fn prompt_required_list<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    label: &str,
+) -> Result<Vec<String>> {
+    loop {
+        let raw = prompt(input, output, &format!("{label} (comma-separated)"), None)?;
+        let items: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !items.is_empty() {
+            return Ok(items);
+        }
+        writeln!(output, "  at least one is required")?;
+    }
+}
+
+/// Like [`prompt_required_list`], but re-prompts the whole list until every entry passes
+/// `validate` - catching a typo'd relay URL or npub before the wizard finishes, same as the
+/// per-field validation above.
+fn prompt_required_list_validated<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    label: &str,
+    validate: impl Fn(&str) -> Result<(), String>,
+) -> Result<Vec<String>> {
+    loop {
+        let items = prompt_required_list(input, output, label)?;
+        match items
+            .iter()
+            .find_map(|item| validate(item).err().map(|e| (item.clone(), e)))
+        {
+            Some((bad, err)) => writeln!(output, "  {bad:?}: {err}")?,
+            None => return Ok(items),
+        }
+    }
+}
+
+fn validate_relay_url(v: &str) -> Result<(), String> {
+    if v.starts_with("wss://") || v.starts_with("ws://") {
+        Ok(())
+    } else {
+        Err("relay URLs should start with wss:// (or ws:// for a local/test relay)".to_string())
+    }
+}
+
+fn validate_npub(v: &str) -> Result<(), String> {
+    nostr_sdk::PublicKey::from_bech32(v.trim())
+        .map(|_| ())
+        .map_err(|e| format!("not a valid npub: {e}"))
 }
 
 fn validate_fingerprint(v: &str) -> Result<(), String> {
@@ -505,6 +579,52 @@ pub fn run_interactive<R: BufRead, W: Write>(
     let recovery_destination_whitelist =
         prompt_optional_list(input, output, "Recovery destination whitelist addresses")?;
 
+    writeln!(
+        output,
+        "\n-- Nostr transport (optional - an alternate, authenticated front door for the same \
+         API, no open port needed) --"
+    )?;
+    let enable_nostr = prompt_choice(input, output, "Enable it now?", &["y", "n"], "n")?;
+    let nostr_transport = if enable_nostr == "y" {
+        let signing_kind = prompt_choice(
+            input,
+            output,
+            "Where does this service's Nostr nsec live?",
+            &["file", "env"],
+            "env",
+        )?;
+        let nsec = if signing_kind == "file" {
+            NostrNsecAnswer::File(prompt(
+                input,
+                output,
+                "Path to the nsec file",
+                Some("/etc/cosigner/nostr.nsec"),
+            )?)
+        } else {
+            NostrNsecAnswer::EnvVar(prompt(
+                input,
+                output,
+                "Environment variable holding the nsec",
+                Some("COSIGNER_NOSTR_NSEC"),
+            )?)
+        };
+        let relays =
+            prompt_required_list_validated(input, output, "Relay URLs", validate_relay_url)?;
+        let allowed_npubs = prompt_required_list_validated(
+            input,
+            output,
+            "Allowed npubs (one per device that may submit requests)",
+            validate_npub,
+        )?;
+        Some(NostrTransportAnswer {
+            nsec,
+            relays,
+            allowed_npubs,
+        })
+    } else {
+        None
+    };
+
     Ok(WizardAnswers {
         network,
         timelock_blocks,
@@ -521,6 +641,7 @@ pub fn run_interactive<R: BufRead, W: Write>(
         notify,
         recovery_hold_seconds,
         recovery_destination_whitelist,
+        nostr_transport,
     })
 }
 
@@ -653,6 +774,23 @@ pub fn render_toml(a: &WizardAnswers) -> String {
         ),
     }
 
+    if let Some(nostr) = &a.nostr_transport {
+        out.push_str("\n# Alternate front door for the same HTTP API, over Nostr NIP-17 private\n");
+        out.push_str("# messages - no open port needed. Every sender is cryptographically\n");
+        out.push_str("# verified before allowed_npubs is even consulted; removing an npub here\n");
+        out.push_str("# is how a lost or stolen device is cut off.\n");
+        out.push_str("[nostr_transport]\n");
+        match &nostr.nsec {
+            NostrNsecAnswer::File(path) => out.push_str(&format!("nsec_file = \"{path}\"\n")),
+            NostrNsecAnswer::EnvVar(var) => out.push_str(&format!("nsec_env_var = \"{var}\"\n")),
+        }
+        out.push_str(&format!("relays = {}\n", toml_list(&nostr.relays)));
+        out.push_str(&format!(
+            "allowed_npubs = {}\n",
+            toml_list(&nostr.allowed_npubs)
+        ));
+    }
+
     out
 }
 
@@ -702,6 +840,7 @@ mod tests {
             },
             recovery_hold_seconds: 172_800,
             recovery_destination_whitelist: None,
+            nostr_transport: None,
         }
     }
 
@@ -801,6 +940,7 @@ mod tests {
             "",                           // renotify_interval_seconds -> default
             "",                           // recovery hold_seconds -> default
             "",                           // recovery whitelist -> none
+            "",                           // enable nostr transport -> default "n"
         ]
         .join("\n")
             + "\n";
@@ -808,6 +948,10 @@ mod tests {
         let mut input = Cursor::new(script.into_bytes());
         let mut output: Vec<u8> = Vec::new();
         let answers = run_interactive(&mut input, &mut output).expect("wizard should complete");
+        assert!(
+            answers.nostr_transport.is_none(),
+            "declining nostr_transport should leave it unset"
+        );
 
         let text = render_toml(&answers);
         let cfg: crate::config::WalletConfig = toml::from_str(&text).expect("valid TOML");
@@ -851,5 +995,133 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value, "4ba43603");
+    }
+
+    /// A real, freshly-generated npub - not a hand-typed bech32 string, so its checksum is
+    /// guaranteed valid rather than trusted by eye.
+    fn sample_npub() -> String {
+        use nostr_sdk::prelude::ToBech32;
+        nostr_sdk::Keys::generate()
+            .public_key()
+            .to_bech32()
+            .unwrap()
+    }
+
+    #[test]
+    fn nostr_transport_renders_and_validates_when_present() {
+        let mut answers = sample_answers();
+        answers.nostr_transport = Some(NostrTransportAnswer {
+            nsec: NostrNsecAnswer::EnvVar("COSIGNER_NOSTR_NSEC".to_string()),
+            relays: vec![
+                "wss://relay.damus.io".to_string(),
+                "wss://nos.lol".to_string(),
+            ],
+            allowed_npubs: vec![sample_npub()],
+        });
+        let text = render_toml(&answers);
+        assert!(text.contains("[nostr_transport]"));
+        assert!(text.contains("nsec_env_var = \"COSIGNER_NOSTR_NSEC\""));
+        assert!(text.contains("relays = [\"wss://relay.damus.io\", \"wss://nos.lol\"]"));
+
+        let cfg: crate::config::WalletConfig = toml::from_str(&text).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.nostr_transport.is_some());
+    }
+
+    #[test]
+    fn absent_nostr_transport_renders_no_section() {
+        let text = render_toml(&sample_answers());
+        assert!(!text.contains("[nostr_transport]"));
+    }
+
+    #[test]
+    fn interactive_wizard_can_enable_nostr_transport() {
+        let (satochip, _) = crate::test_util::test_key_spec_with_xpriv(0x01);
+        let (mobile, _) = crate::test_util::test_key_spec_with_xpriv(0x02);
+        let (server, _) = crate::test_util::test_key_spec_with_xpriv(0x03);
+        let npub = sample_npub();
+
+        // Same prefix as `interactive_wizard_produces_a_validating_config_when_every_default_is_accepted`
+        // (every field up through "recovery whitelist" via defaults), then diverges to actually
+        // enable and fill in [nostr_transport].
+        let script = [
+            "",                                    // network -> default signet
+            "4320",                                // timelock
+            &satochip.master_fingerprint,          // SATOCHIP fingerprint
+            "",                                    // SATOCHIP path -> default
+            &satochip.xpub,                        // SATOCHIP xpub
+            &mobile.master_fingerprint,            // MOBILE fingerprint
+            "",                                    // MOBILE path -> default
+            &mobile.xpub,                          // MOBILE xpub
+            &server.master_fingerprint,            // SERVER fingerprint
+            "",                                    // SERVER path -> default
+            &server.xpub,                          // SERVER xpub
+            "",                                    // server_signing kind -> default "file"
+            "",                                    // xprv file path -> default
+            "",                                    // bitcoind rpc url -> default
+            "",                                    // bitcoind auth kind -> default "cookie"
+            "/home/bitcoin/.cookie",               // cookie path
+            "",                                    // bind_addr -> default
+            "",                                    // gap_limit -> default
+            "",                                    // ledger_db_path -> default
+            "",                                    // max_tx_sat -> default
+            "",                                    // max_daily_sat -> default
+            "",                                    // max_weekly_sat -> default
+            "",                                    // max_monthly_sat -> default
+            "",                                    // max_fee_sat -> default
+            "",                                    // max_fee_rate -> default
+            "",                                    // policy whitelist -> none
+            "",                                    // notify channel -> default "ntfy"
+            "",                                    // ntfy url -> default
+            "",                                    // ntfy auth token -> none
+            "",                                    // notify hold_seconds -> default
+            "",                                    // sweep_interval_seconds -> default
+            "",                                    // renotify_interval_seconds -> default
+            "",                                    // recovery hold_seconds -> default
+            "",                                    // recovery whitelist -> none
+            "y",                                   // enable nostr transport
+            "",                                    // nsec source -> default "env"
+            "",                                    // env var name -> default COSIGNER_NOSTR_NSEC
+            "wss://relay.damus.io, wss://nos.lol", // relays
+            &npub,                                 // allowed npub
+        ]
+        .join("\n")
+            + "\n";
+
+        let mut input = Cursor::new(script.into_bytes());
+        let mut output: Vec<u8> = Vec::new();
+        let answers = run_interactive(&mut input, &mut output).expect("wizard should complete");
+
+        let nostr = answers
+            .nostr_transport
+            .as_ref()
+            .expect("should have enabled nostr_transport");
+        assert_eq!(nostr.relays.len(), 2);
+        assert_eq!(nostr.allowed_npubs.len(), 1);
+
+        let text = render_toml(&answers);
+        let cfg: crate::config::WalletConfig = toml::from_str(&text).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn invalid_relay_url_reprompts_the_whole_list() {
+        let script = "not-a-relay\nwss://relay.damus.io\n";
+        let mut input = Cursor::new(script.as_bytes());
+        let mut output: Vec<u8> = Vec::new();
+        let relays =
+            prompt_required_list_validated(&mut input, &mut output, "relays", validate_relay_url)
+                .unwrap();
+        assert_eq!(relays, vec!["wss://relay.damus.io".to_string()]);
+    }
+
+    #[test]
+    fn invalid_npub_reprompts_the_whole_list() {
+        let script = format!("not-an-npub\n{}\n", sample_npub());
+        let mut input = Cursor::new(script.as_bytes());
+        let mut output: Vec<u8> = Vec::new();
+        let npubs = prompt_required_list_validated(&mut input, &mut output, "npubs", validate_npub)
+            .unwrap();
+        assert_eq!(npubs.len(), 1);
     }
 }

@@ -27,6 +27,9 @@ services:
       BITCOIND_RPC_USER: "${BITCOIND_RPC_USER:-}"
       BITCOIND_RPC_PASSWORD: "${BITCOIND_RPC_PASSWORD:-}"
       BITCOIND_RPC_COOKIE_FILE: "${BITCOIND_RPC_COOKIE_FILE:-}"
+      # Only read if wallet.toml has [nostr_transport] with nsec_env_var set to this same
+      # name - optional, so left empty by default rather than required like the vars above.
+      COSIGNER_NOSTR_NSEC: "${COSIGNER_NOSTR_NSEC:-}"
 
 volumes:
   cosigner-data:
