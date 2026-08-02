@@ -79,8 +79,9 @@ hold_seconds = 172800           # 48h of notify-and-veto before a no-hardware sp
 # Optional alternate front door for the same HTTP API, over Nostr NIP-17 private messages
 # instead of an open port - no inbound port, no domain, no certificate. Every message's sender
 # is cryptographically verified before allowed_npubs is even consulted; removing an npub here
-# is how a lost or stolen device is cut off.
+# is how a lost or stolen device is cut off. nsec_file (not nsec_env_var) here - like
+# server.xprv above, Umbrel has no per-app secret-entry UI, so this is a mounted file too.
 # [nostr_transport]
-# nsec_env_var = "COSIGNER_NOSTR_NSEC"
+# nsec_file = "/data/config/nostr.nsec"
 # relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.snort.social"]
 # allowed_npubs = ["npub1..."]  # one entry per device allowed to submit requests

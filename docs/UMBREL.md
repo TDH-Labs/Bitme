@@ -125,6 +125,25 @@ The full command set (`recovery-kit publish/fetch/import`, `migrate-build-sweep`
 is the same as [`docs/DOCKER.md`](DOCKER.md) - only the invocation shape (`docker run` with
 explicit mounts, not `docker compose run`) differs here.
 
+## Optional: the Nostr transport
+
+`[nostr_transport]` gives the service its own Nostr identity, receiving signing requests as
+NIP-17 private messages instead of (or alongside) plain HTTP - see the README's "Where Nostr
+fits" section. Umbrel has no per-app secret-entry UI, so - same as `server.xprv` above - this
+service's Nostr secret key goes in as a third mounted file, not an environment variable:
+
+```sh
+ssh umbrel@umbrel.local
+cd ~/umbrel/app-data/bitme-cosigner/data
+$EDITOR config/nostr.nsec   # just the nsec, nothing else
+chmod 600 config/nostr.nsec
+$EDITOR config/wallet.toml  # uncomment [nostr_transport]; nsec_file = "/data/config/nostr.nsec"
+```
+
+Then restart the app from the Umbrel dashboard. Removing a device's npub from
+`allowed_npubs` and restarting is how you cut it off - its messages are still cryptographically
+genuine, they're just no longer answered.
+
 ## Updating
 
 Umbrel's App Store update mechanism handles pulling new versions of this repo; since the app is

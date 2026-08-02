@@ -83,7 +83,8 @@ hold_seconds = 172800           # 48h of notify-and-veto before a no-hardware sp
 # Optional alternate front door for the same HTTP API, over Nostr NIP-17 private messages
 # instead of an open port - no inbound port, no domain, no certificate. Every message's sender
 # is cryptographically verified before allowed_npubs is even consulted; removing an npub here
-# is how a lost or stolen device is cut off.
+# is how a lost or stolen device is cut off. If you set nsec_env_var here, also set
+# COSIGNER_NOSTR_NSEC in .env - docker-compose.yml only passes through variables it knows about.
 # [nostr_transport]
 # nsec_env_var = "COSIGNER_NOSTR_NSEC"
 # relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.snort.social"]

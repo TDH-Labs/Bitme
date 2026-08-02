@@ -154,6 +154,25 @@ descriptor, or a block explorer - this command doesn't scan for them itself. Sig
 still goes through the normal channels: SATOCHIP/MOBILE's own apps, then this service's usual
 `/sign_psbt` for the SERVER co-sign.
 
+## 3c. Optional: the Nostr transport
+
+`[nostr_transport]` in `config/wallet.toml` gives the service its own Nostr identity, receiving
+signing requests as NIP-17 private messages instead of (or alongside) plain HTTP - see the
+README's "Where Nostr fits" section for why. To turn it on:
+
+1. Generate a Nostr keypair for this service (any Nostr client can do this - it's just a
+   secp256k1 keypair, same shape as Bitcoin's).
+2. Set `COSIGNER_NOSTR_NSEC` in `.env` to the resulting nsec - `docker-compose.yml` passes it
+   through to the container as an optional variable, same mechanism as `COSIGNER_SERVER_XPRV`.
+3. Uncomment `[nostr_transport]` in `config/wallet.toml`, leaving `nsec_env_var =
+   "COSIGNER_NOSTR_NSEC"` as-is, and fill in your relays and the npub(s) of whichever devices
+   should be allowed to submit requests this way.
+4. Recreate the container so it picks up the new `.env` value: `docker compose up -d` (no
+   `--build` needed - nothing about the image itself changed).
+
+Removing a device's npub from `allowed_npubs` and restarting is how you cut it off - its
+messages are still cryptographically genuine, they're just no longer answered.
+
 ## 4. Validate the descriptor before starting the server
 
 ```sh

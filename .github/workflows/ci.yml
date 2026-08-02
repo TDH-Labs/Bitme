@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build, unit test, lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (lib, bin, tests)
+        run: cargo build --all-targets
+
+      - name: Unit tests
+        run: cargo test --lib
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --check
+
+  regtest:
+    name: Regtest integration tests
+    runs-on: ubuntu-latest
+    # Same image already used by docker-compose.signet.yml and
+    # bitme-cosigner/docker-compose.simulate-umbrel.yml, so its BITCOIN_NETWORK/
+    # BITCOIN_EXTRA_ARGS interface is already relied on elsewhere in this repo, not introduced
+    # fresh here.
+    services:
+      bitcoind:
+        image: btcpayserver/bitcoin:29.2
+        env:
+          BITCOIN_NETWORK: regtest
+          BITCOIN_EXTRA_ARGS: |
+            server=1
+            rpcbind=0.0.0.0
+            rpcallowip=0.0.0.0/0
+            rpcuser=cosigner
+            rpcpassword=cosigner
+            fallbackfee=0.0001
+        ports:
+          - 18443:18443
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Wait for bitcoind RPC
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sS --user cosigner:cosigner \
+                --data-binary '{"jsonrpc":"1.0","id":"ci","method":"getblockchaininfo","params":[]}' \
+                -H 'content-type: text/plain;' http://127.0.0.1:18443/ >/dev/null 2>&1; then
+              echo "bitcoind is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "bitcoind did not become ready in time" >&2
+          exit 1
+
+      # Both integration test files gracefully skip (not fail) without COSIGNER_REGTEST_RPC_URL
+      # set - see tests/common/mod.rs - so this job only ever adds coverage, never blocks on a
+      # missing node. Run together, single-threaded: both files share the same live node/mempool,
+      # and running them as concurrent processes against it would race.
+      - name: Regtest integration tests
+        env:
+          COSIGNER_REGTEST_RPC_URL: http://127.0.0.1:18443
+          COSIGNER_REGTEST_RPC_USER: cosigner
+          COSIGNER_REGTEST_RPC_PASSWORD: cosigner
+        run: cargo test --test regtest_inspect --test regtest_full_flow -- --test-threads=1
