@@ -9,6 +9,8 @@ use cosigner::descriptor::{self, BuiltDescriptor};
 use cosigner::http::{self, AppState};
 use cosigner::invariants::{self, InvariantReport, LabeledKey};
 use cosigner::ledger::Ledger;
+use cosigner::notify::{MultiNotifier, Notifier};
+use cosigner::sign;
 use cosigner::signing::ServerSigningKey;
 use miniscript::descriptor::DefiniteDescriptorKey;
 use miniscript::{Descriptor, DescriptorPublicKey, ForEachKey};
@@ -92,9 +94,12 @@ fn run() -> Result<()> {
 }
 
 fn cmd_serve(args: ServeArgs) -> Result<()> {
+    tracing_subscriber::fmt::init();
+
     let cfg = WalletConfig::load(&args.config)?;
     let (bitcoind_cfg, server_cfg) = cfg.require_server_config()?;
     let (policy_cfg, signing_cfg) = cfg.require_signing_config()?;
+    let notify_cfg = cfg.require_notify_config()?;
     let ledger_db_path = server_cfg
         .ledger_db_path
         .clone()
@@ -108,6 +113,10 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
 
     let server_key = ServerSigningKey::load(signing_cfg, &cfg.keys.server.xpub, cfg.network)?;
     let policy = Arc::new(policy_cfg.compile(cfg.network)?);
+    let notifier: Arc<dyn Notifier> =
+        Arc::new(MultiNotifier::from_config(notify_cfg).context("configuring [notify] channels")?);
+    let hold_seconds = notify_cfg.hold_seconds;
+    let sweep_interval = std::time::Duration::from_secs(notify_cfg.sweep_interval_seconds.max(1));
 
     let client = bitcoind_client(bitcoind_cfg)?;
     let chain: Arc<dyn ChainSource> = Arc::new(BitcoindRpc::new(client));
@@ -119,18 +128,33 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
         .build()
         .context("starting tokio runtime")?;
     rt.block_on(async move {
-        let ledger = Ledger::connect(&ledger_db_path)
-            .await
-            .with_context(|| format!("opening ledger at {ledger_db_path}"))?;
+        let ledger = Arc::new(
+            Ledger::connect(&ledger_db_path)
+                .await
+                .with_context(|| format!("opening ledger at {ledger_db_path}"))?,
+        );
         let state = AppState {
             wallet: Arc::new(wallet),
             cfg: Arc::new(cfg.clone()),
-            chain,
+            chain: chain.clone(),
             gap_limit,
             server_key: Arc::new(server_key),
-            ledger: Arc::new(ledger),
-            policy,
+            ledger: ledger.clone(),
+            policy: policy.clone(),
+            notifier,
+            hold_seconds,
         };
+
+        spawn_sweeper(
+            state.ledger.clone(),
+            state.wallet.clone(),
+            state.cfg.clone(),
+            state.server_key.clone(),
+            state.policy.clone(),
+            chain,
+            gap_limit,
+            sweep_interval,
+        );
 
         let listener = tokio::net::TcpListener::bind(&bind_addr)
             .await
@@ -143,6 +167,56 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
             .await
             .context("http server")
     })
+}
+
+/// Runs `sign::sweep_due` on a fixed interval for as long as the server is up. Each pending
+/// spend's outcome is logged, not propagated - a failure processing one row (or even the
+/// sweep query itself, e.g. a transient DB hiccup) must never bring down the HTTP server or
+/// stop other rows from being retried on the next tick.
+#[allow(clippy::too_many_arguments)]
+fn spawn_sweeper(
+    ledger: Arc<Ledger>,
+    wallet: Arc<BuiltDescriptor>,
+    cfg: Arc<WalletConfig>,
+    server_key: Arc<ServerSigningKey>,
+    policy: Arc<cosigner::policy::CompiledPolicy>,
+    chain: Arc<dyn ChainSource>,
+    gap_limit: u32,
+    interval: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            let now = now_unix();
+            let results = sign::sweep_due(
+                &ledger,
+                &wallet,
+                &cfg,
+                &server_key,
+                &policy,
+                &chain,
+                gap_limit,
+                now,
+            )
+            .await;
+            for (txid, outcome) in results {
+                match outcome {
+                    Ok(outcome) => tracing::info!(txid, ?outcome, "processed pending signature"),
+                    Err(err) => {
+                        tracing::warn!(txid, error = %err, "failed to process pending signature (will retry)")
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before 1970")
+        .as_secs() as i64
 }
 
 fn bitcoind_client(cfg: &BitcoindConfig) -> Result<bitcoincore_rpc::Client> {

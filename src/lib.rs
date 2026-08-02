@@ -5,6 +5,7 @@ pub mod http;
 pub mod inspect;
 pub mod invariants;
 pub mod ledger;
+pub mod notify;
 pub mod policy;
 pub mod sign;
 pub mod signing;
