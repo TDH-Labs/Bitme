@@ -451,6 +451,10 @@ fn print_report(report: &InvariantReport, timelock_blocks: u16) {
         pass(report.timelock_boundary_holds)
     );
     println!(
+        "losing any ONE key is survivable (every pair can eventually spend): {}",
+        pass(report.every_pair_can_eventually_spend)
+    );
+    println!(
         "ALL INVARIANTS HOLD: {}",
         pass(report.all_invariants_hold())
     );

@@ -5,6 +5,9 @@
 //!   - exactly one 2-key subset can spend immediately (the HOT path)
 //!   - the remaining 2-key subset(s) can only spend after the configured relative timelock,
 //!     and not one block earlier (exact boundary, not "eventually")
+//!   - *every* 2-key subset can eventually spend - i.e. losing any single key is survivable.
+//!     This is the invariant that makes the wallet recoverable rather than merely secure, and
+//!     it's the one an earlier revision of this descriptor failed.
 //!
 //! This works by lifting the descriptor to rust-miniscript's abstract `Semantic` policy and
 //! using its `entails` algorithm ("every satisfaction of A is also a satisfaction of B") to ask,
@@ -42,6 +45,9 @@ pub struct InvariantReport {
     pub exactly_one_immediate_path: bool,
     pub at_least_one_timelocked_path: bool,
     pub timelock_boundary_holds: bool,
+    /// Every 2-key subset can spend, immediately or after the timelock - so the loss of any
+    /// single key still leaves a way to move the funds. See the module doc.
+    pub every_pair_can_eventually_spend: bool,
 }
 
 impl InvariantReport {
@@ -50,6 +56,7 @@ impl InvariantReport {
             && self.exactly_one_immediate_path
             && self.at_least_one_timelocked_path
             && self.timelock_boundary_holds
+            && self.every_pair_can_eventually_spend
     }
 }
 
@@ -143,13 +150,18 @@ pub fn verify_invariants(
         }
     }
 
+    let every_pair_can_eventually_spend = pairs
+        .iter()
+        .all(|p| p.spends_immediately || p.spends_after_timelock);
+
     Ok(InvariantReport {
         key_labels: keys.iter().map(|k| k.label.clone()).collect(),
-        no_single_key_can_spend,
         pairs,
+        no_single_key_can_spend,
         exactly_one_immediate_path: immediate_count == 1,
         at_least_one_timelocked_path: timelocked_count >= 1,
         timelock_boundary_holds: boundary_ok,
+        every_pair_can_eventually_spend,
     })
 }
 
@@ -228,24 +240,32 @@ mod tests {
             "HOT path (satochip+server) must spend immediately"
         );
 
-        let recovery = pair(&report, "satochip", "mobile");
+        // Recovery when THIS SERVICE is gone.
+        let no_server = pair(&report, "satochip", "mobile");
         assert!(
-            !recovery.spends_immediately,
-            "RECOVERY path must not spend immediately"
+            !no_server.spends_immediately,
+            "satochip+mobile must not bypass the policy engine by spending immediately"
         );
         assert!(
-            recovery.spends_after_timelock,
-            "RECOVERY path must spend after the timelock"
+            no_server.spends_after_timelock,
+            "satochip+mobile must spend after the timelock (server-loss recovery)"
         );
 
-        let excluded = pair(&report, "server", "mobile");
+        // Recovery when the SATOCHIP is gone - the property the previous descriptor lacked,
+        // and the whole reason for the redesign.
+        let no_hardware = pair(&report, "server", "mobile");
         assert!(
-            !excluded.spends_immediately,
-            "server+mobile must never spend: no SATOCHIP"
+            !no_hardware.spends_immediately,
+            "server+mobile must not spend immediately - no-hardware spends must wait"
         );
         assert!(
-            !excluded.spends_after_timelock,
-            "server+mobile must never spend, even after waiting: no SATOCHIP"
+            no_hardware.spends_after_timelock,
+            "server+mobile MUST spend after the timelock: losing the SATOCHIP must be survivable"
+        );
+
+        assert!(
+            report.every_pair_can_eventually_spend,
+            "losing any single key must be survivable: {report:?}"
         );
     }
 
@@ -337,19 +357,26 @@ mod tests {
         }
     }
 
+    /// The no-hardware recovery path, empirically: SERVER + MOBILE must be blocked before the
+    /// timelock and must work at it. This is what makes a destroyed SATOCHIP survivable.
     #[test]
-    fn server_and_mobile_witness_never_constructs_without_satochip() {
+    fn server_and_mobile_witness_constructs_only_after_the_timelock() {
         let satochip = test_signer(0x41);
         let server = test_signer(0x42);
         let mobile = test_signer(0x43);
-        let desc = concrete_descriptor(satochip.public, server.public, mobile.public, 12960);
-        let far_future = Sequence::from_height(u16::MAX);
+        let timelock = 4320u16;
+        let desc = concrete_descriptor(satochip.public, server.public, mobile.public, timelock);
 
         let mut sigs = HashMap::new();
         sigs.insert(server.public, test_signature(&server.secret));
         sigs.insert(mobile.public, test_signature(&mobile.secret));
-        desc.get_satisfaction((sigs, far_future))
-            .expect_err("server+mobile must never spend without SATOCHIP, even after waiting");
+
+        desc.get_satisfaction((sigs.clone(), Sequence::ZERO))
+            .expect_err("server+mobile must not spend immediately");
+        desc.get_satisfaction((sigs.clone(), Sequence::from_height(timelock - 1)))
+            .expect_err("server+mobile must not spend one block before the timelock");
+        desc.get_satisfaction((sigs, Sequence::from_height(timelock)))
+            .expect("server+mobile must spend exactly at the timelock: lost-SATOCHIP recovery");
     }
 
     #[test]
