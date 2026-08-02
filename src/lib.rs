@@ -8,6 +8,7 @@ pub mod ledger;
 pub mod notify;
 pub mod policy;
 pub mod policy_auth;
+pub mod recovery_kit;
 pub mod sign;
 pub mod signing;
 
