@@ -113,7 +113,12 @@ fn regtest_wallet_config() -> WalletConfig {
 /// `AppState` that `/inspect`-only tests still have to provide but don't exercise.
 async fn signing_test_fixtures(
     cfg: &WalletConfig,
-) -> (ServerSigningKey, Ledger, cosigner::policy::CompiledPolicy) {
+) -> (
+    ServerSigningKey,
+    Ledger,
+    u64,
+    cosigner::policy::CompiledPolicy,
+) {
     let (_, xprv) = key_spec_with_xpriv(SERVER_SEED, KEY_PATH);
     let env_var = format!("COSIGNER_TEST_SERVER_XPRV_{}", std::process::id());
     // SAFETY: test-only, single-threaded-per-process env var scoped to this process id.
@@ -137,8 +142,12 @@ async fn signing_test_fixtures(
         destination_whitelist: None,
     };
     let policy = policy_cfg.compile(cfg.network).unwrap();
+    let seeded = ledger
+        .load_or_seed_policy_state(&serde_json::to_string(&policy_cfg).unwrap(), 0)
+        .await
+        .unwrap();
 
-    (server_key, ledger, policy)
+    (server_key, ledger, seeded.version, policy)
 }
 
 /// Mines 101 blocks to a fresh node-wallet address (to mature coinbase funds), so the node
@@ -245,7 +254,7 @@ async fn inspect_recognizes_a_real_utxo_and_computes_fee_over_regtest() {
         .assume_checked();
     let psbt = unsigned_spend_psbt(outpoint, &prevout, &dest_address, Amount::from_sat(900_000));
 
-    let (server_key, ledger, policy) = signing_test_fixtures(&cfg).await;
+    let (server_key, ledger, policy_version, policy) = signing_test_fixtures(&cfg).await;
     let chain = std::sync::Arc::new(BitcoindRpc::new(node));
     let state = AppState {
         wallet: std::sync::Arc::new(wallet),
@@ -254,7 +263,10 @@ async fn inspect_recognizes_a_real_utxo_and_computes_fee_over_regtest() {
         gap_limit: GAP_LIMIT,
         server_key: std::sync::Arc::new(server_key),
         ledger: std::sync::Arc::new(ledger),
-        policy: std::sync::Arc::new(policy),
+        policy: std::sync::Arc::new(tokio::sync::RwLock::new(http::PolicyHandle {
+            version: policy_version,
+            compiled: policy,
+        })),
         notifier: std::sync::Arc::new(NoopNotifier),
         hold_seconds: 0,
     };
@@ -328,7 +340,7 @@ async fn inspect_rejects_an_input_not_derived_from_our_descriptor_over_regtest()
         .assume_checked();
     let psbt = unsigned_spend_psbt(outpoint, &prevout, &dest_address, Amount::from_sat(900_000));
 
-    let (server_key, ledger, policy) = signing_test_fixtures(&cfg).await;
+    let (server_key, ledger, policy_version, policy) = signing_test_fixtures(&cfg).await;
     let chain = std::sync::Arc::new(BitcoindRpc::new(node));
     let state = AppState {
         wallet: std::sync::Arc::new(wallet),
@@ -337,7 +349,10 @@ async fn inspect_rejects_an_input_not_derived_from_our_descriptor_over_regtest()
         gap_limit: GAP_LIMIT,
         server_key: std::sync::Arc::new(server_key),
         ledger: std::sync::Arc::new(ledger),
-        policy: std::sync::Arc::new(policy),
+        policy: std::sync::Arc::new(tokio::sync::RwLock::new(http::PolicyHandle {
+            version: policy_version,
+            compiled: policy,
+        })),
         notifier: std::sync::Arc::new(NoopNotifier),
         hold_seconds: 0,
     };

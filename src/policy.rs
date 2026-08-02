@@ -20,13 +20,15 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::Address;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::ChainNetwork;
 use crate::inspect::{InspectionReport, OutputKind};
 use crate::ledger::RollingTotals;
 
-#[derive(Debug, Clone, Deserialize)]
+/// Also `Serialize`, unlike most config-only structs in this crate: `policy_auth.rs` persists
+/// this exact shape as JSON in `policy_state` and echoes it back from `GET /policy`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PolicyConfig {
     pub max_tx_sat: u64,
     pub max_daily_sat: u64,

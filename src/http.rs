@@ -13,6 +13,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bitcoin::psbt::Psbt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 use crate::chain::ChainSource;
 use crate::config::WalletConfig;
@@ -20,9 +21,19 @@ use crate::descriptor::{BuiltDescriptor, Chain};
 use crate::inspect::{self, InspectError, InspectionReport, OutputKind, SpendingPath};
 use crate::ledger::{Ledger, PendingStatus};
 use crate::notify::Notifier;
-use crate::policy::CompiledPolicy;
+use crate::policy::{CompiledPolicy, PolicyConfig};
+use crate::policy_auth::{self, PolicyAuthError};
 use crate::sign::{self, LedgerOutcome, SignPsbtError, SubmitError, SubmitOutcome};
 use crate::signing::{ServerSigningKey, SigningError};
+
+/// The currently-effective policy plus the version it was authorized as - see `policy_auth.rs`.
+/// Held behind a lock in `AppState` so `POST /policy` can hot-swap it without a restart; every
+/// other handler takes a cheap read-locked snapshot (`CompiledPolicy` is `Clone`) rather than
+/// holding the lock across any `await`.
+pub struct PolicyHandle {
+    pub version: u64,
+    pub compiled: CompiledPolicy,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -32,10 +43,10 @@ pub struct AppState {
     pub gap_limit: u32,
     /// Only used by `/sign_psbt`.
     pub server_key: Arc<ServerSigningKey>,
-    /// Only used by `/sign_psbt`, `GET /sign_psbt/{id}` and `/veto/{id}`.
+    /// Only used by `/sign_psbt`, `GET /sign_psbt/{id}`, `/veto/{id}` and `/policy`.
     pub ledger: Arc<Ledger>,
-    /// Only used by `/sign_psbt`.
-    pub policy: Arc<CompiledPolicy>,
+    /// Only used by `/sign_psbt` and `/policy`.
+    pub policy: Arc<RwLock<PolicyHandle>>,
     /// Only used by `/sign_psbt`.
     pub notifier: Arc<dyn Notifier>,
     /// Only used by `/sign_psbt`. How long an approved spend is held (and vetoable) before the
@@ -49,6 +60,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sign_psbt", post(sign_psbt_handler))
         .route("/sign_psbt/{id}", get(get_sign_psbt_handler))
         .route("/veto/{id}", post(veto_handler))
+        .route("/policy", get(get_policy_handler).post(post_policy_handler))
         .with_state(state)
 }
 
@@ -349,6 +361,8 @@ async fn sign_psbt_handler(
     })?;
     let report: InspectionReport = report.map_err(ApiError::from)?;
 
+    // A cheap snapshot: never hold the policy lock across the `.await`s below.
+    let policy = state.policy.read().await.compiled.clone();
     let outcome = sign::submit_for_signing(
         psbt,
         report,
@@ -356,7 +370,7 @@ async fn sign_psbt_handler(
         &state.cfg,
         &state.server_key,
         &state.ledger,
-        &state.policy,
+        &policy,
         state.notifier.as_ref(),
         state.hold_seconds,
         now_unix(),
@@ -484,6 +498,103 @@ async fn veto_handler(
     .into_response())
 }
 
+#[derive(Debug, Serialize)]
+struct PolicyResponse {
+    version: u64,
+    #[serde(flatten)]
+    policy: PolicyConfig,
+}
+
+/// Re-expresses a compiled (network-checked) policy back in the plain `PolicyConfig` shape
+/// used by `GET`/`POST /policy` - the inverse of [`PolicyConfig::compile`].
+fn policy_response(version: u64, compiled: &CompiledPolicy) -> PolicyResponse {
+    PolicyResponse {
+        version,
+        policy: PolicyConfig {
+            max_tx_sat: compiled.max_tx_sat,
+            max_daily_sat: compiled.max_daily_sat,
+            max_weekly_sat: compiled.max_weekly_sat,
+            max_monthly_sat: compiled.max_monthly_sat,
+            max_fee_sat: compiled.max_fee_sat,
+            max_fee_rate_sat_per_vb: compiled.max_fee_rate_sat_per_vb,
+            destination_whitelist: compiled
+                .destination_whitelist
+                .as_ref()
+                .map(|addrs| addrs.iter().map(|a| a.to_string()).collect()),
+        },
+    }
+}
+
+impl From<PolicyAuthError> for ApiError {
+    fn from(e: PolicyAuthError) -> Self {
+        let status = match &e {
+            PolicyAuthError::VersionMismatch { .. } => StatusCode::CONFLICT,
+            PolicyAuthError::InvalidPolicy(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            PolicyAuthError::MalformedSignature(_) => StatusCode::BAD_REQUEST,
+            // The request is well-formed but its signature doesn't authorize the action.
+            PolicyAuthError::UnauthorizedSigner => StatusCode::FORBIDDEN,
+            PolicyAuthError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let error = match &e {
+            PolicyAuthError::VersionMismatch { .. } => "version_mismatch",
+            PolicyAuthError::InvalidPolicy(_) => "invalid_policy",
+            PolicyAuthError::MalformedSignature(_) => "malformed_signature",
+            PolicyAuthError::UnauthorizedSigner => "unauthorized_signer",
+            PolicyAuthError::Internal(_) => "internal",
+        };
+        ApiError {
+            status,
+            error,
+            message: e.to_string(),
+        }
+    }
+}
+
+/// The current policy and the version it's authorized as - the version a `POST /policy`
+/// request must target next (`version + 1`).
+async fn get_policy_handler(State(state): State<AppState>) -> Json<PolicyResponse> {
+    let handle = state.policy.read().await;
+    Json(policy_response(handle.version, &handle.compiled))
+}
+
+#[derive(Debug, Deserialize)]
+struct PolicyChangeRequestJson {
+    policy: PolicyConfig,
+    version: u64,
+    /// Base64-encoded standard Bitcoin signed message, produced by SATOCHIP, over the exact
+    /// text `policy_auth::canonical_message(version, &policy)` renders - see that function's
+    /// docs for the format a human needs to actually sign.
+    signature: String,
+}
+
+/// Applies a SATOCHIP-authorized policy change - see `policy_auth.rs`. On success, hot-swaps
+/// the policy every other handler reads, with no restart required.
+async fn post_policy_handler(
+    State(state): State<AppState>,
+    Json(req): Json<PolicyChangeRequestJson>,
+) -> Result<Json<PolicyResponse>, ApiError> {
+    let outcome = policy_auth::apply_policy_change(
+        &state.ledger,
+        &state.cfg,
+        state.gap_limit,
+        policy_auth::PolicyChangeRequest {
+            policy: req.policy,
+            version: req.version,
+            signature_base64: req.signature,
+        },
+        now_unix(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    let response = policy_response(outcome.version, &outcome.compiled);
+    *state.policy.write().await = PolicyHandle {
+        version: outcome.version,
+        compiled: outcome.compiled,
+    };
+    Ok(Json(response))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -505,7 +616,7 @@ mod tests {
     use crate::ledger::Ledger;
     use crate::notify::mock::RecordingNotifier;
     use crate::policy::PolicyConfig;
-    use crate::test_util::{test_server_xpriv, test_wallet_config};
+    use crate::test_util::{test_key_spec_with_xpriv, test_server_xpriv, test_wallet_config};
 
     static ENV_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -542,7 +653,7 @@ mod tests {
         )
         .unwrap();
 
-        let policy = PolicyConfig {
+        let policy_cfg = PolicyConfig {
             max_tx_sat: 100_000,
             max_daily_sat: u64::MAX,
             max_weekly_sat: u64::MAX,
@@ -550,9 +661,14 @@ mod tests {
             max_fee_sat: u64::MAX,
             max_fee_rate_sat_per_vb: f64::MAX,
             destination_whitelist: None,
-        }
-        .compile(cfg.network)
-        .unwrap();
+        };
+        let policy = policy_cfg.compile(cfg.network).unwrap();
+
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        let seeded = ledger
+            .load_or_seed_policy_state(&serde_json::to_string(&policy_cfg).unwrap(), 0)
+            .await
+            .unwrap();
 
         let state = AppState {
             wallet: Arc::new(wallet),
@@ -560,8 +676,11 @@ mod tests {
             chain: chain.clone(),
             gap_limit: 50,
             server_key: Arc::new(server_key),
-            ledger: Arc::new(Ledger::connect_in_memory().await.unwrap()),
-            policy: Arc::new(policy),
+            ledger: Arc::new(ledger),
+            policy: Arc::new(RwLock::new(PolicyHandle {
+                version: seeded.version,
+                compiled: policy,
+            })),
             notifier: Arc::new(RecordingNotifier::new()),
             hold_seconds,
         };
@@ -752,5 +871,155 @@ mod tests {
             StatusCode::NOT_FOUND,
             "a denied-at-submission spend must never be queued"
         );
+    }
+
+    // ---- M6: GET/POST /policy ----
+
+    fn sign_satochip_message(message: &str) -> String {
+        use bitcoin::secp256k1::{Message, Secp256k1};
+
+        let (_, satochip_xprv) = test_key_spec_with_xpriv(0x01);
+        let secp = Secp256k1::new();
+        let msg_hash = bitcoin::sign_message::signed_msg_hash(message);
+        let msg = Message::from_digest(msg_hash.to_byte_array());
+        let sig = secp.sign_ecdsa_recoverable(&msg, &satochip_xprv.private_key);
+        bitcoin::sign_message::MessageSignature::new(sig, true).to_base64()
+    }
+
+    #[tokio::test]
+    async fn get_policy_reports_the_seeded_version_and_values() {
+        let (state, _chain) = test_state(1_000_000).await;
+        let (status, body) = call(router(state), "GET", "/policy", None).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["version"], 1);
+        assert_eq!(body["max_tx_sat"], 100_000);
+    }
+
+    #[tokio::test]
+    async fn post_policy_with_a_valid_satochip_signature_hot_swaps_the_running_policy() {
+        let (state, chain) = test_state(1_000_000).await;
+
+        let new_policy = serde_json::json!({
+            "max_tx_sat": 5,
+            "max_daily_sat": u64::MAX,
+            "max_weekly_sat": u64::MAX,
+            "max_monthly_sat": u64::MAX,
+            "max_fee_sat": u64::MAX,
+            "max_fee_rate_sat_per_vb": f64::MAX,
+            "destination_whitelist": null,
+        });
+        let message = crate::policy_auth::canonical_message(
+            2,
+            &serde_json::from_value(new_policy.clone()).unwrap(),
+        );
+        let signature = sign_satochip_message(&message);
+
+        let (status, body) = call(
+            router(state.clone()),
+            "POST",
+            "/policy",
+            Some(serde_json::json!({
+                "policy": new_policy,
+                "version": 2,
+                "signature": signature,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["version"], 2);
+        assert_eq!(body["max_tx_sat"], 5);
+
+        let (status, body) = call(router(state.clone()), "GET", "/policy", None).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["version"], 2);
+
+        // The new (much lower) cap must actually be enforced by /sign_psbt now, without a
+        // restart - proves the hot-swap, not just that the DB row changed.
+        let psbt = hot_psbt(&chain, &state.wallet, 42);
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/sign_psbt",
+            Some(serde_json::json!({ "psbt": psbt.to_string() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "got: {body}");
+        assert_eq!(body["error"], "policy_denied");
+    }
+
+    #[tokio::test]
+    async fn post_policy_rejects_a_signature_from_a_non_satochip_key() {
+        let (state, _chain) = test_state(1_000_000).await;
+
+        let new_policy = serde_json::json!({
+            "max_tx_sat": 5,
+            "max_daily_sat": u64::MAX,
+            "max_weekly_sat": u64::MAX,
+            "max_monthly_sat": u64::MAX,
+            "max_fee_sat": u64::MAX,
+            "max_fee_rate_sat_per_vb": f64::MAX,
+            "destination_whitelist": null,
+        });
+        // Signed with SERVER's own key instead of SATOCHIP's.
+        let message = crate::policy_auth::canonical_message(
+            2,
+            &serde_json::from_value(new_policy.clone()).unwrap(),
+        );
+        let msg_hash = bitcoin::sign_message::signed_msg_hash(&message);
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let server_xprv = test_server_xpriv();
+        let sig = secp.sign_ecdsa_recoverable(
+            &bitcoin::secp256k1::Message::from_digest(msg_hash.to_byte_array()),
+            &server_xprv.private_key,
+        );
+        let signature = bitcoin::sign_message::MessageSignature::new(sig, true).to_base64();
+
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/policy",
+            Some(serde_json::json!({
+                "policy": new_policy,
+                "version": 2,
+                "signature": signature,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "got: {body}");
+        assert_eq!(body["error"], "unauthorized_signer");
+    }
+
+    #[tokio::test]
+    async fn post_policy_rejects_a_wrong_version() {
+        let (state, _chain) = test_state(1_000_000).await;
+
+        let new_policy = serde_json::json!({
+            "max_tx_sat": 5,
+            "max_daily_sat": u64::MAX,
+            "max_weekly_sat": u64::MAX,
+            "max_monthly_sat": u64::MAX,
+            "max_fee_sat": u64::MAX,
+            "max_fee_rate_sat_per_vb": f64::MAX,
+            "destination_whitelist": null,
+        });
+        let message = crate::policy_auth::canonical_message(
+            99,
+            &serde_json::from_value(new_policy.clone()).unwrap(),
+        );
+        let signature = sign_satochip_message(&message);
+
+        let (status, body) = call(
+            router(state),
+            "POST",
+            "/policy",
+            Some(serde_json::json!({
+                "policy": new_policy,
+                "version": 99,
+                "signature": signature,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "got: {body}");
+        assert_eq!(body["error"], "version_mismatch");
     }
 }

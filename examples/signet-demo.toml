@@ -40,6 +40,12 @@ xprv_file = "/etc/cosigner/server.xprv"
 # and again (against whatever the rolling totals are by then) right before it's actually
 # signed - see src/policy.rs and src/sign.rs. Above-threshold spends are refused outright;
 # there is no override.
+#
+# This section is only ever consulted once: the first time this service ever starts against a
+# fresh ledger database, its values are copied in as policy version 1. Every start after that
+# reads the current policy straight from the database instead - the values below are ignored,
+# and the only way to change the running policy from then on is a SATOCHIP-authorized
+# POST /policy (see src/policy_auth.rs and `cosigner policy message --help`).
 [policy]
 max_tx_sat = 500000           # 0.005 BTC per transaction
 max_daily_sat = 1000000       # 0.01 BTC per trailing 24h
