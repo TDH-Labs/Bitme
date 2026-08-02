@@ -50,6 +50,51 @@ enum TopCommand {
         #[command(subcommand)]
         command: RecoveryKitCommand,
     },
+    /// Builds an unsigned sweep PSBT moving funds off an OLD descriptor - for replacing a lost
+    /// SATOCHIP, phone, or server without the old device ever needing to work again. Signing
+    /// (SATOCHIP/MOBILE's own apps + the OLD wallet's `/sign_psbt`) and broadcasting still
+    /// happen through the normal channels; this only builds the PSBT.
+    MigrateBuildSweep(MigrateBuildSweepArgs),
+}
+
+#[derive(Args)]
+struct MigrateBuildSweepArgs {
+    /// Path to the OLD wallet.toml (the one whose keys/descriptor currently hold the funds) -
+    /// needs [keys], timelock_blocks, and [bitcoind] to look up the listed UTXOs.
+    #[arg(long)]
+    old_config: PathBuf,
+    /// A UTXO to sweep, as `txid:vout`. Repeat for multiple. Find these with `bitcoin-cli
+    /// listunspent` (against a watch-only import of the OLD descriptor) or a block explorer -
+    /// this command doesn't scan for them itself.
+    #[arg(long = "utxo")]
+    utxos: Vec<String>,
+    /// Sweep directly to this address.
+    #[arg(long)]
+    to: Option<String>,
+    /// Sweep to receive-index-0 of THIS wallet.toml instead of an explicit --to address.
+    /// Exactly one of --to / --new-config is required.
+    #[arg(long)]
+    new_config: Option<PathBuf>,
+    /// Which two keys will actually sign this sweep. Consequential, not cosmetic: it sets the
+    /// nSequence committed into the unsigned transaction (BIP68 is consensus-enforced, so this
+    /// can't be decided later once whoever's signing picks their two keys).
+    #[arg(long, value_enum)]
+    path: MigrateSweepPath,
+    /// Fee rate in sat/vByte.
+    #[arg(long)]
+    fee_rate: f64,
+    /// Where to write the resulting unsigned PSBT (base64, one line).
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum MigrateSweepPath {
+    /// SATOCHIP + SERVER - use when the SATOCHIP is fine and available.
+    Hot,
+    /// SATOCHIP + MOBILE, or MOBILE + SERVER, after the OLD descriptor's timelock - use when
+    /// the SATOCHIP is the device being replaced.
+    Recovery,
 }
 
 #[derive(Subcommand)]
@@ -223,7 +268,81 @@ fn run() -> Result<()> {
             RecoveryKitCommand::Publish(args) => cmd_recovery_kit_publish(args),
             RecoveryKitCommand::Fetch(args) => cmd_recovery_kit_fetch(args),
         },
+        TopCommand::MigrateBuildSweep(args) => cmd_migrate_build_sweep(args),
     }
+}
+
+fn cmd_migrate_build_sweep(args: MigrateBuildSweepArgs) -> Result<()> {
+    let old_cfg = WalletConfig::load(&args.old_config)?;
+    let old_wallet = descriptor::build_descriptor(&old_cfg)?;
+    let (bitcoind_cfg, server_cfg) = old_cfg.require_server_config()?;
+    let gap_limit = server_cfg.gap_limit;
+
+    let outpoints: Vec<bitcoin::OutPoint> = args
+        .utxos
+        .iter()
+        .map(|s| {
+            s.parse()
+                .with_context(|| format!("--utxo {s:?} is not a valid txid:vout"))
+        })
+        .collect::<Result<_>>()?;
+
+    let destination = match (&args.to, &args.new_config) {
+        (Some(addr), None) => addr
+            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+            .with_context(|| format!("--to {addr:?} is not a valid address"))?
+            .require_network(old_cfg.network.to_bitcoin_network())
+            .context("--to address is for the wrong network")?,
+        (None, Some(new_config_path)) => {
+            let new_cfg = WalletConfig::load(new_config_path)?;
+            let new_wallet = descriptor::build_descriptor(&new_cfg)?;
+            let addr = descriptor::address_at(&new_wallet.external, 0, new_cfg.network)?;
+            println!("Sweeping to receive[0] of the new wallet: {addr}");
+            addr
+        }
+        _ => bail!("pass exactly one of --to or --new-config"),
+    };
+
+    let path = match args.path {
+        MigrateSweepPath::Hot => cosigner::migrate::SweepPath::Hot,
+        MigrateSweepPath::Recovery => cosigner::migrate::SweepPath::Recovery,
+    };
+
+    let client = bitcoind_client(bitcoind_cfg)?;
+    let chain = BitcoindRpc::new(client);
+
+    let plan = cosigner::migrate::build_sweep_psbt(
+        &old_wallet,
+        &chain,
+        gap_limit,
+        &outpoints,
+        &destination,
+        path,
+        old_cfg.timelock_blocks,
+        args.fee_rate,
+    )?;
+
+    std::fs::write(&args.out, plan.psbt.to_string())
+        .with_context(|| format!("writing {}", args.out.display()))?;
+
+    println!(
+        "Swept {} input(s): {} total in, {} fee, {} to destination.",
+        plan.psbt.unsigned_tx.input.len(),
+        plan.total_in,
+        plan.fee,
+        plan.destination_amount
+    );
+    println!("Wrote unsigned PSBT to {}.", args.out.display());
+    println!(
+        "Next: sign with the two required keys (SATOCHIP{}), then submit to the OLD wallet's \
+         /sign_psbt for the SERVER co-sign - it applies the same policy/hold/notify flow as any \
+         other spend.",
+        match path {
+            cosigner::migrate::SweepPath::Hot => " + SERVER (automatic on submit)",
+            cosigner::migrate::SweepPath::Recovery => " + MOBILE, or MOBILE + SERVER",
+        }
+    );
+    Ok(())
 }
 
 fn cmd_recovery_kit_publish(args: RecoveryKitPublishArgs) -> Result<()> {

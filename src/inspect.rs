@@ -282,7 +282,9 @@ fn combine_paths(paths: &[InputPath]) -> SpendingPath {
 /// own inputs still missing a final witness, uses the descriptor's own worst-case witness
 /// weight (`our_witness_weight`, in weight units) rather than guessing a byte count -
 /// conservative, so a fee rate computed from this estimate is never overstated.
-fn estimate_weight(psbt: &Psbt, our_witness_weight: Weight) -> Weight {
+/// `pub(crate)` (not just `fn`) so `migrate.rs` can reuse this exact fee/weight math when
+/// sizing a sweep - one estimator, not two subtly-different copies.
+pub(crate) fn estimate_weight(psbt: &Psbt, our_witness_weight: Weight) -> Weight {
     let tx = &psbt.unsigned_tx;
 
     let mut base: u64 = 4 // version
