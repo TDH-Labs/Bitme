@@ -7,6 +7,7 @@ pub mod invariants;
 pub mod ledger;
 pub mod migrate;
 pub mod nostr_kit;
+pub mod nostr_transport;
 pub mod notify;
 pub mod policy;
 pub mod policy_auth;

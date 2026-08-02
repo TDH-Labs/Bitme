@@ -58,6 +58,7 @@ pub fn test_wallet_config(timelock_blocks: u16) -> WalletConfig {
         server_signing: None,
         notify: None,
         recovery: None,
+        nostr_transport: None,
     }
 }
 

@@ -241,12 +241,15 @@ social identity. Its job is **addressing and transport**. Two uses, both real:
 
 ### 1. Talking to the cosigner without exposing it
 
-Today your wallet reaches the service over HTTP, which means an open port. On a home box that's
-port-forwarding, a domain, a certificate — and right now, no authentication at all.
+**Built.** Reaching the service over HTTP means an open port — on a home box that's
+port-forwarding, a domain, a certificate.
 
-Instead, the cosigner can hold a Nostr identity and connect **outward** to relays, receiving
-transactions as encrypted direct messages. This is the same pattern NIP-46 already uses for
-remote Nostr signing, applied to Bitcoin PSBTs.
+Instead, `[nostr_transport]` gives the cosigner its own Nostr identity, connecting **outward**
+to relays and receiving requests as NIP-17 gift-wrapped private messages (`{"method", "path",
+"body"}`, mirroring the HTTP API one-to-one). Each message is dispatched straight into the same
+`axum::Router` the HTTP server itself runs — the same policy, signing, and freeze logic, just a
+different door — so the two transports can never drift apart. It's the same pattern NIP-46
+already uses for remote Nostr signing, applied to Bitcoin PSBTs.
 
 ```mermaid
 flowchart LR
@@ -393,7 +396,7 @@ What each attacker can and can't do:
 | Phone + server | **Coins under 30 days old:** locked until they mature. **Coins older than that:** the script timelock is already satisfied, so only the 48h hold, the notification and your veto stand in the way — and none of those survive a *fully rooted* server that has the raw key. This is the sharpest edge in the design. |
 | Satochip + phone | Yes, after ~30 days. |
 | Satochip + server | Yes, immediately, within your policy limits. |
-| Network access to the API | **Currently:** can submit transactions and burn spending limits. Can't move funds — the Satochip is still required. Fixed by the Nostr transport work below. |
+| Network access to the HTTP API | Can submit transactions and burn spending limits. Can't move funds — the Satochip is still required. HTTP itself has no built-in auth, so bind it to loopback or a private network; `[nostr_transport]` (above) is the authenticated alternative if you need to reach it from elsewhere. |
 
 The honest weak point: **an attacker holding both your phone and your raw server key can take
 mature coins, and the timelock will not stop them.** It only delays coins younger than 30 days.
@@ -406,7 +409,7 @@ notification rather than pretending the delay is a wall.
 
 ## Current status
 
-Working and tested — 144 unit tests, plus integration tests against a real regtest node:
+Working and tested — 150 unit tests, plus integration tests against a real regtest node:
 
 - Descriptor construction with machine-checked invariant proofs
 - Transaction inspection with independent on-chain verification
@@ -432,11 +435,13 @@ Working and tested — 144 unit tests, plus integration tests against a real reg
   `cosigner serve` needs (keys, timelock, bitcoind, policy, notify, recovery), with inline
   validation and a config that's confirmed to parse and validate before it's ever written.
 
+- **Nostr transport** (`[nostr_transport]`) — NIP-17 gift-wrapped private messages dispatched
+  into the same HTTP router, so it can never drift out of sync with the HTTP API. The relay
+  round-trip itself is env-gated and pending confirmation against real relays from a machine
+  with network access to them, same as the recovery kit's relay publishing above.
+
 Not done yet:
 
-- **Nostr transport** for PSBT delivery itself (the "talking to the cosigner without exposing it"
-  section above) — designed, not built. Comparable in scope to a full milestone: relay pool
-  management, NIP-44, request/response correlation, npub-allowlist auth.
 - **Nothing has touched real hardware.** No Satochip, no Bitcoin Keeper, no mainnet. Signet
   first, and not yet.
 

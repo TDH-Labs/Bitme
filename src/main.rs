@@ -641,6 +641,15 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
             sweep_interval,
         );
 
+        if let Some(nostr_cfg) = cfg.nostr_transport.clone() {
+            let nostr_state = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = cosigner::nostr_transport::run(&nostr_cfg, nostr_state).await {
+                    tracing::error!(error = %e, "nostr transport stopped");
+                }
+            });
+        }
+
         let listener = tokio::net::TcpListener::bind(&bind_addr)
             .await
             .with_context(|| format!("binding {bind_addr}"))?;
