@@ -425,7 +425,7 @@ notification rather than pretending the delay is a wall.
 
 ## Current status
 
-Working and tested — 150 unit tests, plus integration tests against a real regtest node:
+Working and tested — 155 unit tests, plus integration tests against a real regtest node:
 
 - Descriptor construction with machine-checked invariant proofs
 - Transaction inspection with independent on-chain verification
@@ -448,8 +448,9 @@ Working and tested — 150 unit tests, plus integration tests against a real reg
   normal channels (hardware apps + the old wallet's own `/sign_psbt`); this only builds the PSBT.
 
 - **The setup wizard** (`cosigner init`) — an interactive prompt flow for every field
-  `cosigner serve` needs (keys, timelock, bitcoind, policy, notify, recovery), with inline
-  validation and a config that's confirmed to parse and validate before it's ever written.
+  `cosigner serve` needs (keys, timelock, bitcoind, policy, notify, recovery, and optionally
+  Nostr transport), with inline validation and a config that's confirmed to parse and validate
+  before it's ever written.
 
 - **Nostr transport** (`[nostr_transport]`) — NIP-17 gift-wrapped private messages dispatched
   into the same HTTP router, so it can never drift out of sync with the HTTP API. The relay
@@ -471,4 +472,6 @@ cargo build && cargo test && cargo clippy --all-targets && cargo fmt
 
 `cargo test` runs the mocked-chain unit tests. The regtest integration tests need a real node
 and skip cleanly without one — see [`tests/regtest_inspect.rs`](tests/regtest_inspect.rs) for the
-command.
+command. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs both on every push:
+unit tests/clippy/fmt always, and the regtest suite for real against a bitcoind service
+container.
