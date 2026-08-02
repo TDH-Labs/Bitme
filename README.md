@@ -123,17 +123,26 @@ matter; short enough that recovery isn't a season of your life.
 
 ## How a spend actually works
 
-The server never signs the moment you ask. It queues, it tells you, it waits, and only then does
-it sign — so a signature is never the first you hear about a transaction.
+**The Satochip never talks to the server. It has no networking - no WiFi, no Bluetooth, nothing
+that reaches the internet.** It only ever talks to whatever taps it: your phone over NFC, or a
+card reader plugged into a computer. Every "SATOCHIP + SERVER" spend is really two separate,
+disconnected steps stitched together by a PSBT file that your wallet app carries between them -
+never a live connection between the card and this service.
+
+The server never signs the moment you ask, either way. It queues, it tells you, it waits, and
+only then does it sign - so a signature is never the first you hear about a transaction.
 
 ```mermaid
 sequenceDiagram
-    participant You as Your wallet
+    participant SC as Your Satochip
+    participant You as Your wallet app
     participant CS as Cosigner
     participant Node as Your bitcoind
     participant N as Notification
 
-    You->>CS: POST /sign_psbt (unsigned transaction)
+    Note over SC,You: Tap to phone / card reader - purely local, no network
+    SC->>You: Partial signature (SATOCHIP's share)
+    You->>CS: POST /sign_psbt (SATOCHIP's signature already attached)
     CS->>Node: Are these coins real? Whose are they?
     Node-->>CS: UTXO details
     Note over CS: Re-derives every address itself.<br/>Never trusts what the PSBT claims.
@@ -148,12 +157,19 @@ sequenceDiagram
             CS->>CS: Cancelled permanently
         else Hold elapses
             CS->>CS: Re-check policy against live state
-            CS->>CS: Sign
-            CS-->>You: PSBT with the server signature
+            CS->>CS: Add the SERVER signature
+            CS-->>You: PSBT with both signatures — 2 of 3, spendable
         end
     end
-    Note over You: You still add SATOCHIP and broadcast.<br/>The server never does either.
+    Note over You: You broadcast. The server never does.<br/>Notice the Satochip only ever appears in the top line.
 ```
+
+The cosigner never talks to the Satochip either — as far as this service is concerned, "SATOCHIP
+signed" just means *a PSBT arrived with a valid signature under SATOCHIP's key already in it*. It
+has no way to reach the card, ask it to sign, or know it exists except through that signature.
+Your wallet app (Bitcoin Keeper, or Sparrow with a card reader) is the only thing that talks to
+both sides — locally to the Satochip, over the network to the cosigner — and a PSBT file is the
+only thing that ever crosses between them.
 
 Some specifics that matter:
 
