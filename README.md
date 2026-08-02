@@ -370,6 +370,15 @@ cargo run -- descriptor build --config examples/signet-demo.toml
 That prints the descriptor, some addresses, and the full invariant report — no node, no server,
 no keys of your own required.
 
+Setting up for real, without hand-editing TOML: `cosigner init` walks through the three
+xpubs/fingerprints, the timelock, and everything `cosigner serve` needs, with sensible defaults
+and immediate validation of anything a typo could break, and writes a `wallet.toml` that's
+already confirmed to parse and validate before it's written.
+
+```sh
+cargo run -- init --out wallet.toml
+```
+
 ---
 
 ## Threat model
@@ -397,7 +406,7 @@ notification rather than pretending the delay is a wall.
 
 ## Current status
 
-Working and tested — 137 unit tests, plus integration tests against a real regtest node:
+Working and tested — 144 unit tests, plus integration tests against a real regtest node:
 
 - Descriptor construction with machine-checked invariant proofs
 - Transaction inspection with independent on-chain verification
@@ -419,13 +428,15 @@ Working and tested — 137 unit tests, plus integration tests against a real reg
   off an old descriptor to a new one when replacing a lost device. Signing still goes through the
   normal channels (hardware apps + the old wallet's own `/sign_psbt`); this only builds the PSBT.
 
+- **The setup wizard** (`cosigner init`) — an interactive prompt flow for every field
+  `cosigner serve` needs (keys, timelock, bitcoind, policy, notify, recovery), with inline
+  validation and a config that's confirmed to parse and validate before it's ever written.
+
 Not done yet:
 
 - **Nostr transport** for PSBT delivery itself (the "talking to the cosigner without exposing it"
   section above) — designed, not built. Comparable in scope to a full milestone: relay pool
   management, NIP-44, request/response correlation, npub-allowlist auth.
-- **A setup wizard.** Right now you hand-edit TOML with three xpubs, which is not "simple to set
-  up" by any reasonable standard.
 - **Nothing has touched real hardware.** No Satochip, no Bitcoin Keeper, no mainnet. Signet
   first, and not yet.
 

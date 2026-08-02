@@ -13,6 +13,7 @@ pub mod policy_auth;
 pub mod recovery_kit;
 pub mod sign;
 pub mod signing;
+pub mod wizard;
 
 #[cfg(test)]
 pub(crate) mod test_util;
