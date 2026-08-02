@@ -44,6 +44,53 @@ enum TopCommand {
     /// requiring hardware here would buy nothing while making a freeze permanent in exactly
     /// the case the lost-SATOCHIP recovery path exists for.
     Unfreeze(UnfreezeArgs),
+    /// Encrypted, off-machine backup/restore of wallet.toml + the SERVER xprv - protects
+    /// against losing the box that runs this service, not against losing any of the three keys.
+    RecoveryKit {
+        #[command(subcommand)]
+        command: RecoveryKitCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecoveryKitCommand {
+    /// Encrypt wallet.toml + the SERVER xprv into a single backup blob.
+    Export(RecoveryKitExportArgs),
+    /// Decrypt a backup blob back into a wallet.toml + a SERVER xprv file.
+    Import(RecoveryKitImportArgs),
+}
+
+#[derive(Args)]
+struct RecoveryKitExportArgs {
+    /// Path to the wallet.toml to back up.
+    #[arg(long)]
+    config: PathBuf,
+    /// Path to a file containing the passphrase (its trimmed contents). Never pass a passphrase
+    /// directly on the command line - it would end up in shell history and process listings.
+    #[arg(long)]
+    passphrase_file: PathBuf,
+    /// Where to write the ASCII-armored backup blob.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Args)]
+struct RecoveryKitImportArgs {
+    /// Path to the ASCII-armored backup blob produced by `recovery-kit export`.
+    #[arg(long = "in")]
+    input: PathBuf,
+    /// Path to a file containing the passphrase (its trimmed contents).
+    #[arg(long)]
+    passphrase_file: PathBuf,
+    /// Where to write the restored wallet.toml.
+    #[arg(long)]
+    out_config: PathBuf,
+    /// Where to write the restored SERVER xprv.
+    #[arg(long)]
+    out_server_key: PathBuf,
+    /// Overwrite out_config/out_server_key if they already exist.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Args)]
@@ -134,7 +181,69 @@ fn run() -> Result<()> {
             PolicyCommand::Message(args) => cmd_policy_message(args),
         },
         TopCommand::Unfreeze(args) => cmd_unfreeze(args),
+        TopCommand::RecoveryKit { command } => match command {
+            RecoveryKitCommand::Export(args) => cmd_recovery_kit_export(args),
+            RecoveryKitCommand::Import(args) => cmd_recovery_kit_import(args),
+        },
     }
+}
+
+fn cmd_recovery_kit_export(args: RecoveryKitExportArgs) -> Result<()> {
+    let passphrase = std::fs::read_to_string(&args.passphrase_file)
+        .with_context(|| format!("reading {}", args.passphrase_file.display()))?;
+    let armored = cosigner::recovery_kit::export(&args.config, passphrase.trim())?;
+    std::fs::write(&args.out, &armored)
+        .with_context(|| format!("writing {}", args.out.display()))?;
+    println!(
+        "Wrote encrypted recovery kit to {} ({} bytes armored).",
+        args.out.display(),
+        armored.len()
+    );
+    println!(
+        "Store this somewhere OTHER than this machine (a second machine, a paper/QR backup, or \
+         Nostr relays via `cosigner recovery-kit publish`) - it is useless as a backup for this \
+         box's own disk failure if it only ever lives on this disk."
+    );
+    Ok(())
+}
+
+fn cmd_recovery_kit_import(args: RecoveryKitImportArgs) -> Result<()> {
+    if !args.force {
+        for p in [&args.out_config, &args.out_server_key] {
+            if p.exists() {
+                bail!("{} already exists - pass --force to overwrite", p.display());
+            }
+        }
+    }
+    let passphrase = std::fs::read_to_string(&args.passphrase_file)
+        .with_context(|| format!("reading {}", args.passphrase_file.display()))?;
+    let armored = std::fs::read_to_string(&args.input)
+        .with_context(|| format!("reading {}", args.input.display()))?;
+    let restored = cosigner::recovery_kit::import(&armored, passphrase.trim())?;
+
+    std::fs::write(&args.out_config, &restored.wallet_toml)
+        .with_context(|| format!("writing {}", args.out_config.display()))?;
+    std::fs::write(&args.out_server_key, &restored.server_xprv)
+        .with_context(|| format!("writing {}", args.out_server_key.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&args.out_server_key, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 600 {}", args.out_server_key.display()))?;
+    }
+
+    println!(
+        "Restored wallet.toml to {} and the SERVER xprv to {} (backup created at unix time {}).",
+        args.out_config.display(),
+        args.out_server_key.display(),
+        restored.created_at
+    );
+    println!(
+        "If the restored config's [server_signing].xprv_file doesn't already point at {}, update \
+         it (or set xprv_env_var instead) before running `cosigner serve`.",
+        args.out_server_key.display()
+    );
+    Ok(())
 }
 
 fn cmd_unfreeze(args: UnfreezeArgs) -> Result<()> {

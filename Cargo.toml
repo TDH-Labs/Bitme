@@ -12,6 +12,7 @@ name = "cosigner"
 path = "src/main.rs"
 
 [dependencies]
+age = { version = "0.12.1", features = ["armor"] }
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
