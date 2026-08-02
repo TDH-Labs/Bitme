@@ -55,6 +55,19 @@ enum TopCommand {
     /// (SATOCHIP/MOBILE's own apps + the OLD wallet's `/sign_psbt`) and broadcasting still
     /// happen through the normal channels; this only builds the PSBT.
     MigrateBuildSweep(MigrateBuildSweepArgs),
+    /// Interactive wizard that writes a validated wallet.toml, instead of hand-editing TOML
+    /// with three xpubs and ~30 other fields.
+    Init(InitArgs),
+}
+
+#[derive(Args)]
+struct InitArgs {
+    /// Where to write the generated wallet.toml.
+    #[arg(long, default_value = "wallet.toml")]
+    out: PathBuf,
+    /// Overwrite --out if it already exists.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Args)]
@@ -269,7 +282,41 @@ fn run() -> Result<()> {
             RecoveryKitCommand::Fetch(args) => cmd_recovery_kit_fetch(args),
         },
         TopCommand::MigrateBuildSweep(args) => cmd_migrate_build_sweep(args),
+        TopCommand::Init(args) => cmd_init(args),
     }
+}
+
+fn cmd_init(args: InitArgs) -> Result<()> {
+    if args.out.exists() && !args.force {
+        bail!(
+            "{} already exists - pass --force to overwrite",
+            args.out.display()
+        );
+    }
+
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    let answers = cosigner::wizard::run_interactive(&mut input, &mut output)?;
+    let text = cosigner::wizard::render_toml(&answers);
+
+    // Parse and validate the rendered text through the exact same path `cosigner serve` would
+    // use, before writing anything - a wizard bug must surface here, not as a confusing error
+    // the next time this file is loaded.
+    let parsed: WalletConfig = toml::from_str(&text)
+        .context("wizard produced TOML that failed to parse - this is a bug")?;
+    parsed
+        .validate()
+        .context("wizard produced a config that failed validation - this is a bug")?;
+
+    std::fs::write(&args.out, &text).with_context(|| format!("writing {}", args.out.display()))?;
+    println!("\nWrote {}.", args.out.display());
+    println!(
+        "Sanity-check it: cargo run -- descriptor build --config {}",
+        args.out.display()
+    );
+    Ok(())
 }
 
 fn cmd_migrate_build_sweep(args: MigrateBuildSweepArgs) -> Result<()> {
