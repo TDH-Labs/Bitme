@@ -1,0 +1,26 @@
+# Test-only override, NOT part of the real Umbrel packaging (Umbrel injects a real Bitcoin
+# Core node itself - this just stands in for it locally). Adds a throwaway regtest bitcoind to
+# this same compose project so `app` can reach it by service name, letting
+# scripts/simulate-umbrel.sh exercise this directory's actual docker-compose.yml (build
+# context, entrypoint, startup) against Umbrel-shaped inputs without real Umbrel hardware.
+#
+# Deliberately doesn't override `app`'s environment here: docker-compose.yml's
+# ${APP_BITCOIN_NODE_IP} etc. are resolved from the *host* shell environment at compose-parse
+# time (see scripts/simulate-umbrel.sh), not something a second compose file's `environment:`
+# block can feed back into - only `bitcoind` needs adding here.
+services:
+  bitcoind:
+    image: btcpayserver/bitcoin:29.2
+    environment:
+      BITCOIN_NETWORK: regtest
+      BITCOIN_EXTRA_ARGS: |
+        server=1
+        rpcbind=0.0.0.0
+        rpcallowip=0.0.0.0/0
+        rpcuser=umbrelsim
+        rpcpassword=umbrelsim
+        fallbackfee=0.0001
+
+  app:
+    depends_on:
+      - bitcoind

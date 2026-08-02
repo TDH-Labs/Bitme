@@ -11,6 +11,13 @@ test, not a known-good deployment, and expect to troubleshoot.
 (Umbrel's Bitcoin Core app supports it), and don't set `i_understand_this_is_mainnet = true`
 until you've verified everything end-to-end.
 
+Before touching real Umbrel hardware, `scripts/simulate-umbrel.sh` (run from a machine with
+Docker and real internet access) exercises this exact directory's `docker-compose.yml` - build
+context, entrypoint, startup - against faked Umbrel-shaped environment variables and a
+throwaway regtest node standing in for Umbrel's Bitcoin Core app. A pass there means the
+packaging is structurally sound; it doesn't replace an install on real hardware, but it catches
+build/wiring mistakes for free before you spend time on a device.
+
 ## Why this differs from a typical Umbrel app
 
 Two deliberate departures from the usual Umbrel app pattern, both because of this project's own
