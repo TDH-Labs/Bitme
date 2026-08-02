@@ -116,6 +116,33 @@ pub struct WalletConfig {
     /// Only required once policy-gated signing (`/sign_psbt`) is wired up; the descriptor
     /// CLI and `/inspect` don't consult it.
     pub policy: Option<crate::policy::PolicyConfig>,
+    /// Only required by `/sign_psbt`. Never put an xprv directly in this file - point at a
+    /// file path or an env var instead.
+    pub server_signing: Option<ServerSigningConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerSigningConfig {
+    /// Path to a file containing the SERVER account-level xprv (and nothing else). Mutually
+    /// exclusive with `xprv_env_var`.
+    #[serde(default)]
+    pub xprv_file: Option<String>,
+    /// Name of an environment variable holding the SERVER account-level xprv. Mutually
+    /// exclusive with `xprv_file`.
+    #[serde(default)]
+    pub xprv_env_var: Option<String>,
+}
+
+impl ServerSigningConfig {
+    fn validate(&self) -> Result<()> {
+        match (&self.xprv_file, &self.xprv_env_var) {
+            (Some(_), Some(_)) => {
+                bail!("server_signing: set either xprv_file or xprv_env_var, not both")
+            }
+            (None, None) => bail!("server_signing: one of xprv_file or xprv_env_var is required"),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,6 +184,10 @@ pub struct ServerConfig {
     /// external/internal chains, when deciding whether a scriptPubkey is ours.
     #[serde(default = "default_gap_limit")]
     pub gap_limit: u32,
+    /// Path to the SQLite ledger database file (created if missing). Only required by
+    /// `/sign_psbt`; `/inspect` alone doesn't touch it.
+    #[serde(default)]
+    pub ledger_db_path: Option<String>,
 }
 
 fn default_gap_limit() -> u32 {
@@ -224,10 +255,14 @@ impl WalletConfig {
             policy.compile(self.network).context("[policy]")?;
         }
 
+        if let Some(server_signing) = &self.server_signing {
+            server_signing.validate()?;
+        }
+
         Ok(())
     }
 
-    /// `cosigner serve` needs both `[bitcoind]` and `[server]`; the descriptor CLI doesn't.
+    /// `cosigner serve` needs `[bitcoind]` and `[server]`; the descriptor CLI doesn't.
     pub fn require_server_config(&self) -> Result<(&BitcoindConfig, &ServerConfig)> {
         let bitcoind = self.bitcoind.as_ref().context(
             "config is missing the [bitcoind] section, required to run `cosigner serve`",
@@ -237,6 +272,21 @@ impl WalletConfig {
             .as_ref()
             .context("config is missing the [server] section, required to run `cosigner serve`")?;
         Ok((bitcoind, server))
+    }
+
+    /// `/sign_psbt` additionally needs `[policy]` and `[server_signing]`.
+    pub fn require_signing_config(
+        &self,
+    ) -> Result<(&crate::policy::PolicyConfig, &ServerSigningConfig)> {
+        let policy = self
+            .policy
+            .as_ref()
+            .context("config is missing the [policy] section, required for /sign_psbt")?;
+        let server_signing = self
+            .server_signing
+            .as_ref()
+            .context("config is missing the [server_signing] section, required for /sign_psbt")?;
+        Ok((policy, server_signing))
     }
 }
 
