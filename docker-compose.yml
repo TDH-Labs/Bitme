@@ -1,0 +1,32 @@
+# Base deployment: cosigner only, talking to a bitcoind you already have (a VPS's own node, or
+# any reachable node). For local testing without an existing node, layer the signet override:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.signet.yml up
+#
+# Either way: copy .env.example to .env and fill it in first, and copy
+# config/wallet.toml.example to config/wallet.toml (right here on the host - it's bind-mounted
+# in below) and fill it in before starting - see docs/DOCKER.md.
+services:
+  cosigner:
+    build: .
+    image: cosigner:latest
+    restart: unless-stopped
+    ports:
+      - "${COSIGNER_HTTP_PORT:-8080}:8080"
+    volumes:
+      - cosigner-data:/data
+      # More specific than the volume mount above, so this wins for anything under /data/config:
+      # the ledger database still lives in the named volume, but the config you actually edit
+      # is a plain file on your host, not something hidden inside a Docker volume.
+      - ./config:/data/config:ro
+    environment:
+      COSIGNER_HTTP_PORT: "8080"
+      COSIGNER_GAP_LIMIT: "${COSIGNER_GAP_LIMIT:-1000}"
+      COSIGNER_SERVER_XPRV: "${COSIGNER_SERVER_XPRV:?set this in .env - see .env.example. Never commit a real xprv.}"
+      BITCOIND_RPC_URL: "${BITCOIND_RPC_URL:?set this in .env - see .env.example}"
+      BITCOIND_RPC_USER: "${BITCOIND_RPC_USER:-}"
+      BITCOIND_RPC_PASSWORD: "${BITCOIND_RPC_PASSWORD:-}"
+      BITCOIND_RPC_COOKIE_FILE: "${BITCOIND_RPC_COOKIE_FILE:-}"
+
+volumes:
+  cosigner-data:

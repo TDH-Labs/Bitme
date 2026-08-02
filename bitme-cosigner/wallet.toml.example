@@ -1,0 +1,62 @@
+# Umbrel variant of config/wallet.toml.example - the only difference is [server_signing] below
+# (a mounted file instead of an environment variable, since Umbrel has no per-app secret-entry
+# UI to put an xprv into). See docs/UMBREL.md for where this file and server.xprv actually go.
+#
+# [bitcoind] and [server] must NOT appear in this file - the container generates both itself,
+# fresh on every start, from Umbrel's injected Bitcoin Core connection details.
+
+network = "signet"                 # start here. Only move to "mainnet" (with
+                                    # i_understand_this_is_mainnet = true below) after you've
+                                    # verified this whole setup end-to-end on signet.
+# i_understand_this_is_mainnet = true
+timelock_blocks = 12960            # ~90 days at 10 min/block - the RECOVERY path's relative
+                                    # timelock (SATOCHIP + MOBILE, after this many blocks)
+
+[keys.satochip]
+master_fingerprint = "00000000"    # 8 hex chars - e.g. Sparrow's "Master Fingerprint" field
+derivation_path = "48h/1h/0h/2h"
+xpub = "tpub..."                   # the extended PUBLIC key AT derivation_path - never a
+                                    # private key, and never the master xpub
+
+[keys.mobile]
+master_fingerprint = "00000000"    # from Bitcoin Keeper
+derivation_path = "48h/1h/0h/2h"
+xpub = "tpub..."
+
+[keys.server]
+master_fingerprint = "00000000"    # must match the xprv in server.xprv, referenced below
+derivation_path = "48h/1h/0h/2h"
+xpub = "tpub..."
+
+[server_signing]
+# server.xprv must sit next to this file in the app's persistent data directory (i.e. also
+# under .../config/) - see docs/UMBREL.md for the exact path on your Umbrel.
+xprv_file = "/data/config/server.xprv"
+
+# Only ever consulted once, to seed policy version 1 the very first time this service starts
+# against a fresh install - after that, the running policy lives in the ledger database and can
+# only be changed via a SATOCHIP-authorized POST /policy.
+[policy]
+max_tx_sat = 500000
+max_daily_sat = 1000000
+max_weekly_sat = 3000000
+max_monthly_sat = 8000000
+max_fee_sat = 50000
+max_fee_rate_sat_per_vb = 200.0
+# destination_whitelist = ["tb1q..."]   # optional; omit to allow any destination
+
+[notify]
+hold_seconds = 900                 # 15 minutes to review and veto before this service signs
+sweep_interval_seconds = 5
+
+[notify.ntfy]
+url = "https://ntfy.sh/replace-with-a-private-topic-name"
+# auth_token = "..."                # optional, for a self-hosted ntfy server requiring auth
+
+# [notify.smtp]                     # optional second (or alternative) channel; both may be set
+# host = "smtp.example.com"
+# port = 587
+# username = "cosigner@example.com"
+# password = "..."
+# from = "cosigner@example.com"
+# to = "you@example.com"

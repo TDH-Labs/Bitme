@@ -1,0 +1,79 @@
+#!/bin/sh
+# Generates the deployment-specific parts of the wallet config ([bitcoind], [server]) fresh on
+# every container start, from environment variables, and appends them to the operator-edited
+# static config - so the same image works unmodified both for a plain docker-compose deployment
+# and for Umbrel (which injects different values for the same variables). See docs/DOCKER.md.
+set -eu
+
+DATA_DIR="${COSIGNER_DATA_DIR:-/data}"
+CONFIG_DIR="$DATA_DIR/config"
+USER_CONFIG="$CONFIG_DIR/wallet.toml"
+GENERATED_CONFIG="$DATA_DIR/generated.toml"
+
+mkdir -p "$CONFIG_DIR"
+
+# Anything other than the default `serve` command (e.g. `descriptor build`) is passed straight
+# through - those don't need [bitcoind]/[server] and shouldn't require a full deployment config.
+if [ "${1:-}" != "serve" ]; then
+    exec cosigner "$@"
+fi
+shift
+
+if [ ! -f "$USER_CONFIG" ]; then
+    cat >&2 <<EOF
+ERROR: missing $USER_CONFIG
+
+This must contain: network, timelock_blocks, [keys.satochip], [keys.mobile], [keys.server],
+[policy], [server_signing], and [notify]. Copy config/wallet.toml.example into your mounted
+data volume as config/wallet.toml and fill in your real xpubs before starting this container.
+[bitcoind] and [server] must NOT be in this file - the container generates those itself from
+its own environment. See docs/DOCKER.md.
+EOF
+    exit 1
+fi
+
+if [ -z "${BITCOIND_RPC_URL:-}" ]; then
+    echo "ERROR: BITCOIND_RPC_URL is not set." >&2
+    exit 1
+fi
+
+# --- Optional safety net: catch a config/deployment mismatch before it can matter -------------
+# APP_BITCOIN_NETWORK is injected by Umbrel when this app depends on the official Bitcoin Core
+# app (see umbrel/bitme-cosigner/docker-compose.yml) - it is never set outside Umbrel.
+if [ -n "${APP_BITCOIN_NETWORK:-}" ]; then
+    configured_network=$(grep -E '^[[:space:]]*network[[:space:]]*=' "$USER_CONFIG" \
+        | head -n1 | sed -E 's/^[^"]*"([^"]*)".*/\1/')
+    case "$APP_BITCOIN_NETWORK" in
+        testnet4) expected_network=testnet ;;
+        *) expected_network="$APP_BITCOIN_NETWORK" ;;
+    esac
+    if [ -n "$configured_network" ] && [ "$configured_network" != "$expected_network" ]; then
+        echo "ERROR: wallet.toml declares network = \"$configured_network\", but the Bitcoin" >&2
+        echo "Core app this depends on is running \"$APP_BITCOIN_NETWORK\". Refusing to start" >&2
+        echo "rather than run against a mismatched node." >&2
+        exit 1
+    fi
+fi
+
+# --- Generate the deployment-specific sections -------------------------------------------------
+{
+    cat "$USER_CONFIG"
+    echo ""
+    echo "[bitcoind]"
+    printf 'rpc_url = "%s"\n' "$BITCOIND_RPC_URL"
+    if [ -n "${BITCOIND_RPC_COOKIE_FILE:-}" ]; then
+        printf 'rpc_cookie_file = "%s"\n' "$BITCOIND_RPC_COOKIE_FILE"
+    else
+        : "${BITCOIND_RPC_USER:?BITCOIND_RPC_USER or BITCOIND_RPC_COOKIE_FILE is required}"
+        : "${BITCOIND_RPC_PASSWORD:?BITCOIND_RPC_PASSWORD or BITCOIND_RPC_COOKIE_FILE is required}"
+        printf 'rpc_user = "%s"\n' "$BITCOIND_RPC_USER"
+        printf 'rpc_password = "%s"\n' "$BITCOIND_RPC_PASSWORD"
+    fi
+    echo ""
+    echo "[server]"
+    printf 'bind_addr = "0.0.0.0:%s"\n' "${COSIGNER_HTTP_PORT:-8080}"
+    printf 'gap_limit = %s\n' "${COSIGNER_GAP_LIMIT:-1000}"
+    printf 'ledger_db_path = "%s"\n' "$DATA_DIR/ledger.sqlite3"
+} >"$GENERATED_CONFIG"
+
+exec cosigner serve --config "$GENERATED_CONFIG" "$@"

@@ -1,0 +1,6 @@
+# Identifies this repo as an Umbrel community app store, per Umbrel's
+# umbrel-community-app-store convention. Add it in your Umbrel via
+# App Store -> ... -> Community App Stores -> Add App Store, pasting this repo's URL.
+# See docs/UMBREL.md.
+id: "bitme"
+name: "Bitme"
