@@ -57,6 +57,7 @@ pub fn test_wallet_config(timelock_blocks: u16) -> WalletConfig {
         policy: None,
         server_signing: None,
         notify: None,
+        recovery: None,
     }
 }
 

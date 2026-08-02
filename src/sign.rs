@@ -36,7 +36,7 @@ use bitcoin::psbt::Psbt;
 use thiserror::Error;
 
 use crate::chain::ChainSource;
-use crate::config::WalletConfig;
+use crate::config::{RecoveryConfig, WalletConfig};
 use crate::descriptor::BuiltDescriptor;
 use crate::inspect::{self, InspectError, InspectionReport, OutputKind, SpendingPath};
 use crate::ledger::{Ledger, LedgerTx, PendingStatus};
@@ -95,6 +95,7 @@ async fn decide_and_sign(
     cfg: &WalletConfig,
     server_key: &ServerSigningKey,
     policy: &CompiledPolicy,
+    recovery_whitelist: Option<&[bitcoin::Address]>,
     now: i64,
 ) -> Result<DecideOutcome, SignPsbtError> {
     let txid = psbt.unsigned_tx.compute_txid().to_string();
@@ -109,11 +110,25 @@ async fn decide_and_sign(
         return Ok(DecideOutcome::AlreadyRecorded(psbt));
     }
 
-    let rolling = ltx.rolling_totals(now).await?;
-    match policy::evaluate_policy(report, &rolling, policy) {
+    // Which rules apply depends on which path this is. A recovery spend is a whole-balance
+    // sweep by nature, so the ordinary caps would deny exactly the thing the path exists for -
+    // see `policy::evaluate_recovery_policy`.
+    let decision = match report.spending_path {
+        SpendingPath::Recovery => policy::evaluate_recovery_policy(report, recovery_whitelist),
+        _ => {
+            let rolling = ltx.rolling_totals(now).await?;
+            policy::evaluate_policy(report, &rolling, policy)
+        }
+    };
+
+    match decision {
         PolicyDecision::Deny(violations) => Ok(DecideOutcome::Denied(violations)),
         PolicyDecision::Allow => {
             signing::sign_hot_inputs(&mut psbt, wallet, cfg, server_key, &report.inputs)?;
+            // Recovery spends are recorded too. They don't consume the rolling budget in any
+            // meaningful sense (the caps don't gate them), but the ledger is the audit trail
+            // of every signature this service has ever produced, and a recovery signature is
+            // the one you'd most want a record of.
             ltx.record_spend(&txid, now, spend_sat, fee_sat).await?;
             Ok(DecideOutcome::Recorded(psbt))
         }
@@ -144,7 +159,7 @@ pub async fn sign_psbt(
 
     let mut ltx = ledger.begin().await?;
     match decide_and_sign(
-        &mut ltx, psbt, &report, wallet, cfg, server_key, policy, now,
+        &mut ltx, psbt, &report, wallet, cfg, server_key, policy, None, now,
     )
     .await?
     {
@@ -174,10 +189,18 @@ pub async fn sign_psbt(
 #[derive(Debug, Error)]
 pub enum SubmitError {
     #[error(
-        "PSBT does not use the HOT spending path (SATOCHIP+SERVER, immediately) - this \
-         service only ever countersigns that path"
+        "PSBT does not use a spending path this service co-signs. It signs SATOCHIP+SERVER, \
+         and (unless disabled) MOBILE+SERVER recovery spends; it cannot help with \
+         SATOCHIP+MOBILE, which doesn't need it"
     )]
     NotHotPath,
+    #[error(
+        "this is a MOBILE+SERVER recovery spend, but recovery co-signing is disabled \
+         ([recovery] enabled = false)"
+    )]
+    RecoveryDisabled,
+    #[error("signing is frozen: {0}")]
+    Frozen(String),
     #[error("policy denied this transaction")]
     Denied(Vec<PolicyViolation>),
     #[error("this exact transaction was already vetoed - resubmit a materially different PSBT to try again")]
@@ -215,20 +238,54 @@ pub async fn submit_for_signing(
     server_key: &ServerSigningKey,
     ledger: &Ledger,
     policy: &CompiledPolicy,
+    recovery: &RecoveryConfig,
     notifier: &dyn Notifier,
     hold_seconds: i64,
     now: i64,
 ) -> Result<SubmitOutcome, SubmitError> {
-    if report.spending_path != SpendingPath::Hot {
-        return Err(SubmitError::NotHotPath);
+    // Freeze is checked first and unconditionally: it's the "something is wrong, stop
+    // everything" control, so it must not be reachable-around by any path below.
+    if ledger.is_frozen().await? {
+        return Err(SubmitError::Frozen(
+            "co-signing is frozen; unfreeze with a SATOCHIP-signed POST /unfreeze or the \
+             `cosigner unfreeze` CLI"
+                .to_string(),
+        ));
     }
+
+    let is_recovery = match report.spending_path {
+        SpendingPath::Hot => false,
+        SpendingPath::Recovery if recovery.enabled => true,
+        SpendingPath::Recovery => return Err(SubmitError::RecoveryDisabled),
+        SpendingPath::Ambiguous => return Err(SubmitError::NotHotPath),
+    };
+    // A recovery spend waits far longer than a normal one - for a UTXO already older than the
+    // script timelock, this hold is the *only* thing standing between a stolen phone and the
+    // coins, so it is the primary control rather than a backstop.
+    let hold_seconds = if is_recovery {
+        recovery.hold_seconds
+    } else {
+        hold_seconds
+    };
+    let recovery_whitelist = recovery
+        .compiled_whitelist(cfg.network)
+        .map_err(SubmitError::Internal)?;
+    let recovery_whitelist = recovery_whitelist.as_deref();
 
     let txid = psbt.unsigned_tx.compute_txid().to_string();
     let mut ltx = ledger.begin().await?;
 
     if ltx.already_recorded(&txid).await? {
         let outcome = decide_and_sign(
-            &mut ltx, psbt, &report, wallet, cfg, server_key, policy, now,
+            &mut ltx,
+            psbt,
+            &report,
+            wallet,
+            cfg,
+            server_key,
+            policy,
+            recovery_whitelist,
+            now,
         )
         .await
         .map_err(|e| SubmitError::Internal(anyhow::anyhow!(e)))?;
@@ -265,8 +322,13 @@ pub async fn submit_for_signing(
         };
     }
 
-    let rolling = ltx.rolling_totals(now).await?;
-    if let PolicyDecision::Deny(violations) = policy::evaluate_policy(&report, &rolling, policy) {
+    let submission_decision = if is_recovery {
+        policy::evaluate_recovery_policy(&report, recovery_whitelist)
+    } else {
+        let rolling = ltx.rolling_totals(now).await?;
+        policy::evaluate_policy(&report, &rolling, policy)
+    };
+    if let PolicyDecision::Deny(violations) = submission_decision {
         ltx.rollback().await?;
         return Err(SubmitError::Denied(violations));
     }
@@ -332,11 +394,17 @@ pub async fn process_due_pending_row(
     cfg: &WalletConfig,
     server_key: &ServerSigningKey,
     policy: &CompiledPolicy,
+    recovery: &RecoveryConfig,
     chain: &Arc<dyn ChainSource>,
     gap_limit: u32,
     txid: &str,
     now: i64,
 ) -> Result<PendingOutcome> {
+    // A freeze holds due rows in place rather than failing them: the point is to stop signing
+    // while you sort something out, then resume - not to destroy the queue.
+    if ledger.is_frozen().await? {
+        return Ok(PendingOutcome::Skipped);
+    }
     // Read outside any open transaction first: the chain I/O below can be slow, and holding
     // the ledger's single connection for its duration would block every other ledger user
     // (including `POST /veto/{id}`) for no reason.
@@ -390,15 +458,32 @@ pub async fn process_due_pending_row(
         }
     }
 
-    if report.spending_path != SpendingPath::Hot {
-        let message = "no longer classifies as the HOT spending path".to_string();
+    let path_ok = match report.spending_path {
+        SpendingPath::Hot => true,
+        SpendingPath::Recovery => recovery.enabled,
+        SpendingPath::Ambiguous => false,
+    };
+    if !path_ok {
+        let message = format!(
+            "no longer a co-signable spending path at fire time (now {:?})",
+            report.spending_path
+        );
         ltx.mark_pending_failed(txid, &message).await?;
         ltx.commit().await?;
         return Ok(PendingOutcome::Failed(message));
     }
+    let recovery_whitelist = recovery.compiled_whitelist(cfg.network)?;
 
     match decide_and_sign(
-        &mut ltx, psbt, &report, wallet, cfg, server_key, policy, now,
+        &mut ltx,
+        psbt,
+        &report,
+        wallet,
+        cfg,
+        server_key,
+        policy,
+        recovery_whitelist.as_deref(),
+        now,
     )
     .await
     {
@@ -446,6 +531,7 @@ pub async fn sweep_due(
     cfg: &WalletConfig,
     server_key: &ServerSigningKey,
     policy: &CompiledPolicy,
+    recovery: &RecoveryConfig,
     chain: &Arc<dyn ChainSource>,
     gap_limit: u32,
     now: i64,
@@ -457,7 +543,7 @@ pub async fn sweep_due(
     let mut results = Vec::with_capacity(due.len());
     for txid in due {
         let outcome = process_due_pending_row(
-            ledger, wallet, cfg, server_key, policy, chain, gap_limit, &txid, now,
+            ledger, wallet, cfg, server_key, policy, recovery, chain, gap_limit, &txid, now,
         )
         .await;
         results.push((txid, outcome));
@@ -485,17 +571,17 @@ mod tests {
     use crate::policy::PolicyConfig;
     use crate::test_util::{test_server_xpriv, test_wallet_config};
 
-    fn fake_txid(byte: u8) -> Txid {
+    pub(super) fn fake_txid(byte: u8) -> Txid {
         Txid::from_byte_array([byte; 32])
     }
 
-    fn foreign_script(fill: u8) -> ScriptBuf {
+    pub(super) fn foreign_script(fill: u8) -> ScriptBuf {
         let mut bytes = vec![0x00, 0x20];
         bytes.extend_from_slice(&[fill; 32]);
         ScriptBuf::from(bytes)
     }
 
-    fn load_test_server_key(cfg: &WalletConfig, env_var: &str) -> ServerSigningKey {
+    pub(super) fn load_test_server_key(cfg: &WalletConfig, env_var: &str) -> ServerSigningKey {
         let xprv = test_server_xpriv();
         // SAFETY: test-only; each test uses a distinct env var name to avoid cross-test races.
         unsafe { std::env::set_var(env_var, xprv.to_string()) };
@@ -506,7 +592,7 @@ mod tests {
         ServerSigningKey::load(&signing_cfg, &cfg.keys.server.xpub, cfg.network).unwrap()
     }
 
-    fn policy_with_caps(
+    pub(super) fn policy_with_caps(
         network: ChainNetwork,
         max_tx_sat: u64,
         max_daily_sat: u64,
@@ -529,7 +615,7 @@ mod tests {
     /// destination. `Sequence::ENABLE_RBF_NO_LOCKTIME` doesn't satisfy any relative timelock,
     /// so this classifies as HOT regardless of which (if any) signatures are attached - no
     /// need to fake a SATOCHIP signature just to exercise the policy/ledger orchestration.
-    fn hot_psbt(
+    pub(super) fn hot_psbt(
         chain: &MockChainSource,
         wallet: &BuiltDescriptor,
         txid_byte: u8,
@@ -573,6 +659,61 @@ mod tests {
             value: Amount::from_sat(amount_sat),
             script_pubkey,
         });
+        psbt
+    }
+
+    /// A MOBILE + SERVER recovery-shaped PSBT: nSequence satisfies `older(N)` and a MOBILE
+    /// signature is already attached, which is what makes `inspect` classify it as `Recovery`.
+    /// The MOBILE signature here is a stand-in (the classifier only checks that one is present
+    /// for the right key), which is enough to exercise the recovery gate and policy.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn recovery_psbt(
+        chain: &MockChainSource,
+        wallet: &BuiltDescriptor,
+        cfg: &WalletConfig,
+        txid_byte: u8,
+        index: u32,
+        amount_sat: u64,
+        fee_sat: u64,
+    ) -> Psbt {
+        let script_pubkey = descriptor::at_index(&wallet.external, index)
+            .unwrap()
+            .script_pubkey();
+        let outpoint = OutPoint::new(fake_txid(txid_byte), 0);
+        chain.insert(
+            outpoint,
+            Utxo {
+                txout: TxOut {
+                    value: Amount::from_sat(amount_sat),
+                    script_pubkey: script_pubkey.clone(),
+                },
+                confirmations: 100_000,
+            },
+        );
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::from_height(cfg.timelock_blocks),
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(amount_sat - fee_sat),
+                script_pubkey: foreign_script(txid_byte),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(amount_sat),
+            script_pubkey,
+        });
+        let role_keys = descriptor::role_keys_at(wallet, cfg, Chain::External, index).unwrap();
+        psbt.inputs[0].partial_sigs.insert(
+            role_keys.mobile,
+            crate::test_util::test_signature(&crate::test_util::test_signer(0x99).secret),
+        );
         psbt
     }
 
@@ -849,16 +990,20 @@ mod tests {
 
     // ---- M5: submit_for_signing / process_due_pending_row / sweep_due ----
 
-    struct QueueFixture {
-        cfg: WalletConfig,
-        wallet: BuiltDescriptor,
-        chain: Arc<MockChainSource>,
-        server_key: ServerSigningKey,
-        ledger: Ledger,
-        policy: CompiledPolicy,
+    pub(super) struct QueueFixture {
+        pub(super) cfg: WalletConfig,
+        pub(super) wallet: BuiltDescriptor,
+        pub(super) chain: Arc<MockChainSource>,
+        pub(super) server_key: ServerSigningKey,
+        pub(super) ledger: Ledger,
+        pub(super) policy: CompiledPolicy,
     }
 
-    async fn queue_fixture(env_var: &str, max_tx_sat: u64, max_daily_sat: u64) -> QueueFixture {
+    pub(super) async fn queue_fixture(
+        env_var: &str,
+        max_tx_sat: u64,
+        max_daily_sat: u64,
+    ) -> QueueFixture {
         let cfg = test_wallet_config(12960);
         let wallet = build_descriptor(&cfg).unwrap();
         let chain = Arc::new(MockChainSource::new());
@@ -876,7 +1021,7 @@ mod tests {
     }
 
     impl QueueFixture {
-        fn chain_as_dyn(&self) -> Arc<dyn ChainSource> {
+        pub(super) fn chain_as_dyn(&self) -> Arc<dyn ChainSource> {
             self.chain.clone()
         }
     }
@@ -898,6 +1043,7 @@ mod tests {
             &f.server_key,
             &f.ledger,
             &f.policy,
+            &RecoveryConfig::default(),
             &notifier,
             300,
             1_000_000,
@@ -949,6 +1095,7 @@ mod tests {
             &f.server_key,
             &f.ledger,
             &f.policy,
+            &RecoveryConfig::default(),
             &notifier,
             300,
             1_000_000,
@@ -965,6 +1112,7 @@ mod tests {
             &f.server_key,
             &f.ledger,
             &f.policy,
+            &RecoveryConfig::default(),
             &notifier,
             300,
             1_000_100,
@@ -1005,6 +1153,7 @@ mod tests {
             &f.server_key,
             &f.ledger,
             &f.policy,
+            &RecoveryConfig::default(),
             &notifier,
             300,
             1_000_000,
@@ -1019,6 +1168,7 @@ mod tests {
             &f.cfg,
             &f.server_key,
             &f.policy,
+            &RecoveryConfig::default(),
             &chain_dyn,
             50,
             1_000_299,
@@ -1047,6 +1197,7 @@ mod tests {
             &f.server_key,
             &f.ledger,
             &f.policy,
+            &RecoveryConfig::default(),
             &notifier,
             300,
             1_000_000,
@@ -1061,6 +1212,7 @@ mod tests {
             &f.cfg,
             &f.server_key,
             &f.policy,
+            &RecoveryConfig::default(),
             &chain_dyn,
             50,
             1_000_300,
@@ -1097,6 +1249,7 @@ mod tests {
             &f.cfg,
             &f.server_key,
             &f.policy,
+            &RecoveryConfig::default(),
             &chain_dyn,
             50,
             1_000_301,
@@ -1121,6 +1274,7 @@ mod tests {
             &f.server_key,
             &f.ledger,
             &f.policy,
+            &RecoveryConfig::default(),
             &notifier,
             300,
             1_000_000,
@@ -1140,6 +1294,7 @@ mod tests {
             &f.cfg,
             &f.server_key,
             &f.policy,
+            &RecoveryConfig::default(),
             &chain_dyn,
             50,
             1_000_300,
@@ -1165,6 +1320,7 @@ mod tests {
             &f.server_key,
             &f.ledger,
             &f.policy,
+            &RecoveryConfig::default(),
             &notifier,
             300,
             1_000_301,
@@ -1196,6 +1352,7 @@ mod tests {
             &f.server_key,
             &f.ledger,
             &f.policy,
+            &RecoveryConfig::default(),
             &notifier,
             0,
             1_000_000,
@@ -1215,6 +1372,7 @@ mod tests {
             &f.server_key,
             &f.ledger,
             &f.policy,
+            &RecoveryConfig::default(),
             &notifier,
             0,
             1_000_000,
@@ -1233,6 +1391,7 @@ mod tests {
             &f.cfg,
             &f.server_key,
             &f.policy,
+            &RecoveryConfig::default(),
             &chain_dyn,
             50,
             1_000_000,
@@ -1282,6 +1441,7 @@ mod tests {
             &f.server_key,
             &f.ledger,
             &f.policy,
+            &RecoveryConfig::default(),
             &notifier,
             300,
             1_000_000,
@@ -1301,6 +1461,7 @@ mod tests {
             &f.cfg,
             &f.server_key,
             &f.policy,
+            &RecoveryConfig::default(),
             &chain_dyn,
             50,
             1_000_300,
@@ -1362,6 +1523,7 @@ mod tests {
             &f.server_key,
             &f.ledger,
             &f.policy,
+            &RecoveryConfig::default(),
             &notifier,
             300,
             1_000_000,
@@ -1371,5 +1533,324 @@ mod tests {
         assert!(matches!(err, SubmitError::NotHotPath));
         assert!(f.ledger.get_pending(&txid).await.unwrap().is_none());
         assert!(notifier.sent.lock().unwrap().is_empty());
+    }
+}
+
+/// Re-notifies about spends still holding, so a single missed message can't silently cost you
+/// the veto window. Called on the same tick as [`sweep_due`]; `interval_seconds` is how long
+/// to leave between reminders for a given spend.
+pub async fn renotify_pending(
+    ledger: &Ledger,
+    notifier: &dyn Notifier,
+    interval_seconds: i64,
+    now: i64,
+) -> Result<usize> {
+    let rows = ledger
+        .pending_needing_renotify(now, interval_seconds)
+        .await?;
+    let mut sent = 0usize;
+    for row in rows {
+        let notice = PendingNotice {
+            txid: &row.txid,
+            spend_sat: row.spend_amount_sat,
+            fee_sat: row.fee_sat,
+            // Destinations aren't stored on the row; the reminder is a nudge to go look, and
+            // re-deriving them would mean re-inspecting against the chain on every tick.
+            destinations: &[],
+            hold_until: row.hold_until,
+        };
+        if let Err(e) = notifier.notify(&notice).await {
+            // A failed reminder must not stop the others, and must not fail the spend - the
+            // original notification already went out at submission time.
+            tracing::warn!(txid = %row.txid, error = %e, "reminder notification failed");
+            continue;
+        }
+        ledger.mark_notified(&row.txid, now).await?;
+        sent += 1;
+    }
+    Ok(sent)
+}
+
+#[cfg(test)]
+mod recovery_and_freeze_tests {
+    use super::tests::*;
+    use super::*;
+    use crate::notify::mock::RecordingNotifier;
+
+    /// Freeze must stop a submission dead, before anything is queued or notified.
+    #[tokio::test]
+    async fn a_freeze_blocks_new_submissions_entirely() {
+        let f = queue_fixture("COSIGNER_TEST_FREEZE_SUBMIT", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+        f.ledger.set_frozen(true, 0, Some("test")).await.unwrap();
+
+        let psbt = hot_psbt(&f.chain, &f.wallet, 60, 0, 100_000, 1_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+
+        let err = submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &RecoveryConfig::default(),
+            &notifier,
+            300,
+            1_000_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SubmitError::Frozen(_)), "got {err:?}");
+        assert!(f.ledger.get_pending(&txid).await.unwrap().is_none());
+        assert!(notifier.sent.lock().unwrap().is_empty());
+    }
+
+    /// A freeze applied *after* something is already queued must stop it firing, and lifting
+    /// the freeze must let it through - held, not destroyed.
+    #[tokio::test]
+    async fn a_freeze_holds_already_queued_spends_then_releases_them() {
+        let f = queue_fixture("COSIGNER_TEST_FREEZE_SWEEP", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+
+        let psbt = hot_psbt(&f.chain, &f.wallet, 61, 0, 100_000, 1_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &RecoveryConfig::default(),
+            &notifier,
+            0,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+
+        f.ledger.set_frozen(true, 1_000_001, None).await.unwrap();
+        let chain_dyn = f.chain_as_dyn();
+        let results = sweep_due(
+            &f.ledger,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.policy,
+            &RecoveryConfig::default(),
+            &chain_dyn,
+            50,
+            1_000_100,
+        )
+        .await;
+        assert!(
+            results
+                .iter()
+                .all(|(_, r)| matches!(r.as_ref().unwrap(), PendingOutcome::Skipped)),
+            "a frozen sweep must skip, not sign: {results:?}"
+        );
+        assert_eq!(
+            f.ledger.rolling_totals(1_000_100).await.unwrap(),
+            crate::ledger::RollingTotals::default()
+        );
+
+        f.ledger.set_frozen(false, 1_000_200, None).await.unwrap();
+        let results = sweep_due(
+            &f.ledger,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.policy,
+            &RecoveryConfig::default(),
+            &chain_dyn,
+            50,
+            1_000_300,
+        )
+        .await;
+        assert!(
+            matches!(results[0].1.as_ref().unwrap(), PendingOutcome::Signed(_)),
+            "unfreezing must release the held spend: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_disabled_refuses_the_no_hardware_path() {
+        let f = queue_fixture("COSIGNER_TEST_RECOVERY_OFF", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+        let disabled = RecoveryConfig {
+            enabled: false,
+            ..RecoveryConfig::default()
+        };
+
+        // A recovery-shaped PSBT: sequence satisfies older(N) and MOBILE has signed.
+        let psbt = recovery_psbt(&f.chain, &f.wallet, &f.cfg, 62, 0, 100_000, 1_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        assert_eq!(report.spending_path, SpendingPath::Recovery);
+
+        let err = submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &disabled,
+            &notifier,
+            300,
+            1_000_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SubmitError::RecoveryDisabled), "got {err:?}");
+    }
+
+    /// The point of the whole descriptor change: with the SATOCHIP gone, MOBILE + SERVER must
+    /// actually get co-signed - and it must ignore the ordinary per-tx cap, because sweeping
+    /// the balance is the entire purpose.
+    #[tokio::test]
+    async fn recovery_spend_is_cosigned_and_ignores_the_ordinary_caps() {
+        // A per-tx cap far below the spend: a HOT spend this size would be denied outright.
+        let f = queue_fixture("COSIGNER_TEST_RECOVERY_ON", 1_000, 1_000).await;
+        let notifier = RecordingNotifier::new();
+        let recovery = RecoveryConfig::default();
+
+        let psbt = recovery_psbt(&f.chain, &f.wallet, &f.cfg, 63, 0, 100_000, 1_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        assert_eq!(report.spending_path, SpendingPath::Recovery);
+
+        let outcome = submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &recovery,
+            &notifier,
+            0,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        let SubmitOutcome::Queued { hold_until, .. } = outcome else {
+            panic!("expected Queued, got {outcome:?}");
+        };
+        // It used the recovery hold, not the caller's hold_seconds of 0.
+        assert_eq!(hold_until, 1_000_000 + recovery.hold_seconds);
+
+        let chain_dyn = f.chain_as_dyn();
+        let results = sweep_due(
+            &f.ledger,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.policy,
+            &recovery,
+            &chain_dyn,
+            50,
+            1_000_000 + recovery.hold_seconds,
+        )
+        .await;
+        assert!(
+            matches!(results[0].1.as_ref().unwrap(), PendingOutcome::Signed(_)),
+            "MOBILE+SERVER recovery must be co-signed despite the 1000 sat cap: {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_whitelist_blocks_an_unlisted_destination() {
+        let f = queue_fixture("COSIGNER_TEST_RECOVERY_WL", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+        let recovery = RecoveryConfig {
+            // A valid signet address that is deliberately NOT where this PSBT pays.
+            destination_whitelist: Some(vec![crate::descriptor::address_at(
+                &f.wallet.external,
+                9,
+                f.cfg.network,
+            )
+            .unwrap()
+            .to_string()]),
+            ..RecoveryConfig::default()
+        };
+
+        let psbt = recovery_psbt(&f.chain, &f.wallet, &f.cfg, 64, 0, 100_000, 1_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+
+        let err = submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &recovery,
+            &notifier,
+            0,
+            1_000_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SubmitError::Denied(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn reminders_fire_on_interval_and_only_while_still_holding() {
+        let f = queue_fixture("COSIGNER_TEST_RENOTIFY", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+
+        let psbt = hot_psbt(&f.chain, &f.wallet, 65, 0, 100_000, 1_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &RecoveryConfig::default(),
+            &notifier,
+            10_000,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            notifier.sent.lock().unwrap().len(),
+            1,
+            "initial notification"
+        );
+
+        // Too soon: the submission notification counts as the last one sent.
+        let n = renotify_pending(&f.ledger, &notifier, 3_600, 1_001_000)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "must not remind before the interval elapses");
+
+        let n = renotify_pending(&f.ledger, &notifier, 3_600, 1_004_000)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "must remind once the interval has elapsed");
+        assert_eq!(notifier.sent.lock().unwrap().len(), 2);
+
+        // And immediately again is too soon once more.
+        let n = renotify_pending(&f.ledger, &notifier, 3_600, 1_004_100)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+
+        // Past the hold, it's due rather than holding - the sweeper's job now, not the
+        // reminder's.
+        let n = renotify_pending(&f.ledger, &notifier, 3_600, 1_020_000)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "must not remind about a spend that's already due");
     }
 }

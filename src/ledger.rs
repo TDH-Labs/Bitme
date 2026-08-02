@@ -187,6 +187,105 @@ impl Ledger {
         .execute(&self.pool)
         .await
         .context("creating policy_state table")?;
+
+        // The freeze kill-switch: a single row (`id = 1`) that, when set, makes this service
+        // refuse to co-sign anything at all. Durable on purpose - a freeze must survive a
+        // restart, or "turn it off and on again" would silently disarm it.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS freeze_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                frozen INTEGER NOT NULL,
+                changed_at INTEGER NOT NULL,
+                reason TEXT
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("creating freeze_state table")?;
+
+        // Added after the initial pending_signatures schema shipped, so it goes on as an ALTER
+        // rather than a column in the CREATE above - existing databases must keep working.
+        // SQLite has no `ADD COLUMN IF NOT EXISTS`; re-running it on a database that already
+        // has the column errors, which is the expected steady state, so that one error is
+        // swallowed and anything else propagates.
+        let alter = sqlx::query(
+            "ALTER TABLE pending_signatures ADD COLUMN last_notified_at INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+        match alter {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(anyhow::Error::new(e).context("adding last_notified_at column")),
+        }
+        Ok(())
+    }
+
+    /// Pending rows that are still holding (not yet due) and haven't been notified about since
+    /// `now - interval`. Reminding during the window is the difference between "you had a
+    /// chance to veto" and "you missed the one notification and never knew" - Bitkey pings
+    /// repeatedly across its delay window for exactly this reason.
+    pub async fn pending_needing_renotify(
+        &self,
+        now: i64,
+        interval_seconds: i64,
+    ) -> Result<Vec<PendingRow>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT txid FROM pending_signatures
+             WHERE status = ?1 AND hold_until > ?2 AND last_notified_at <= ?3",
+        )
+        .bind(PendingStatus::Pending.as_str())
+        .bind(now)
+        .bind(now - interval_seconds)
+        .fetch_all(&self.pool)
+        .await
+        .context("querying pending rows needing re-notification")?;
+
+        let mut out = Vec::new();
+        for (txid,) in rows {
+            if let Some(row) = self.get_pending(&txid).await? {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn mark_notified(&self, txid: &str, at: i64) -> Result<()> {
+        sqlx::query("UPDATE pending_signatures SET last_notified_at = ?1 WHERE txid = ?2")
+            .bind(at)
+            .bind(txid)
+            .execute(&self.pool)
+            .await
+            .context("updating last_notified_at")?;
+        Ok(())
+    }
+
+    /// Whether signing is currently frozen. Absent row = not frozen.
+    pub async fn is_frozen(&self) -> Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT frozen FROM freeze_state WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await
+            .context("querying freeze_state")?;
+        Ok(row.is_some_and(|(f,)| f != 0))
+    }
+
+    pub async fn set_frozen(
+        &self,
+        frozen: bool,
+        changed_at: i64,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO freeze_state (id, frozen, changed_at, reason) VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET frozen = excluded.frozen, \
+                changed_at = excluded.changed_at, reason = excluded.reason",
+        )
+        .bind(i64::from(frozen))
+        .bind(changed_at)
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .context("writing freeze_state")?;
         Ok(())
     }
 
@@ -390,8 +489,9 @@ impl LedgerTx {
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO pending_signatures
-                (txid, psbt_base64, spend_amount_sat, fee_sat, created_at, hold_until, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (txid, psbt_base64, spend_amount_sat, fee_sat, created_at, hold_until, status,
+                 last_notified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?5)",
         )
         .bind(txid)
         .bind(psbt_base64)

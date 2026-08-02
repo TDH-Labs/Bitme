@@ -5,8 +5,9 @@ use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
+use bitcoin::address::NetworkUnchecked;
 use bitcoin::bip32::{DerivationPath, Xpub};
-use bitcoin::{Network, NetworkKind};
+use bitcoin::{Address, Network, NetworkKind};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -123,6 +124,101 @@ pub struct WalletConfig {
     /// an approved spend is never signed immediately - it's queued, a notification is sent,
     /// and it only actually gets signed once `hold_seconds` has passed with no veto.
     pub notify: Option<NotifyConfig>,
+    /// Governs whether this service will co-sign the MOBILE + SERVER recovery path (the one
+    /// that exists for a lost/destroyed SATOCHIP). Absent means the defaults below.
+    pub recovery: Option<RecoveryConfig>,
+}
+
+/// Policy for the MOBILE + SERVER spending path.
+///
+/// This path deserves its own settings rather than reusing `[policy]`, for two reasons:
+///
+/// 1. Its legitimate use is *sweeping the whole balance* to a replacement wallet, so the
+///    ordinary per-transaction and rolling caps are exactly the wrong gate - they'd block the
+///    only thing it's for.
+/// 2. It is the one path that moves money with no hardware key involved, so it warrants a
+///    longer hold and louder notification than day-to-day spending.
+///
+/// **On the relative timelock.** `older(N)` is a BIP68 *relative* locktime: it requires the
+/// input to be N blocks deep, not that N blocks pass from now. Coins that have been sitting
+/// longer than N blocks already satisfy it, so for a mature wallet this path is available
+/// immediately and `hold_seconds` below is the *primary* protection against a stolen phone,
+/// not a secondary one. Set it generously.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecoveryConfig {
+    /// Whether to co-sign MOBILE + SERVER at all. Default `true` - if this were off by
+    /// default, the lost-SATOCHIP recovery path would be broken by default, which defeats the
+    /// point of having it.
+    ///
+    /// Deliberately a plain config value rather than something gated behind a SATOCHIP-signed
+    /// policy change: needing the SATOCHIP to enable the recover-from-a-lost-SATOCHIP path
+    /// would be circular. Editing it requires access to this server, which you have and a
+    /// phone thief does not.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How long a recovery spend is held before signing. Defaults to 48h - much longer than a
+    /// normal spend's hold, because see the note above about mature coins.
+    #[serde(default = "default_recovery_hold_seconds")]
+    pub hold_seconds: i64,
+    /// If set, recovery spends may only pay these addresses. Strongly recommended: pre-commit
+    /// to the address you'd sweep to, and a stolen phone can't redirect the funds even if it
+    /// gets past everything else.
+    #[serde(default)]
+    pub destination_whitelist: Option<Vec<String>>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_recovery_hold_seconds() -> i64 {
+    48 * 60 * 60
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hold_seconds: default_recovery_hold_seconds(),
+            destination_whitelist: None,
+        }
+    }
+}
+
+impl RecoveryConfig {
+    fn validate(&self, network: ChainNetwork) -> Result<()> {
+        if self.hold_seconds < 0 {
+            bail!("recovery.hold_seconds must not be negative");
+        }
+        if let Some(list) = &self.destination_whitelist {
+            for entry in list {
+                Address::<NetworkUnchecked>::from_str(entry)
+                    .with_context(|| {
+                        format!("recovery.destination_whitelist entry {entry:?} is not a valid address")
+                    })?
+                    .require_network(network.to_bitcoin_network())
+                    .with_context(|| {
+                        format!("recovery.destination_whitelist entry {entry:?} is not valid for {network:?}")
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parsed, network-checked whitelist - `None` means "any destination".
+    pub fn compiled_whitelist(&self, network: ChainNetwork) -> Result<Option<Vec<Address>>> {
+        self.destination_whitelist
+            .as_ref()
+            .map(|list| {
+                list.iter()
+                    .map(|s| {
+                        Ok(Address::<NetworkUnchecked>::from_str(s)?
+                            .require_network(network.to_bitcoin_network())?)
+                    })
+                    .collect::<Result<Vec<Address>>>()
+            })
+            .transpose()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +231,11 @@ pub struct NotifyConfig {
     /// How often the background sweeper checks for spends whose hold has elapsed.
     #[serde(default = "default_sweep_interval_seconds")]
     pub sweep_interval_seconds: u64,
+    /// How long between reminder notifications for a spend that's still holding. One missed
+    /// message shouldn't silently cost you the veto window. Default 6h; set to a large number
+    /// to effectively disable reminders.
+    #[serde(default = "default_renotify_interval_seconds")]
+    pub renotify_interval_seconds: i64,
     #[serde(default)]
     pub ntfy: Option<NtfyConfig>,
     #[serde(default)]
@@ -143,6 +244,10 @@ pub struct NotifyConfig {
 
 fn default_sweep_interval_seconds() -> u64 {
     5
+}
+
+fn default_renotify_interval_seconds() -> i64 {
+    6 * 60 * 60
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -326,7 +431,16 @@ impl WalletConfig {
             notify.validate().context("[notify]")?;
         }
 
+        if let Some(recovery) = &self.recovery {
+            recovery.validate(self.network).context("[recovery]")?;
+        }
+
         Ok(())
+    }
+
+    /// `[recovery]`, or the defaults if the section is absent.
+    pub fn recovery_config(&self) -> RecoveryConfig {
+        self.recovery.clone().unwrap_or_default()
     }
 
     /// `cosigner serve` needs `[bitcoind]` and `[server]`; the descriptor CLI doesn't.
@@ -431,6 +545,7 @@ mod tests {
         cfg.notify = Some(NotifyConfig {
             hold_seconds: 300,
             sweep_interval_seconds: 5,
+            renotify_interval_seconds: 21600,
             ntfy: None,
             smtp: None,
         });
@@ -444,6 +559,7 @@ mod tests {
         cfg.notify = Some(NotifyConfig {
             hold_seconds: 0,
             sweep_interval_seconds: 5,
+            renotify_interval_seconds: 21600,
             ntfy: Some(NtfyConfig {
                 url: "https://ntfy.sh/example".to_string(),
                 auth_token: None,
@@ -459,6 +575,7 @@ mod tests {
         cfg.notify = Some(NotifyConfig {
             hold_seconds: -1,
             sweep_interval_seconds: 5,
+            renotify_interval_seconds: 21600,
             ntfy: Some(NtfyConfig {
                 url: "https://ntfy.sh/example".to_string(),
                 auth_token: None,
