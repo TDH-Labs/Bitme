@@ -8,6 +8,8 @@ use cosigner::config::{BitcoindConfig, WalletConfig};
 use cosigner::descriptor::{self, BuiltDescriptor};
 use cosigner::http::{self, AppState};
 use cosigner::invariants::{self, InvariantReport, LabeledKey};
+use cosigner::ledger::Ledger;
+use cosigner::signing::ServerSigningKey;
 use miniscript::descriptor::DefiniteDescriptorKey;
 use miniscript::{Descriptor, DescriptorPublicKey, ForEachKey};
 
@@ -92,6 +94,11 @@ fn run() -> Result<()> {
 fn cmd_serve(args: ServeArgs) -> Result<()> {
     let cfg = WalletConfig::load(&args.config)?;
     let (bitcoind_cfg, server_cfg) = cfg.require_server_config()?;
+    let (policy_cfg, signing_cfg) = cfg.require_signing_config()?;
+    let ledger_db_path = server_cfg
+        .ledger_db_path
+        .clone()
+        .context("config is missing server.ledger_db_path, required for /sign_psbt")?;
     let wallet = descriptor::build_descriptor(&cfg)?;
 
     let report = run_invariants(&wallet, &cfg)?;
@@ -99,21 +106,32 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
         bail!("refusing to start: descriptor failed invariant checks");
     }
 
+    let server_key = ServerSigningKey::load(signing_cfg, &cfg.keys.server.xpub, cfg.network)?;
+    let policy = Arc::new(policy_cfg.compile(cfg.network)?);
+
     let client = bitcoind_client(bitcoind_cfg)?;
     let chain: Arc<dyn ChainSource> = Arc::new(BitcoindRpc::new(client));
-    let state = AppState {
-        wallet: Arc::new(wallet),
-        cfg: Arc::new(cfg.clone()),
-        chain,
-        gap_limit: server_cfg.gap_limit,
-    };
     let bind_addr = server_cfg.bind_addr.clone();
+    let gap_limit = server_cfg.gap_limit;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting tokio runtime")?;
     rt.block_on(async move {
+        let ledger = Ledger::connect(&ledger_db_path)
+            .await
+            .with_context(|| format!("opening ledger at {ledger_db_path}"))?;
+        let state = AppState {
+            wallet: Arc::new(wallet),
+            cfg: Arc::new(cfg.clone()),
+            chain,
+            gap_limit,
+            server_key: Arc::new(server_key),
+            ledger: Arc::new(ledger),
+            policy,
+        };
+
         let listener = tokio::net::TcpListener::bind(&bind_addr)
             .await
             .with_context(|| format!("binding {bind_addr}"))?;

@@ -6,6 +6,8 @@ pub mod inspect;
 pub mod invariants;
 pub mod ledger;
 pub mod policy;
+pub mod sign;
+pub mod signing;
 
 #[cfg(test)]
 pub(crate) mod test_util;

@@ -185,8 +185,9 @@ impl PolicyDecision {
 }
 
 /// The amount actually leaving the wallet: destination outputs only. Change and
-/// pay-to-self outputs are excluded - see the module doc for why.
-fn destination_total_sat(report: &InspectionReport) -> u64 {
+/// pay-to-self outputs are excluded - see the module doc for why. `pub(crate)` because
+/// `sign.rs` needs the exact same number to record against the ledger.
+pub(crate) fn destination_total_sat(report: &InspectionReport) -> u64 {
     report
         .outputs
         .iter()

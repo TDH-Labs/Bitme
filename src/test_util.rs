@@ -11,9 +11,10 @@ use crate::config::{ChainNetwork, KeySpec, KeysConfig, WalletConfig};
 
 pub const TEST_PATH: &str = "48h/1h/0h/2h";
 
-/// Deterministically derives a (fingerprint, path, xpub) key spec from a single seed byte.
-/// Deterministic on purpose: tests must be reproducible.
-pub fn test_key_spec(seed_byte: u8) -> KeySpec {
+/// Deterministically derives a (fingerprint, path, xpub) key spec plus the matching
+/// account-level xprv from a single seed byte. Deterministic on purpose: tests must be
+/// reproducible.
+pub fn test_key_spec_with_xpriv(seed_byte: u8) -> (KeySpec, Xpriv) {
     let secp = Secp256k1::new();
     let seed = [seed_byte; 32];
     let master = Xpriv::new_master(NetworkKind::Test, &seed).expect("valid seed");
@@ -23,11 +24,22 @@ pub fn test_key_spec(seed_byte: u8) -> KeySpec {
         .derive_priv(&secp, &path)
         .expect("derivation succeeds");
     let xpub = Xpub::from_priv(&secp, &derived);
-    KeySpec {
+    let spec = KeySpec {
         master_fingerprint: fingerprint.to_string(),
         derivation_path: TEST_PATH.to_string(),
         xpub: xpub.to_string(),
-    }
+    };
+    (spec, derived)
+}
+
+pub fn test_key_spec(seed_byte: u8) -> KeySpec {
+    test_key_spec_with_xpriv(seed_byte).0
+}
+
+/// The account-level xprv for the `server` role in [`test_wallet_config`] (seed `0x03`) -
+/// use this to build a matching `ServerSigningKey` in signing tests.
+pub fn test_server_xpriv() -> Xpriv {
+    test_key_spec_with_xpriv(0x03).1
 }
 
 pub fn test_wallet_config(timelock_blocks: u16) -> WalletConfig {
@@ -43,6 +55,7 @@ pub fn test_wallet_config(timelock_blocks: u16) -> WalletConfig {
         bitcoind: None,
         server: None,
         policy: None,
+        server_signing: None,
     }
 }
 
