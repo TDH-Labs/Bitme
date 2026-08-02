@@ -1,26 +1,46 @@
-//! Orchestrates `POST /sign_psbt`: gate on policy (checked atomically against the ledger so
-//! concurrent requests can't race past a rolling limit), sign, and stop - this service never
-//! finalizes or broadcasts anything itself.
+//! Orchestrates `/sign_psbt`'s notify-then-hold-then-sign flow. Nothing here ever signs a
+//! brand-new spend on the spot: [`submit_for_signing`] fast-checks policy, queues the spend in
+//! the ledger's `pending_signatures` table, and sends an out-of-band notification; only the
+//! background sweeper, via [`process_due_pending_row`] once the hold has elapsed, actually
+//! signs and records it - unless a human calls `POST /veto/{id}` first. This service still
+//! never finalizes or broadcasts anything itself.
 //!
-//! Deliberately does *not* call `inspect::inspect` itself: that does blocking bitcoind RPC
-//! I/O, while this function does async SQLite I/O (`sqlx`) - mixing the two in one async fn
-//! would either block the async runtime's worker thread on network I/O, or require awaiting
-//! from inside a blocking task, neither of which is clean. The caller (the HTTP handler) runs
-//! `inspect()` inside `spawn_blocking` first - exactly as `/inspect` already does - and passes
-//! the resulting report in here.
+//! Deliberately does *not* call `inspect::inspect` itself for a fresh submission: that does
+//! blocking bitcoind RPC I/O, while this module does async SQLite I/O (`sqlx`) - mixing the
+//! two in one async fn would either block the async runtime's worker thread on network I/O, or
+//! require awaiting from inside a blocking task, neither of which is clean. The HTTP handler
+//! runs `inspect()` inside `spawn_blocking` first - exactly as `/inspect` already does - and
+//! passes the resulting report in here. [`process_due_pending_row`], which re-inspects a
+//! *stored* PSBT at fire time (chain state may have moved since submission), does its own
+//! `spawn_blocking` internally, since the sweeper has no other caller to do it for it.
 //!
-//! Ordering is deliberate: evaluating policy and recording the spend *before* attempting to
-//! sign would let a failed signature still burn budget; recording *after* signing (and before
-//! the ledger transaction commits) means a crash or error mid-signature leaves nothing
-//! recorded, and returning only after `commit()` succeeds satisfies "record before returning."
+//! [`decide_and_sign`] is the one piece of authoritative policy-then-sign logic, shared by
+//! three callers that must each run it inside exactly one already-open ledger transaction:
+//! the immediate idempotent-replay fast path (in both [`sign_psbt`] and
+//! [`submit_for_signing`]), and fire-time processing (in [`process_due_pending_row`]). It's a
+//! deliberate constraint, not a style choice: this ledger's pool is capped at one connection
+//! (see `ledger.rs`), so opening a *second* transaction from inside a task that's still
+//! holding one open would deadlock forever waiting for a connection that can't free up.
+//!
+//! Ordering is deliberate throughout: evaluating policy and recording the spend *before*
+//! attempting to sign would let a failed signature still burn budget; recording *after*
+//! signing (and before the ledger transaction commits) means a crash or error mid-signature
+//! leaves nothing recorded, and returning only after `commit()` succeeds satisfies "record
+//! before returning."
 
+use std::str::FromStr;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
 use bitcoin::psbt::Psbt;
 use thiserror::Error;
 
+use crate::chain::ChainSource;
 use crate::config::WalletConfig;
 use crate::descriptor::BuiltDescriptor;
-use crate::inspect::{InspectionReport, SpendingPath};
-use crate::ledger::Ledger;
+use crate::inspect::{self, InspectError, InspectionReport, OutputKind, SpendingPath};
+use crate::ledger::{Ledger, LedgerTx, PendingStatus};
+use crate::notify::{Notifier, PendingNotice};
 use crate::policy::{self, CompiledPolicy, PolicyDecision, PolicyViolation};
 use crate::signing::{self, ServerSigningKey, SigningError};
 
@@ -55,13 +75,61 @@ pub struct SignPsbtResult {
     pub ledger: LedgerOutcome,
 }
 
+#[derive(Debug)]
+enum DecideOutcome {
+    Recorded(Psbt),
+    AlreadyRecorded(Psbt),
+    Denied(Vec<PolicyViolation>),
+}
+
+/// The one piece of authoritative "is this still allowed, and if so sign it" logic - see the
+/// module doc for why every caller must supply an already-open `ltx` rather than opening its
+/// own. Stable across however many parties have signed so far: segwit txids never depend on
+/// witness data, so `txid` is the same identifier regardless of signing order or retries.
+#[allow(clippy::too_many_arguments)]
+async fn decide_and_sign(
+    ltx: &mut LedgerTx,
+    mut psbt: Psbt,
+    report: &InspectionReport,
+    wallet: &BuiltDescriptor,
+    cfg: &WalletConfig,
+    server_key: &ServerSigningKey,
+    policy: &CompiledPolicy,
+    now: i64,
+) -> Result<DecideOutcome, SignPsbtError> {
+    let txid = psbt.unsigned_tx.compute_txid().to_string();
+    let spend_sat = policy::destination_total_sat(report);
+    let fee_sat = report.fee.to_sat();
+
+    if ltx.already_recorded(&txid).await? {
+        // ECDSA signing is deterministic, so re-signing an already-recorded spend reproduces
+        // a byte-identical signature; it does not re-evaluate policy, since this exact spend
+        // was already approved once.
+        signing::sign_hot_inputs(&mut psbt, wallet, cfg, server_key, &report.inputs)?;
+        return Ok(DecideOutcome::AlreadyRecorded(psbt));
+    }
+
+    let rolling = ltx.rolling_totals(now).await?;
+    match policy::evaluate_policy(report, &rolling, policy) {
+        PolicyDecision::Deny(violations) => Ok(DecideOutcome::Denied(violations)),
+        PolicyDecision::Allow => {
+            signing::sign_hot_inputs(&mut psbt, wallet, cfg, server_key, &report.inputs)?;
+            ltx.record_spend(&txid, now, spend_sat, fee_sat).await?;
+            Ok(DecideOutcome::Recorded(psbt))
+        }
+    }
+}
+
 /// `report` must be the result of inspecting this exact `psbt` (see the module docs for why
 /// that's the caller's job, not this function's). `now` (unix seconds) is threaded in
 /// explicitly - the underlying steps are otherwise all deterministic given their inputs, and
 /// tests need to control it.
+///
+/// Only ever reaches a `Recorded` outcome via the idempotent-replay path: a *new* approved
+/// spend is never signed here - see [`submit_for_signing`], which queues it instead.
 #[allow(clippy::too_many_arguments)]
 pub async fn sign_psbt(
-    mut psbt: Psbt,
+    psbt: Psbt,
     report: InspectionReport,
     wallet: &BuiltDescriptor,
     cfg: &WalletConfig,
@@ -74,39 +142,21 @@ pub async fn sign_psbt(
         return Err(SignPsbtError::NotHotPath);
     }
 
-    // Stable across however many parties have signed so far: segwit txids never depend on
-    // witness data, so this is the same identifier regardless of signing order or retries.
-    let txid = psbt.unsigned_tx.compute_txid().to_string();
-    let spend_sat = policy::destination_total_sat(&report);
-    let fee_sat = report.fee.to_sat();
-
     let mut ltx = ledger.begin().await?;
-
-    if ltx.already_recorded(&txid).await? {
-        // Nothing to write - roll back the (read-only) transaction and just re-sign. ECDSA
-        // signing is deterministic, so this reproduces byte-identical signatures; it does not
-        // re-evaluate policy, since this exact spend was already approved once.
-        ltx.rollback().await?;
-        signing::sign_hot_inputs(&mut psbt, wallet, cfg, server_key, &report.inputs)?;
-        return Ok(SignPsbtResult {
-            psbt,
-            report,
-            ledger: LedgerOutcome::AlreadyRecorded,
-        });
-    }
-
-    let rolling = ltx.rolling_totals(now).await?;
-    match policy::evaluate_policy(&report, &rolling, policy) {
-        PolicyDecision::Deny(violations) => {
+    match decide_and_sign(
+        &mut ltx, psbt, &report, wallet, cfg, server_key, policy, now,
+    )
+    .await?
+    {
+        DecideOutcome::AlreadyRecorded(psbt) => {
             ltx.rollback().await?;
-            Err(SignPsbtError::Denied(violations))
+            Ok(SignPsbtResult {
+                psbt,
+                report,
+                ledger: LedgerOutcome::AlreadyRecorded,
+            })
         }
-        PolicyDecision::Allow => {
-            // If signing fails here, `ltx` is dropped by the `?` early return without a
-            // commit - sqlx rolls back automatically, so nothing gets recorded for a spend
-            // that was never actually signed.
-            signing::sign_hot_inputs(&mut psbt, wallet, cfg, server_key, &report.inputs)?;
-            ltx.record_spend(&txid, now, spend_sat, fee_sat).await?;
+        DecideOutcome::Recorded(psbt) => {
             ltx.commit().await?;
             Ok(SignPsbtResult {
                 psbt,
@@ -114,7 +164,305 @@ pub async fn sign_psbt(
                 ledger: LedgerOutcome::Recorded,
             })
         }
+        DecideOutcome::Denied(violations) => {
+            ltx.rollback().await?;
+            Err(SignPsbtError::Denied(violations))
+        }
     }
+}
+
+#[derive(Debug, Error)]
+pub enum SubmitError {
+    #[error(
+        "PSBT does not use the HOT spending path (SATOCHIP+SERVER, immediately) - this \
+         service only ever countersigns that path"
+    )]
+    NotHotPath,
+    #[error("policy denied this transaction")]
+    Denied(Vec<PolicyViolation>),
+    #[error("this exact transaction was already vetoed - resubmit a materially different PSBT to try again")]
+    Vetoed,
+    #[error("this exact transaction was already denied when its hold elapsed: {0}")]
+    PreviouslyDenied(String),
+    #[error("this exact transaction previously failed to sign: {0}")]
+    PreviouslyFailed(String),
+    #[error("failed to deliver the out-of-band notification - refusing to queue this spend: {0}")]
+    NotifyFailed(String),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+#[derive(Debug)]
+pub enum SubmitOutcome {
+    /// This exact transaction was already fully processed by an earlier submission - signed
+    /// immediately, just like the pre-M5 idempotent replay. No new hold, no new notification.
+    AlreadySigned(Box<SignPsbtResult>),
+    /// Newly queued (or an idempotent re-submission of one already queued and still pending).
+    Queued { txid: String, hold_until: i64 },
+}
+
+/// The entry point for a spend this service has not seen before: fast-checks policy against
+/// the ledger as it stands right now (so an obviously-over-cap spend is refused immediately,
+/// without notifying anyone or starting a hold), then queues it and notifies. The fast check
+/// is *not* authoritative - [`process_due_pending_row`] re-evaluates policy again at fire time,
+/// since other spends may consume the same rolling budget while this one is held.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_for_signing(
+    psbt: Psbt,
+    report: InspectionReport,
+    wallet: &BuiltDescriptor,
+    cfg: &WalletConfig,
+    server_key: &ServerSigningKey,
+    ledger: &Ledger,
+    policy: &CompiledPolicy,
+    notifier: &dyn Notifier,
+    hold_seconds: i64,
+    now: i64,
+) -> Result<SubmitOutcome, SubmitError> {
+    if report.spending_path != SpendingPath::Hot {
+        return Err(SubmitError::NotHotPath);
+    }
+
+    let txid = psbt.unsigned_tx.compute_txid().to_string();
+    let mut ltx = ledger.begin().await?;
+
+    if ltx.already_recorded(&txid).await? {
+        let outcome = decide_and_sign(
+            &mut ltx, psbt, &report, wallet, cfg, server_key, policy, now,
+        )
+        .await
+        .map_err(|e| SubmitError::Internal(anyhow::anyhow!(e)))?;
+        ltx.rollback().await?;
+        let DecideOutcome::AlreadyRecorded(signed) = outcome else {
+            return Err(SubmitError::Internal(anyhow::anyhow!(
+                "already_recorded=true but decide_and_sign returned {outcome:?}"
+            )));
+        };
+        return Ok(SubmitOutcome::AlreadySigned(Box::new(SignPsbtResult {
+            psbt: signed,
+            report,
+            ledger: LedgerOutcome::AlreadyRecorded,
+        })));
+    }
+
+    if let Some(row) = ltx.get_pending(&txid).await? {
+        ltx.rollback().await?;
+        return match row.status {
+            PendingStatus::Pending => Ok(SubmitOutcome::Queued {
+                txid,
+                hold_until: row.hold_until,
+            }),
+            PendingStatus::Vetoed => Err(SubmitError::Vetoed),
+            PendingStatus::Denied => Err(SubmitError::PreviouslyDenied(
+                row.message.unwrap_or_default(),
+            )),
+            PendingStatus::Failed => Err(SubmitError::PreviouslyFailed(
+                row.message.unwrap_or_default(),
+            )),
+            PendingStatus::Signed => Err(SubmitError::Internal(anyhow::anyhow!(
+                "pending row for {txid} is signed but the ledger has no matching record"
+            ))),
+        };
+    }
+
+    let rolling = ltx.rolling_totals(now).await?;
+    if let PolicyDecision::Deny(violations) = policy::evaluate_policy(&report, &rolling, policy) {
+        ltx.rollback().await?;
+        return Err(SubmitError::Denied(violations));
+    }
+
+    let spend_sat = policy::destination_total_sat(&report);
+    let fee_sat = report.fee.to_sat();
+    let hold_until = now + hold_seconds;
+    let psbt_base64 = psbt.to_string();
+    ltx.insert_pending(&txid, &psbt_base64, spend_sat, fee_sat, now, hold_until)
+        .await?;
+    ltx.commit().await?;
+
+    // Notification happens outside the transaction (it's network I/O) - see the module doc on
+    // why failure here must roll the queue entry to a terminal `failed` state rather than
+    // silently leaving an un-notified hold ticking down toward an unsupervised signature.
+    let destinations: Vec<String> = report
+        .outputs
+        .iter()
+        .filter(|o| o.kind == OutputKind::Destination)
+        .map(|o| {
+            o.address
+                .as_ref()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| o.script_pubkey.to_hex_string())
+        })
+        .collect();
+    let notice = PendingNotice {
+        txid: &txid,
+        spend_sat,
+        fee_sat,
+        destinations: &destinations,
+        hold_until,
+    };
+    if let Err(e) = notifier.notify(&notice).await {
+        let message = format!("notification delivery failed: {e}");
+        let mut ltx = ledger.begin().await?;
+        ltx.mark_pending_failed(&txid, &message).await?;
+        ltx.commit().await?;
+        return Err(SubmitError::NotifyFailed(e.to_string()));
+    }
+
+    Ok(SubmitOutcome::Queued { txid, hold_until })
+}
+
+#[derive(Debug)]
+pub enum PendingOutcome {
+    Signed(Psbt),
+    Denied(Vec<PolicyViolation>),
+    Failed(String),
+    /// The row was resolved (or vetoed) by something else between being listed as due and
+    /// being processed - nothing to do.
+    Skipped,
+}
+
+/// Fire-time processing of one due pending row: re-inspects the *stored* PSBT against live
+/// chain state (never trusts the submission-time snapshot - a reorg or another spend of the
+/// same UTXO could have happened during the hold) and re-evaluates policy from scratch, inside
+/// one ledger transaction shared with [`decide_and_sign`].
+#[allow(clippy::too_many_arguments)]
+pub async fn process_due_pending_row(
+    ledger: &Ledger,
+    wallet: &BuiltDescriptor,
+    cfg: &WalletConfig,
+    server_key: &ServerSigningKey,
+    policy: &CompiledPolicy,
+    chain: &Arc<dyn ChainSource>,
+    gap_limit: u32,
+    txid: &str,
+    now: i64,
+) -> Result<PendingOutcome> {
+    // Read outside any open transaction first: the chain I/O below can be slow, and holding
+    // the ledger's single connection for its duration would block every other ledger user
+    // (including `POST /veto/{id}`) for no reason.
+    let psbt_base64 = match ledger.get_pending(txid).await? {
+        Some(row) if row.status == PendingStatus::Pending => row.psbt_base64,
+        _ => return Ok(PendingOutcome::Skipped),
+    };
+    let psbt = Psbt::from_str(&psbt_base64).context("parsing stored pending psbt")?;
+
+    let wallet_owned = wallet.clone();
+    let cfg_owned = cfg.clone();
+    let chain_owned = chain.clone();
+    let psbt_for_inspect = psbt.clone();
+    let inspect_result: std::result::Result<InspectionReport, InspectError> =
+        tokio::task::spawn_blocking(move || {
+            inspect::inspect(
+                &psbt_for_inspect,
+                &wallet_owned,
+                &cfg_owned,
+                chain_owned.as_ref(),
+                gap_limit,
+            )
+        })
+        .await
+        .context("inspect task panicked")?;
+
+    let report = match inspect_result {
+        Ok(report) => report,
+        Err(InspectError::Chain(e)) => {
+            // Transient (RPC hiccup, node temporarily unreachable): leave the row `pending` so
+            // the next sweep tick retries, rather than permanently failing it.
+            return Err(e.context(format!("re-inspecting pending spend {txid} at fire time")));
+        }
+        Err(e) => {
+            let message = e.to_string();
+            let mut ltx = ledger.begin().await?;
+            ltx.mark_pending_failed(txid, &message).await?;
+            ltx.commit().await?;
+            return Ok(PendingOutcome::Failed(message));
+        }
+    };
+
+    let mut ltx = ledger.begin().await?;
+    // Re-check status inside the transaction: a veto may have landed between the read above
+    // and now.
+    match ltx.get_pending(txid).await? {
+        Some(row) if row.status == PendingStatus::Pending => {}
+        _ => {
+            ltx.rollback().await?;
+            return Ok(PendingOutcome::Skipped);
+        }
+    }
+
+    if report.spending_path != SpendingPath::Hot {
+        let message = "no longer classifies as the HOT spending path".to_string();
+        ltx.mark_pending_failed(txid, &message).await?;
+        ltx.commit().await?;
+        return Ok(PendingOutcome::Failed(message));
+    }
+
+    match decide_and_sign(
+        &mut ltx, psbt, &report, wallet, cfg, server_key, policy, now,
+    )
+    .await
+    {
+        Ok(DecideOutcome::Recorded(signed)) | Ok(DecideOutcome::AlreadyRecorded(signed)) => {
+            ltx.mark_pending_signed(txid, &signed.to_string()).await?;
+            ltx.commit().await?;
+            Ok(PendingOutcome::Signed(signed))
+        }
+        Ok(DecideOutcome::Denied(violations)) => {
+            let message = violations
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            ltx.mark_pending_denied(txid, &message).await?;
+            ltx.commit().await?;
+            Ok(PendingOutcome::Denied(violations))
+        }
+        Err(SignPsbtError::Signing(signing_err)) => {
+            // A structural signing failure (bad sighash type, key mismatch): permanent, will
+            // never succeed on retry - drop `ltx` (auto-rollback) and mark it failed in a
+            // fresh, short transaction.
+            drop(ltx);
+            let message = signing_err.to_string();
+            let mut ltx = ledger.begin().await?;
+            ltx.mark_pending_failed(txid, &message).await?;
+            ltx.commit().await?;
+            Ok(PendingOutcome::Failed(message))
+        }
+        Err(e) => {
+            // A DB/internal error: `ltx` drops without commit (auto-rollback), leaving the row
+            // `pending` so the next sweep tick retries.
+            Err(anyhow::anyhow!(e).context(format!("processing pending spend {txid}")))
+        }
+    }
+}
+
+/// Processes every currently-due pending row. Each row's own failure is captured in its result
+/// entry rather than aborting the sweep - one bad row (e.g. a transient chain RPC error) must
+/// never block every other due row from firing.
+#[allow(clippy::too_many_arguments)]
+pub async fn sweep_due(
+    ledger: &Ledger,
+    wallet: &BuiltDescriptor,
+    cfg: &WalletConfig,
+    server_key: &ServerSigningKey,
+    policy: &CompiledPolicy,
+    chain: &Arc<dyn ChainSource>,
+    gap_limit: u32,
+    now: i64,
+) -> Vec<(String, Result<PendingOutcome>)> {
+    let due = match ledger.due_pending(now).await {
+        Ok(due) => due,
+        Err(e) => return vec![("*".to_string(), Err(e))],
+    };
+    let mut results = Vec::with_capacity(due.len());
+    for txid in due {
+        let outcome = process_due_pending_row(
+            ledger, wallet, cfg, server_key, policy, chain, gap_limit, &txid, now,
+        )
+        .await;
+        results.push((txid, outcome));
+    }
+    results
 }
 
 #[cfg(test)]
@@ -133,6 +481,7 @@ mod tests {
     use crate::config::{ChainNetwork, ServerSigningConfig};
     use crate::descriptor::{self, build_descriptor, Chain};
     use crate::inspect;
+    use crate::notify::mock::RecordingNotifier;
     use crate::policy::PolicyConfig;
     use crate::test_util::{test_server_xpriv, test_wallet_config};
 
@@ -496,5 +845,531 @@ mod tests {
             totals.day_sat, 200,
             "the cap must never be exceeded and no write may be lost"
         );
+    }
+
+    // ---- M5: submit_for_signing / process_due_pending_row / sweep_due ----
+
+    struct QueueFixture {
+        cfg: WalletConfig,
+        wallet: BuiltDescriptor,
+        chain: Arc<MockChainSource>,
+        server_key: ServerSigningKey,
+        ledger: Ledger,
+        policy: CompiledPolicy,
+    }
+
+    async fn queue_fixture(env_var: &str, max_tx_sat: u64, max_daily_sat: u64) -> QueueFixture {
+        let cfg = test_wallet_config(12960);
+        let wallet = build_descriptor(&cfg).unwrap();
+        let chain = Arc::new(MockChainSource::new());
+        let server_key = load_test_server_key(&cfg, env_var);
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        let policy = policy_with_caps(cfg.network, max_tx_sat, max_daily_sat);
+        QueueFixture {
+            cfg,
+            wallet,
+            chain,
+            server_key,
+            ledger,
+            policy,
+        }
+    }
+
+    impl QueueFixture {
+        fn chain_as_dyn(&self) -> Arc<dyn ChainSource> {
+            self.chain.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_queues_a_new_spend_and_notifies_once() {
+        let f = queue_fixture("COSIGNER_TEST_SUBMIT_QUEUE", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+
+        let psbt = hot_psbt(&f.chain, &f.wallet, 1, 0, 100_000, 1_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+
+        let outcome = submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &notifier,
+            300,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            SubmitOutcome::Queued {
+                txid: got_txid,
+                hold_until,
+            } => {
+                assert_eq!(got_txid, txid);
+                assert_eq!(hold_until, 1_000_300);
+            }
+            other => panic!("expected Queued, got {other:?}"),
+        }
+        assert_eq!(
+            notifier.sent.lock().unwrap().as_slice(),
+            std::slice::from_ref(&txid)
+        );
+
+        let row = f.ledger.get_pending(&txid).await.unwrap().unwrap();
+        assert_eq!(row.status, PendingStatus::Pending);
+        // Nothing is recorded against the ledger (and thus the rolling budget) until it fires.
+        assert_eq!(
+            f.ledger.rolling_totals(1_000_000).await.unwrap(),
+            crate::ledger::RollingTotals::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn resubmitting_a_still_pending_spend_is_idempotent_and_does_not_renotify() {
+        let f = queue_fixture("COSIGNER_TEST_SUBMIT_IDEMPOTENT", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+
+        let build = || {
+            let psbt = hot_psbt(&f.chain, &f.wallet, 2, 0, 100_000, 1_000);
+            let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+            (psbt, report)
+        };
+
+        let (psbt_a, report_a) = build();
+        let first = submit_for_signing(
+            psbt_a,
+            report_a,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &notifier,
+            300,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+
+        let (psbt_b, report_b) = build();
+        let second = submit_for_signing(
+            psbt_b,
+            report_b,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &notifier,
+            300,
+            1_000_100,
+        )
+        .await
+        .unwrap();
+
+        let (
+            SubmitOutcome::Queued { hold_until: h1, .. },
+            SubmitOutcome::Queued { hold_until: h2, .. },
+        ) = (first, second)
+        else {
+            panic!("expected both submissions to queue");
+        };
+        assert_eq!(
+            h1, h2,
+            "the hold clock must not restart on a duplicate submission"
+        );
+        assert_eq!(
+            notifier.sent.lock().unwrap().len(),
+            1,
+            "must not notify twice for the same unsigned transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_before_hold_elapses_does_nothing() {
+        let f = queue_fixture("COSIGNER_TEST_SWEEP_NOT_DUE", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+
+        let psbt = hot_psbt(&f.chain, &f.wallet, 3, 0, 100_000, 1_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &notifier,
+            300,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+
+        let chain_dyn = f.chain_as_dyn();
+        let results = sweep_due(
+            &f.ledger,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.policy,
+            &chain_dyn,
+            50,
+            1_000_299,
+        )
+        .await;
+        assert!(results.is_empty(), "hold has not elapsed yet: {results:?}");
+        assert_eq!(
+            f.ledger.rolling_totals(1_000_299).await.unwrap(),
+            crate::ledger::RollingTotals::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_after_hold_elapses_signs_and_records() {
+        let f = queue_fixture("COSIGNER_TEST_SWEEP_DUE", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+
+        let psbt = hot_psbt(&f.chain, &f.wallet, 4, 0, 100_000, 1_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &notifier,
+            300,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+
+        let chain_dyn = f.chain_as_dyn();
+        let results = sweep_due(
+            &f.ledger,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.policy,
+            &chain_dyn,
+            50,
+            1_000_300,
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        let (got_txid, outcome) = &results[0];
+        assert_eq!(got_txid, &txid);
+        let signed_psbt = match outcome.as_ref().unwrap() {
+            PendingOutcome::Signed(psbt) => psbt.clone(),
+            other => panic!("expected Signed, got {other:?}"),
+        };
+        let role_keys = descriptor::role_keys_at(&f.wallet, &f.cfg, Chain::External, 0).unwrap();
+        assert!(signed_psbt.inputs[0]
+            .partial_sigs
+            .contains_key(&role_keys.server));
+
+        let row = f.ledger.get_pending(&txid).await.unwrap().unwrap();
+        assert_eq!(row.status, PendingStatus::Signed);
+        assert_eq!(
+            row.signed_psbt_base64.as_deref(),
+            Some(signed_psbt.to_string().as_str())
+        );
+
+        assert_eq!(
+            f.ledger.rolling_totals(1_000_300).await.unwrap().day_sat,
+            99_000
+        );
+
+        // A second sweep at the same (or later) time must not re-process an already-resolved row.
+        let again = sweep_due(
+            &f.ledger,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.policy,
+            &chain_dyn,
+            50,
+            1_000_301,
+        )
+        .await;
+        assert!(again.is_empty());
+    }
+
+    #[tokio::test]
+    async fn veto_before_hold_elapses_prevents_signing_and_blocks_resubmission() {
+        let f = queue_fixture("COSIGNER_TEST_VETO", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+
+        let psbt = hot_psbt(&f.chain, &f.wallet, 5, 0, 100_000, 1_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &notifier,
+            300,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            f.ledger.veto_pending(&txid).await.unwrap(),
+            Some(PendingStatus::Vetoed)
+        );
+
+        let chain_dyn = f.chain_as_dyn();
+        let results = sweep_due(
+            &f.ledger,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.policy,
+            &chain_dyn,
+            50,
+            1_000_300,
+        )
+        .await;
+        assert!(
+            results.is_empty(),
+            "a vetoed row must never be due: {results:?}"
+        );
+        assert_eq!(
+            f.ledger.rolling_totals(1_000_300).await.unwrap(),
+            crate::ledger::RollingTotals::default()
+        );
+
+        // Resubmitting the identical PSBT must not silently re-queue it.
+        let psbt2 = hot_psbt(&f.chain, &f.wallet, 5, 0, 100_000, 1_000);
+        let report2 = inspect::inspect(&psbt2, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        let err = submit_for_signing(
+            psbt2,
+            report2,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &notifier,
+            300,
+            1_000_301,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SubmitError::Vetoed));
+    }
+
+    /// The race M5's design is built to close: two spends each pass the fast, submission-time
+    /// policy pre-check (since neither has been recorded yet), so both get queued and
+    /// notified - but only one of them can actually fit the rolling cap. The *fire-time*
+    /// re-evaluation inside `process_due_pending_row` is what must catch this, not the
+    /// submission-time check.
+    #[tokio::test]
+    async fn policy_denied_at_fire_time_even_though_allowed_at_submission() {
+        // Cap fits exactly one of the two 100_000 sat destination spends, not both.
+        let f = queue_fixture("COSIGNER_TEST_FIRE_TIME_DENY", u64::MAX, 150_000).await;
+        let notifier = RecordingNotifier::new();
+
+        let psbt_a = hot_psbt(&f.chain, &f.wallet, 6, 0, 101_000, 1_000);
+        let report_a = inspect::inspect(&psbt_a, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        let txid_a = psbt_a.unsigned_tx.compute_txid().to_string();
+        let outcome_a = submit_for_signing(
+            psbt_a,
+            report_a,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &notifier,
+            0,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome_a, SubmitOutcome::Queued { .. }));
+
+        let psbt_b = hot_psbt(&f.chain, &f.wallet, 7, 1, 101_000, 1_000);
+        let report_b = inspect::inspect(&psbt_b, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        let txid_b = psbt_b.unsigned_tx.compute_txid().to_string();
+        let outcome_b = submit_for_signing(
+            psbt_b,
+            report_b,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &notifier,
+            0,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome_b, SubmitOutcome::Queued { .. }),
+            "must still be accepted at submission time - neither spend is recorded yet"
+        );
+
+        let chain_dyn = f.chain_as_dyn();
+        let results = sweep_due(
+            &f.ledger,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.policy,
+            &chain_dyn,
+            50,
+            1_000_000,
+        )
+        .await;
+        assert_eq!(results.len(), 2);
+
+        let mut outcomes: std::collections::HashMap<String, PendingOutcome> = results
+            .into_iter()
+            .map(|(txid, r)| (txid, r.unwrap()))
+            .collect();
+        assert!(matches!(
+            outcomes.remove(&txid_a).unwrap(),
+            PendingOutcome::Signed(_)
+        ));
+        let denied = outcomes.remove(&txid_b).unwrap();
+        assert!(
+            matches!(denied, PendingOutcome::Denied(_)),
+            "the second spend must be denied at fire time once the first consumed the budget: {denied:?}"
+        );
+
+        let row_b = f.ledger.get_pending(&txid_b).await.unwrap().unwrap();
+        assert_eq!(row_b.status, PendingStatus::Denied);
+        assert!(row_b.message.unwrap().contains("daily"));
+
+        assert_eq!(
+            f.ledger.rolling_totals(1_000_000).await.unwrap().day_sat,
+            100_000,
+            "only the first (signed) spend may count against the rolling budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_failure_marks_the_pending_row_failed_and_returns_an_error() {
+        let f = queue_fixture("COSIGNER_TEST_NOTIFY_FAIL", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::failing();
+
+        let psbt = hot_psbt(&f.chain, &f.wallet, 8, 0, 100_000, 1_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+
+        let err = submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &notifier,
+            300,
+            1_000_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SubmitError::NotifyFailed(_)));
+
+        let row = f.ledger.get_pending(&txid).await.unwrap().unwrap();
+        assert_eq!(row.status, PendingStatus::Failed);
+
+        // And it must never become due for signing.
+        let chain_dyn = f.chain_as_dyn();
+        let results = sweep_due(
+            &f.ledger,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.policy,
+            &chain_dyn,
+            50,
+            1_000_300,
+        )
+        .await;
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_a_non_hot_spending_path_without_queuing() {
+        let f = queue_fixture("COSIGNER_TEST_SUBMIT_NOT_HOT", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+
+        let script_pubkey = descriptor::at_index(&f.wallet.external, 0)
+            .unwrap()
+            .script_pubkey();
+        let outpoint = OutPoint::new(fake_txid(9), 0);
+        f.chain.insert(
+            outpoint,
+            Utxo {
+                txout: TxOut {
+                    value: Amount::from_sat(100_000),
+                    script_pubkey: script_pubkey.clone(),
+                },
+                confirmations: 20_000,
+            },
+        );
+        let dest = TxOut {
+            value: Amount::from_sat(99_000),
+            script_pubkey: foreign_script(9),
+        };
+        let txin = TxIn {
+            previous_output: outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::from_height(12960),
+            witness: Witness::new(),
+        };
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![txin],
+            output: vec![dest],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey,
+        });
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        assert_eq!(report.spending_path, SpendingPath::Ambiguous);
+
+        let err = submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &notifier,
+            300,
+            1_000_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SubmitError::NotHotPath));
+        assert!(f.ledger.get_pending(&txid).await.unwrap().is_none());
+        assert!(notifier.sent.lock().unwrap().is_empty());
     }
 }

@@ -47,6 +47,7 @@ use cosigner::config::{ChainNetwork, KeySpec, KeysConfig, ServerSigningConfig, W
 use cosigner::descriptor;
 use cosigner::http::{self, AppState};
 use cosigner::ledger::Ledger;
+use cosigner::notify::NoopNotifier;
 use cosigner::policy::PolicyConfig;
 use cosigner::signing::ServerSigningKey;
 use http_body_util::BodyExt;
@@ -103,6 +104,7 @@ fn regtest_wallet_config() -> WalletConfig {
         server: None,
         policy: None,
         server_signing: None,
+        notify: None,
     }
 }
 
@@ -253,6 +255,8 @@ async fn inspect_recognizes_a_real_utxo_and_computes_fee_over_regtest() {
         server_key: std::sync::Arc::new(server_key),
         ledger: std::sync::Arc::new(ledger),
         policy: std::sync::Arc::new(policy),
+        notifier: std::sync::Arc::new(NoopNotifier),
+        hold_seconds: 0,
     };
     let app = http::router(state);
 
@@ -334,6 +338,8 @@ async fn inspect_rejects_an_input_not_derived_from_our_descriptor_over_regtest()
         server_key: std::sync::Arc::new(server_key),
         ledger: std::sync::Arc::new(ledger),
         policy: std::sync::Arc::new(policy),
+        notifier: std::sync::Arc::new(NoopNotifier),
+        hold_seconds: 0,
     };
     let app = http::router(state);
 

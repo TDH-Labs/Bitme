@@ -119,6 +119,69 @@ pub struct WalletConfig {
     /// Only required by `/sign_psbt`. Never put an xprv directly in this file - point at a
     /// file path or an env var instead.
     pub server_signing: Option<ServerSigningConfig>,
+    /// Only required by `/sign_psbt`. Governs the out-of-band notify-then-hold-then-sign flow:
+    /// an approved spend is never signed immediately - it's queued, a notification is sent,
+    /// and it only actually gets signed once `hold_seconds` has passed with no veto.
+    pub notify: Option<NotifyConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotifyConfig {
+    /// How long an approved spend is held (and vetoable via `POST /veto/{id}`) before this
+    /// service actually signs it. 0 means "sign on the next sweep tick" - still notifies
+    /// first, but leaves essentially no veto window.
+    #[serde(default)]
+    pub hold_seconds: i64,
+    /// How often the background sweeper checks for spends whose hold has elapsed.
+    #[serde(default = "default_sweep_interval_seconds")]
+    pub sweep_interval_seconds: u64,
+    #[serde(default)]
+    pub ntfy: Option<NtfyConfig>,
+    #[serde(default)]
+    pub smtp: Option<SmtpConfig>,
+}
+
+fn default_sweep_interval_seconds() -> u64 {
+    5
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NtfyConfig {
+    /// Full topic URL to POST to, e.g. "https://ntfy.sh/your-private-topic".
+    pub url: String,
+    /// Sent as a bearer token, if the topic requires auth (e.g. a self-hosted ntfy server).
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SmtpConfig {
+    pub host: String,
+    #[serde(default = "default_smtp_port")]
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    pub from: String,
+    pub to: String,
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+
+impl NotifyConfig {
+    fn validate(&self) -> Result<()> {
+        if self.hold_seconds < 0 {
+            bail!("notify.hold_seconds must not be negative");
+        }
+        if self.ntfy.is_none() && self.smtp.is_none() {
+            bail!(
+                "notify: at least one of [notify.ntfy] or [notify.smtp] is required - a hold \
+                 with no notification channel would silently sign with nobody able to veto it"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -259,6 +322,10 @@ impl WalletConfig {
             server_signing.validate()?;
         }
 
+        if let Some(notify) = &self.notify {
+            notify.validate().context("[notify]")?;
+        }
+
         Ok(())
     }
 
@@ -287,6 +354,13 @@ impl WalletConfig {
             .as_ref()
             .context("config is missing the [server_signing] section, required for /sign_psbt")?;
         Ok((policy, server_signing))
+    }
+
+    /// `/sign_psbt`'s notify-then-hold-then-sign flow additionally needs `[notify]`.
+    pub fn require_notify_config(&self) -> Result<&NotifyConfig> {
+        self.notify
+            .as_ref()
+            .context("config is missing the [notify] section, required for /sign_psbt")
     }
 }
 
@@ -342,6 +416,57 @@ mod tests {
         });
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("policy"), "got: {err}");
+    }
+
+    #[test]
+    fn no_notify_section_is_valid() {
+        let cfg = test_wallet_config(12960);
+        assert!(cfg.notify.is_none());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn notify_without_any_channel_fails_validation() {
+        let mut cfg = test_wallet_config(12960);
+        cfg.notify = Some(NotifyConfig {
+            hold_seconds: 300,
+            sweep_interval_seconds: 5,
+            ntfy: None,
+            smtp: None,
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("notify"), "got: {err}");
+    }
+
+    #[test]
+    fn notify_with_ntfy_channel_and_zero_hold_is_valid() {
+        let mut cfg = test_wallet_config(12960);
+        cfg.notify = Some(NotifyConfig {
+            hold_seconds: 0,
+            sweep_interval_seconds: 5,
+            ntfy: Some(NtfyConfig {
+                url: "https://ntfy.sh/example".to_string(),
+                auth_token: None,
+            }),
+            smtp: None,
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn notify_rejects_negative_hold_seconds() {
+        let mut cfg = test_wallet_config(12960);
+        cfg.notify = Some(NotifyConfig {
+            hold_seconds: -1,
+            sweep_interval_seconds: 5,
+            ntfy: Some(NtfyConfig {
+                url: "https://ntfy.sh/example".to_string(),
+                auth_token: None,
+            }),
+            smtp: None,
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("notify"), "got: {err}");
     }
 
     #[test]

@@ -30,6 +30,60 @@ pub struct RollingTotals {
     pub month_sat: u64,
 }
 
+/// Where a submitted-and-approved spend sits in the M5 notify-then-hold-then-sign queue.
+/// `Pending` is the only non-terminal state; every other value is reached exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingStatus {
+    /// Notified, holding, not yet due (or due but not yet swept).
+    Pending,
+    /// A human called `POST /veto/{id}` before the hold elapsed - permanently blocked.
+    Vetoed,
+    /// The hold elapsed and it was signed and recorded in `ledger`.
+    Signed,
+    /// The hold elapsed but policy no longer allows it (rolling totals moved since
+    /// submission) - never signed, nothing recorded.
+    Denied,
+    /// The hold elapsed but signing/inspection failed for a reason other than policy (e.g.
+    /// the UTXO it spent is gone) - never signed, nothing recorded.
+    Failed,
+}
+
+impl PendingStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            PendingStatus::Pending => "pending",
+            PendingStatus::Vetoed => "vetoed",
+            PendingStatus::Signed => "signed",
+            PendingStatus::Denied => "denied",
+            PendingStatus::Failed => "failed",
+        }
+    }
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "pending" => Ok(PendingStatus::Pending),
+            "vetoed" => Ok(PendingStatus::Vetoed),
+            "signed" => Ok(PendingStatus::Signed),
+            "denied" => Ok(PendingStatus::Denied),
+            "failed" => Ok(PendingStatus::Failed),
+            other => anyhow::bail!("unrecognized pending_signatures.status value {other:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingRow {
+    pub txid: String,
+    pub psbt_base64: String,
+    pub spend_amount_sat: u64,
+    pub fee_sat: u64,
+    pub created_at: i64,
+    pub hold_until: i64,
+    pub status: PendingStatus,
+    pub signed_psbt_base64: Option<String>,
+    pub message: Option<String>,
+}
+
 pub struct Ledger {
     pool: SqlitePool,
 }
@@ -85,7 +139,72 @@ impl Ledger {
         .execute(&self.pool)
         .await
         .context("creating ledger table")?;
+
+        // The M5 notify-then-hold-then-sign queue. One row per unsigned txid ever submitted
+        // to `/sign_psbt` and approved at submission time; `status` tracks it from `pending`
+        // to exactly one terminal state (`signed`, `vetoed`, `denied`, or `failed`). Lives in
+        // the same single-connection pool as `ledger` so the sweeper's fire-time processing,
+        // `POST /veto/{id}`, and a fresh `/sign_psbt` submission all serialize against each
+        // other automatically - no separate locking needed.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pending_signatures (
+                txid TEXT PRIMARY KEY,
+                psbt_base64 TEXT NOT NULL,
+                spend_amount_sat INTEGER NOT NULL,
+                fee_sat INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                hold_until INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                signed_psbt_base64 TEXT,
+                message TEXT
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("creating pending_signatures table")?;
         Ok(())
+    }
+
+    /// txids of every `pending`-status row whose hold has elapsed as of `now` - what the
+    /// background sweeper should attempt to process next. A plain pool read: each row gets
+    /// re-checked for its current status inside its own transaction when actually processed,
+    /// so a stale read here (e.g. a veto racing in after this query) is always caught later.
+    pub async fn due_pending(&self, now: i64) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT txid FROM pending_signatures WHERE status = ?1 AND hold_until <= ?2",
+        )
+        .bind(PendingStatus::Pending.as_str())
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .context("querying due pending signatures")?;
+        Ok(rows.into_iter().map(|(txid,)| txid).collect())
+    }
+
+    /// Marks a `pending` row `vetoed`, atomically (only transitions rows still `pending`).
+    /// Returns the row's status *after* the attempt, so the caller can distinguish "vetoed
+    /// just now" from "was already something else" without a second query.
+    pub async fn veto_pending(&self, txid: &str) -> Result<Option<PendingStatus>> {
+        let mut ltx = self.begin().await?;
+        let Some(row) = ltx.get_pending(txid).await? else {
+            ltx.rollback().await?;
+            return Ok(None);
+        };
+        if row.status == PendingStatus::Pending {
+            ltx.mark_pending_vetoed(txid).await?;
+            ltx.commit().await?;
+            Ok(Some(PendingStatus::Vetoed))
+        } else {
+            ltx.rollback().await?;
+            Ok(Some(row.status))
+        }
+    }
+
+    pub async fn get_pending(&self, txid: &str) -> Result<Option<PendingRow>> {
+        let mut ltx = self.begin().await?;
+        let row = ltx.get_pending(txid).await?;
+        ltx.rollback().await?;
+        Ok(row)
     }
 
     /// Sums `spend_amount_sat` over the trailing day/week/month windows ending at `now`.
@@ -200,6 +319,134 @@ impl LedgerTx {
             .await
             .context("recording spend in ledger")?;
         Ok(())
+    }
+
+    /// Fails if `txid` already has a pending-signatures row (`PRIMARY KEY`) - callers must
+    /// check [`get_pending`](Self::get_pending) first within the same transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_pending(
+        &mut self,
+        txid: &str,
+        psbt_base64: &str,
+        spend_amount_sat: u64,
+        fee_sat: u64,
+        created_at: i64,
+        hold_until: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pending_signatures
+                (txid, psbt_base64, spend_amount_sat, fee_sat, created_at, hold_until, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(txid)
+        .bind(psbt_base64)
+        .bind(spend_amount_sat as i64)
+        .bind(fee_sat as i64)
+        .bind(created_at)
+        .bind(hold_until)
+        .bind(PendingStatus::Pending.as_str())
+        .execute(&mut *self.tx)
+        .await
+        .context("inserting pending signature request")?;
+        Ok(())
+    }
+
+    pub async fn get_pending(&mut self, txid: &str) -> Result<Option<PendingRow>> {
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT txid, psbt_base64, spend_amount_sat, fee_sat, created_at, hold_until, \
+                    status, signed_psbt_base64, message
+             FROM pending_signatures WHERE txid = ?1",
+        )
+        .bind(txid)
+        .fetch_optional(&mut *self.tx)
+        .await
+        .context("querying pending signature request")?;
+
+        row.map(
+            |(
+                txid,
+                psbt_base64,
+                spend_amount_sat,
+                fee_sat,
+                created_at,
+                hold_until,
+                status,
+                signed_psbt_base64,
+                message,
+            )| {
+                Ok(PendingRow {
+                    txid,
+                    psbt_base64,
+                    spend_amount_sat: spend_amount_sat as u64,
+                    fee_sat: fee_sat as u64,
+                    created_at,
+                    hold_until,
+                    status: PendingStatus::from_str(&status)?,
+                    signed_psbt_base64,
+                    message,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    async fn set_pending_status(
+        &mut self,
+        txid: &str,
+        status: PendingStatus,
+        signed_psbt_base64: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE pending_signatures
+             SET status = ?1, signed_psbt_base64 = ?2, message = ?3
+             WHERE txid = ?4",
+        )
+        .bind(status.as_str())
+        .bind(signed_psbt_base64)
+        .bind(message)
+        .bind(txid)
+        .execute(&mut *self.tx)
+        .await
+        .context("updating pending signature request")?;
+        Ok(())
+    }
+
+    pub async fn mark_pending_signed(
+        &mut self,
+        txid: &str,
+        signed_psbt_base64: &str,
+    ) -> Result<()> {
+        self.set_pending_status(txid, PendingStatus::Signed, Some(signed_psbt_base64), None)
+            .await
+    }
+
+    pub async fn mark_pending_denied(&mut self, txid: &str, message: &str) -> Result<()> {
+        self.set_pending_status(txid, PendingStatus::Denied, None, Some(message))
+            .await
+    }
+
+    pub async fn mark_pending_failed(&mut self, txid: &str, message: &str) -> Result<()> {
+        self.set_pending_status(txid, PendingStatus::Failed, None, Some(message))
+            .await
+    }
+
+    /// Only ever called on a row already confirmed `Pending` by the caller - see
+    /// [`Ledger::veto_pending`], the sole entry point.
+    async fn mark_pending_vetoed(&mut self, txid: &str) -> Result<()> {
+        self.set_pending_status(txid, PendingStatus::Vetoed, None, None)
+            .await
     }
 
     pub async fn commit(self) -> Result<()> {
@@ -372,6 +619,103 @@ mod tests {
             ledger.rolling_totals(10 * MONTH_SECONDS).await.unwrap(),
             RollingTotals::default()
         );
+    }
+
+    #[tokio::test]
+    async fn pending_insert_get_and_due_roundtrip() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        let mut ltx = ledger.begin().await.unwrap();
+        ltx.insert_pending("tx-a", "cHNidA==", 1_000, 100, 500, 800)
+            .await
+            .unwrap();
+        ltx.commit().await.unwrap();
+
+        let row = ledger.get_pending("tx-a").await.unwrap().unwrap();
+        assert_eq!(row.status, PendingStatus::Pending);
+        assert_eq!(row.spend_amount_sat, 1_000);
+        assert_eq!(row.hold_until, 800);
+        assert!(ledger.get_pending("never-seen").await.unwrap().is_none());
+
+        assert!(ledger.due_pending(799).await.unwrap().is_empty());
+        assert_eq!(ledger.due_pending(800).await.unwrap(), vec!["tx-a"]);
+        assert_eq!(ledger.due_pending(801).await.unwrap(), vec!["tx-a"]);
+    }
+
+    #[tokio::test]
+    async fn veto_pending_transitions_a_pending_row_and_is_reported_back() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        let mut ltx = ledger.begin().await.unwrap();
+        ltx.insert_pending("tx-a", "cHNidA==", 1_000, 100, 500, 800)
+            .await
+            .unwrap();
+        ltx.commit().await.unwrap();
+
+        assert_eq!(
+            ledger.veto_pending("tx-a").await.unwrap(),
+            Some(PendingStatus::Vetoed)
+        );
+        assert_eq!(
+            ledger.get_pending("tx-a").await.unwrap().unwrap().status,
+            PendingStatus::Vetoed
+        );
+        // A due-pending sweep must never pick up a vetoed row.
+        assert!(ledger.due_pending(1_000).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn veto_pending_on_unknown_txid_returns_none() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        assert_eq!(ledger.veto_pending("never-seen").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn veto_pending_is_a_no_op_on_an_already_terminal_row() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        let mut ltx = ledger.begin().await.unwrap();
+        ltx.insert_pending("tx-a", "cHNidA==", 1_000, 100, 500, 800)
+            .await
+            .unwrap();
+        ltx.mark_pending_signed("tx-a", "cHNidA==-signed")
+            .await
+            .unwrap();
+        ltx.commit().await.unwrap();
+
+        // Too late to veto - reports the actual (signed) status rather than pretending to
+        // veto it, and must not overwrite `signed_psbt_base64`.
+        assert_eq!(
+            ledger.veto_pending("tx-a").await.unwrap(),
+            Some(PendingStatus::Signed)
+        );
+        let row = ledger.get_pending("tx-a").await.unwrap().unwrap();
+        assert_eq!(row.status, PendingStatus::Signed);
+        assert_eq!(row.signed_psbt_base64.as_deref(), Some("cHNidA==-signed"));
+    }
+
+    #[tokio::test]
+    async fn mark_pending_denied_and_failed_record_a_message() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        let mut ltx = ledger.begin().await.unwrap();
+        ltx.insert_pending("tx-denied", "cHNidA==", 1_000, 100, 500, 800)
+            .await
+            .unwrap();
+        ltx.mark_pending_denied("tx-denied", "over the daily cap")
+            .await
+            .unwrap();
+        ltx.insert_pending("tx-failed", "cHNidA==", 1_000, 100, 500, 800)
+            .await
+            .unwrap();
+        ltx.mark_pending_failed("tx-failed", "utxo no longer exists")
+            .await
+            .unwrap();
+        ltx.commit().await.unwrap();
+
+        let denied = ledger.get_pending("tx-denied").await.unwrap().unwrap();
+        assert_eq!(denied.status, PendingStatus::Denied);
+        assert_eq!(denied.message.as_deref(), Some("over the daily cap"));
+
+        let failed = ledger.get_pending("tx-failed").await.unwrap().unwrap();
+        assert_eq!(failed.status, PendingStatus::Failed);
+        assert_eq!(failed.message.as_deref(), Some("utxo no longer exists"));
     }
 
     #[tokio::test]

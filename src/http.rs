@@ -6,10 +6,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use bitcoin::psbt::Psbt;
 use serde::{Deserialize, Serialize};
@@ -18,9 +18,10 @@ use crate::chain::ChainSource;
 use crate::config::WalletConfig;
 use crate::descriptor::{BuiltDescriptor, Chain};
 use crate::inspect::{self, InspectError, InspectionReport, OutputKind, SpendingPath};
-use crate::ledger::Ledger;
+use crate::ledger::{Ledger, PendingStatus};
+use crate::notify::Notifier;
 use crate::policy::CompiledPolicy;
-use crate::sign::{self, LedgerOutcome, SignPsbtError};
+use crate::sign::{self, LedgerOutcome, SignPsbtError, SubmitError, SubmitOutcome};
 use crate::signing::{ServerSigningKey, SigningError};
 
 #[derive(Clone)]
@@ -31,16 +32,23 @@ pub struct AppState {
     pub gap_limit: u32,
     /// Only used by `/sign_psbt`.
     pub server_key: Arc<ServerSigningKey>,
-    /// Only used by `/sign_psbt`.
+    /// Only used by `/sign_psbt`, `GET /sign_psbt/{id}` and `/veto/{id}`.
     pub ledger: Arc<Ledger>,
     /// Only used by `/sign_psbt`.
     pub policy: Arc<CompiledPolicy>,
+    /// Only used by `/sign_psbt`.
+    pub notifier: Arc<dyn Notifier>,
+    /// Only used by `/sign_psbt`. How long an approved spend is held (and vetoable) before the
+    /// background sweeper actually signs it.
+    pub hold_seconds: i64,
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/inspect", post(inspect_handler))
         .route("/sign_psbt", post(sign_psbt_handler))
+        .route("/sign_psbt/{id}", get(get_sign_psbt_handler))
+        .route("/veto/{id}", post(veto_handler))
         .with_state(state)
 }
 
@@ -215,6 +223,26 @@ struct SignResponse {
     inspection: InspectResponse,
 }
 
+#[derive(Debug, Serialize)]
+struct QueuedResponse {
+    /// Also the unsigned transaction's txid - `GET /sign_psbt/{id}` and `POST /veto/{id}` both
+    /// take this back.
+    id: String,
+    status: &'static str,
+    /// Unix time the background sweeper will actually sign this, unless vetoed first.
+    hold_until: i64,
+}
+
+fn pending_status_str(status: PendingStatus) -> &'static str {
+    match status {
+        PendingStatus::Pending => "pending",
+        PendingStatus::Vetoed => "vetoed",
+        PendingStatus::Signed => "signed",
+        PendingStatus::Denied => "denied",
+        PendingStatus::Failed => "failed",
+    }
+}
+
 impl From<SigningError> for ApiError {
     fn from(e: SigningError) -> Self {
         let status = match &e {
@@ -259,10 +287,42 @@ impl From<SignPsbtError> for ApiError {
     }
 }
 
+impl From<SubmitError> for ApiError {
+    fn from(e: SubmitError) -> Self {
+        let status = match &e {
+            SubmitError::NotHotPath | SubmitError::Denied(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            SubmitError::Vetoed
+            | SubmitError::PreviouslyDenied(_)
+            | SubmitError::PreviouslyFailed(_) => StatusCode::CONFLICT,
+            SubmitError::NotifyFailed(_) => StatusCode::BAD_GATEWAY,
+            SubmitError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let error = match &e {
+            SubmitError::NotHotPath => "not_hot_path",
+            SubmitError::Denied(_) => "policy_denied",
+            SubmitError::Vetoed => "vetoed",
+            SubmitError::PreviouslyDenied(_) => "previously_denied",
+            SubmitError::PreviouslyFailed(_) => "previously_failed",
+            SubmitError::NotifyFailed(_) => "notify_failed",
+            SubmitError::Internal(_) => "internal",
+        };
+        ApiError {
+            status,
+            error,
+            message: e.to_string(),
+        }
+    }
+}
+
+/// Inspects and, if policy allows, queues `req.psbt` for signing: notifies out-of-band and
+/// holds for `hold_seconds` before the background sweeper actually signs it - see `sign.rs`
+/// for why nothing is ever signed synchronously here. The one exception is a replay of a PSBT
+/// this service already fully signed before, which resolves immediately (200) exactly as it
+/// did before M5; everything else newly approved returns 202 with an id to poll or veto.
 async fn sign_psbt_handler(
     State(state): State<AppState>,
     Json(req): Json<PsbtRequest>,
-) -> Result<Json<SignResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let psbt = Psbt::from_str(req.psbt.trim()).map_err(|e| ApiError {
         status: StatusCode::BAD_REQUEST,
         error: "invalid_psbt",
@@ -275,8 +335,8 @@ async fn sign_psbt_handler(
     let gap_limit = state.gap_limit;
 
     // Inspection does blocking bitcoind RPC I/O; keep it off the async executor, exactly as
-    // /inspect does. Everything after this (the ledger transaction, signing) is either async
-    // I/O or fast pure computation, so it runs directly on this task.
+    // /inspect does. Everything after this (the ledger transaction(s), signing, notifying) is
+    // either async I/O or fast pure computation, so it runs directly on this task.
     let (psbt, report) = tokio::task::spawn_blocking(move || {
         let report = inspect::inspect(&psbt, &wallet, &cfg, chain.as_ref(), gap_limit);
         (psbt, report)
@@ -289,7 +349,7 @@ async fn sign_psbt_handler(
     })?;
     let report: InspectionReport = report.map_err(ApiError::from)?;
 
-    let result = sign::sign_psbt(
+    let outcome = sign::submit_for_signing(
         psbt,
         report,
         &state.wallet,
@@ -297,17 +357,400 @@ async fn sign_psbt_handler(
         &state.server_key,
         &state.ledger,
         &state.policy,
+        state.notifier.as_ref(),
+        state.hold_seconds,
         now_unix(),
     )
-    .await?;
+    .await
+    .map_err(ApiError::from)?;
 
-    let ledger = match result.ledger {
-        LedgerOutcome::Recorded => "recorded",
-        LedgerOutcome::AlreadyRecorded => "already_recorded",
+    Ok(match outcome {
+        SubmitOutcome::AlreadySigned(result) => {
+            let ledger = match result.ledger {
+                LedgerOutcome::Recorded => "recorded",
+                LedgerOutcome::AlreadyRecorded => "already_recorded",
+            };
+            Json(SignResponse {
+                psbt: result.psbt.to_string(),
+                ledger,
+                inspection: result.report.into(),
+            })
+            .into_response()
+        }
+        SubmitOutcome::Queued { txid, hold_until } => (
+            StatusCode::ACCEPTED,
+            Json(QueuedResponse {
+                id: txid,
+                status: "pending",
+                hold_until,
+            }),
+        )
+            .into_response(),
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct PendingStatusResponse {
+    id: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hold_until: Option<i64>,
+    /// Present once `status` is `"signed"`: the base64 PSBT with this service's signature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    psbt: Option<String>,
+    /// Present once `status` is `"denied"` or `"failed"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+/// Polls the status of a spend queued by `POST /sign_psbt` - `id` is the unsigned txid
+/// returned there.
+async fn get_sign_psbt_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let row = state.ledger.get_pending(&id).await.map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        error: "internal",
+        message: e.to_string(),
+    })?;
+    let Some(row) = row else {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            error: "not_found",
+            message: format!("no signing request with id {id}"),
+        });
     };
-    Ok(Json(SignResponse {
-        psbt: result.psbt.to_string(),
-        ledger,
-        inspection: result.report.into(),
-    }))
+
+    let http_status = match row.status {
+        PendingStatus::Pending => StatusCode::ACCEPTED,
+        PendingStatus::Signed => StatusCode::OK,
+        PendingStatus::Vetoed => StatusCode::CONFLICT,
+        PendingStatus::Denied => StatusCode::UNPROCESSABLE_ENTITY,
+        PendingStatus::Failed => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    Ok((
+        http_status,
+        Json(PendingStatusResponse {
+            id: row.txid,
+            status: pending_status_str(row.status),
+            hold_until: matches!(row.status, PendingStatus::Pending).then_some(row.hold_until),
+            psbt: row.signed_psbt_base64,
+            message: row.message,
+        }),
+    )
+        .into_response())
+}
+
+#[derive(Debug, Serialize)]
+struct VetoResponse {
+    id: String,
+    status: &'static str,
+}
+
+/// Cancels a still-pending spend before its hold elapses - `id` is the unsigned txid returned
+/// by `POST /sign_psbt`. Idempotent: vetoing an already-vetoed (or already-denied/failed) spend
+/// just reports its current status; vetoing one that's already signed is a 409, since by then
+/// it's too late.
+async fn veto_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let outcome = state.ledger.veto_pending(&id).await.map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        error: "internal",
+        message: e.to_string(),
+    })?;
+    let Some(status) = outcome else {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            error: "not_found",
+            message: format!("no pending signing request with id {id}"),
+        });
+    };
+
+    if status == PendingStatus::Signed {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            error: "already_signed",
+            message: "too late to veto - this spend was already signed".to_string(),
+        });
+    }
+
+    Ok(Json(VetoResponse {
+        id,
+        status: pending_status_str(status),
+    })
+    .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use bitcoin::hashes::Hash;
+    use bitcoin::{
+        absolute, transaction, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+        Txid, Witness,
+    };
+    use http_body_util::BodyExt;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::chain::mock::MockChainSource;
+    use crate::chain::Utxo;
+    use crate::config::ServerSigningConfig;
+    use crate::descriptor::{self, build_descriptor};
+    use crate::ledger::Ledger;
+    use crate::notify::mock::RecordingNotifier;
+    use crate::policy::PolicyConfig;
+    use crate::test_util::{test_server_xpriv, test_wallet_config};
+
+    static ENV_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn fake_txid(byte: u8) -> Txid {
+        Txid::from_byte_array([byte; 32])
+    }
+
+    fn foreign_script(fill: u8) -> ScriptBuf {
+        let mut bytes = vec![0x00, 0x20];
+        bytes.extend_from_slice(&[fill; 32]);
+        ScriptBuf::from(bytes)
+    }
+
+    async fn test_state(hold_seconds: i64) -> (AppState, Arc<MockChainSource>) {
+        let cfg = test_wallet_config(12960);
+        let wallet = build_descriptor(&cfg).unwrap();
+        let chain = Arc::new(MockChainSource::new());
+
+        let xprv = test_server_xpriv();
+        // SAFETY: test-only; a counter keeps each call's env var name distinct so concurrent
+        // tests in this process never race on the same variable.
+        let env_var = format!(
+            "COSIGNER_TEST_HTTP_XPRV_{}",
+            ENV_COUNTER.fetch_add(1, Ordering::SeqCst)
+        );
+        unsafe { std::env::set_var(&env_var, xprv.to_string()) };
+        let server_key = ServerSigningKey::load(
+            &ServerSigningConfig {
+                xprv_file: None,
+                xprv_env_var: Some(env_var),
+            },
+            &cfg.keys.server.xpub,
+            cfg.network,
+        )
+        .unwrap();
+
+        let policy = PolicyConfig {
+            max_tx_sat: 100_000,
+            max_daily_sat: u64::MAX,
+            max_weekly_sat: u64::MAX,
+            max_monthly_sat: u64::MAX,
+            max_fee_sat: u64::MAX,
+            max_fee_rate_sat_per_vb: f64::MAX,
+            destination_whitelist: None,
+        }
+        .compile(cfg.network)
+        .unwrap();
+
+        let state = AppState {
+            wallet: Arc::new(wallet),
+            cfg: Arc::new(cfg),
+            chain: chain.clone(),
+            gap_limit: 50,
+            server_key: Arc::new(server_key),
+            ledger: Arc::new(Ledger::connect_in_memory().await.unwrap()),
+            policy: Arc::new(policy),
+            notifier: Arc::new(RecordingNotifier::new()),
+            hold_seconds,
+        };
+        (state, chain)
+    }
+
+    /// An unsigned HOT-path PSBT spending a fresh UTXO funded into `chain` at `wallet`'s
+    /// external chain index 0.
+    fn hot_psbt(chain: &MockChainSource, wallet: &BuiltDescriptor, txid_byte: u8) -> Psbt {
+        let script_pubkey = descriptor::at_index(&wallet.external, 0)
+            .unwrap()
+            .script_pubkey();
+        let outpoint = OutPoint::new(fake_txid(txid_byte), 0);
+        chain.insert(
+            outpoint,
+            Utxo {
+                txout: TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: script_pubkey.clone(),
+                },
+                confirmations: 6,
+            },
+        );
+        let dest = TxOut {
+            value: Amount::from_sat(49_000),
+            script_pubkey: foreign_script(txid_byte),
+        };
+        let txin = TxIn {
+            previous_output: outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        };
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![txin],
+            output: vec![dest],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey,
+        });
+        psbt
+    }
+
+    async fn call(
+        app: Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(b) => {
+                builder = builder.header("content-type", "application/json");
+                axum::body::Body::from(b.to_string())
+            }
+            None => axum::body::Body::empty(),
+        };
+        let request = builder.body(body).unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn full_queue_and_veto_flow_via_http() {
+        let (state, chain) = test_state(1_000_000).await;
+        let psbt = hot_psbt(&chain, &state.wallet, 1);
+
+        let (status, body) = call(
+            router(state.clone()),
+            "POST",
+            "/sign_psbt",
+            Some(serde_json::json!({ "psbt": psbt.to_string() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "got: {body}");
+        assert_eq!(body["status"], "pending");
+        let id = body["id"].as_str().unwrap().to_string();
+        assert!(body["hold_until"].as_i64().unwrap() > 0);
+
+        let (status, body) = call(
+            router(state.clone()),
+            "GET",
+            &format!("/sign_psbt/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "got: {body}");
+        assert_eq!(body["status"], "pending");
+
+        let (status, body) =
+            call(router(state.clone()), "POST", &format!("/veto/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["status"], "vetoed");
+
+        let (status, body) = call(
+            router(state.clone()),
+            "GET",
+            &format!("/sign_psbt/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "got: {body}");
+        assert_eq!(body["status"], "vetoed");
+
+        // Idempotent: vetoing an already-vetoed request just reports its status again.
+        let (status, body) =
+            call(router(state.clone()), "POST", &format!("/veto/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["status"], "vetoed");
+
+        let (status, _) = call(router(state), "GET", "/sign_psbt/never-seen", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn veto_of_unknown_id_is_404() {
+        let (state, _chain) = test_state(1_000_000).await;
+        let (status, body) = call(router(state), "POST", "/veto/never-seen", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn over_cap_spend_is_denied_immediately_and_never_queued() {
+        let (state, chain) = test_state(1_000_000).await;
+        // policy.max_tx_sat is 100_000 in test_state(); this destination amount (49_000) is
+        // fine on its own, so make a second, larger spend that trips the per-tx cap instead.
+        let script_pubkey = descriptor::at_index(&state.wallet.external, 1)
+            .unwrap()
+            .script_pubkey();
+        let outpoint = OutPoint::new(fake_txid(9), 0);
+        chain.insert(
+            outpoint,
+            Utxo {
+                txout: TxOut {
+                    value: Amount::from_sat(200_000),
+                    script_pubkey: script_pubkey.clone(),
+                },
+                confirmations: 6,
+            },
+        );
+        let dest = TxOut {
+            value: Amount::from_sat(150_000),
+            script_pubkey: foreign_script(9),
+        };
+        let txin = TxIn {
+            previous_output: outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        };
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![txin],
+            output: vec![dest],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(200_000),
+            script_pubkey,
+        });
+        let id = psbt.unsigned_tx.compute_txid().to_string();
+
+        let (status, body) = call(
+            router(state.clone()),
+            "POST",
+            "/sign_psbt",
+            Some(serde_json::json!({ "psbt": psbt.to_string() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "got: {body}");
+        assert_eq!(body["error"], "policy_denied");
+
+        let (status, _) = call(router(state), "GET", &format!("/sign_psbt/{id}"), None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a denied-at-submission spend must never be queued"
+        );
+    }
 }
