@@ -94,6 +94,7 @@ pub fn regtest_wallet_config() -> WalletConfig {
         server_signing: None,
         notify: None,
         recovery: None,
+        nostr_transport: None,
     }
 }
 

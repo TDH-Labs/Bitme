@@ -8,6 +8,8 @@ use anyhow::{bail, Context, Result};
 use bitcoin::address::NetworkUnchecked;
 use bitcoin::bip32::{DerivationPath, Xpub};
 use bitcoin::{Address, Network, NetworkKind};
+use nostr_sdk::prelude::FromBech32;
+use nostr_sdk::PublicKey as NostrPublicKey;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -127,6 +129,71 @@ pub struct WalletConfig {
     /// Governs whether this service will co-sign the MOBILE + SERVER recovery path (the one
     /// that exists for a lost/destroyed SATOCHIP). Absent means the defaults below.
     pub recovery: Option<RecoveryConfig>,
+    /// Optional alternate front door for the same HTTP API, over Nostr NIP-17 private messages
+    /// instead of an open port. Absent means only HTTP is served.
+    pub nostr_transport: Option<NostrTransportConfig>,
+}
+
+/// Config for `nostr_transport.rs` - an outbound-only Nostr identity for this service that
+/// receives requests as NIP-17 gift-wrapped private messages and answers them by dispatching
+/// into the exact same router `cosigner serve`'s HTTP API uses, so the two transports can never
+/// drift out of sync with each other.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NostrTransportConfig {
+    /// Path to a file containing this service's Nostr nsec (and nothing else). Mutually
+    /// exclusive with `nsec_env_var`. Never put an nsec directly in this file.
+    #[serde(default)]
+    pub nsec_file: Option<String>,
+    /// Name of an environment variable holding this service's Nostr nsec. Mutually exclusive
+    /// with `nsec_file`.
+    #[serde(default)]
+    pub nsec_env_var: Option<String>,
+    /// Relay URLs to connect outbound to (wss://...). At least one required.
+    pub relays: Vec<String>,
+    /// npubs (bech32) allowed to submit requests. Every gift-wrap's sender is cryptographically
+    /// verified by the unwrap itself (see NIP-59) before this list is even consulted - it isn't
+    /// what makes the sender authentic, only what makes them *authorized*. Removing an npub
+    /// here is how a lost or stolen device is cut off: its messages are still verified as
+    /// genuinely from it, then simply ignored.
+    pub allowed_npubs: Vec<String>,
+}
+
+impl NostrTransportConfig {
+    fn validate(&self) -> Result<()> {
+        match (&self.nsec_file, &self.nsec_env_var) {
+            (Some(_), Some(_)) => {
+                bail!("nostr_transport: set either nsec_file or nsec_env_var, not both")
+            }
+            (None, None) => bail!("nostr_transport: one of nsec_file or nsec_env_var is required"),
+            _ => {}
+        }
+        if self.relays.is_empty() {
+            bail!("nostr_transport.relays must not be empty");
+        }
+        if self.allowed_npubs.is_empty() {
+            bail!(
+                "nostr_transport.allowed_npubs must not be empty - an empty allowlist would \
+                 accept requests from no one, which is just a slower way to write \"disabled\""
+            );
+        }
+        for npub in &self.allowed_npubs {
+            NostrPublicKey::from_bech32(npub.trim()).with_context(|| {
+                format!("nostr_transport.allowed_npubs entry {npub:?} is not a valid npub")
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Parsed allowlist, checked once at startup rather than on every incoming message.
+    pub fn compiled_allowlist(&self) -> Result<Vec<NostrPublicKey>> {
+        self.allowed_npubs
+            .iter()
+            .map(|s| {
+                NostrPublicKey::from_bech32(s.trim())
+                    .with_context(|| format!("nostr_transport.allowed_npubs entry {s:?}"))
+            })
+            .collect()
+    }
 }
 
 /// Policy for the MOBILE + SERVER spending path.
@@ -433,6 +500,10 @@ impl WalletConfig {
 
         if let Some(recovery) = &self.recovery {
             recovery.validate(self.network).context("[recovery]")?;
+        }
+
+        if let Some(nostr_transport) = &self.nostr_transport {
+            nostr_transport.validate().context("[nostr_transport]")?;
         }
 
         Ok(())

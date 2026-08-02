@@ -75,3 +75,12 @@ url = "https://ntfy.sh/replace-with-a-private-topic-name"
 enabled = true                  # off would make lost-SATOCHIP recovery impossible by default
 hold_seconds = 172800           # 48h of notify-and-veto before a no-hardware spend is signed
 # destination_whitelist = ["tb1q..."]  # strongly recommended: pre-commit to where you'd sweep
+
+# Optional alternate front door for the same HTTP API, over Nostr NIP-17 private messages
+# instead of an open port - no inbound port, no domain, no certificate. Every message's sender
+# is cryptographically verified before allowed_npubs is even consulted; removing an npub here
+# is how a lost or stolen device is cut off.
+# [nostr_transport]
+# nsec_env_var = "COSIGNER_NOSTR_NSEC"
+# relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.snort.social"]
+# allowed_npubs = ["npub1..."]  # one entry per device allowed to submit requests
