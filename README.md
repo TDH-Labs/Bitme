@@ -75,3 +75,10 @@ cargo fmt
 
 `cargo run -- descriptor build --config examples/signet-demo.toml` builds and validates a
 descriptor from a config without needing a running server or a node.
+
+`cargo test` alone only runs the ~117 mocked-chain unit tests. Two integration test files run
+against a *real* regtest `bitcoind` and skip gracefully (not a failure) without one -
+`tests/regtest_inspect.rs`'s doc comment has the exact command. `tests/regtest_full_flow.rs` is
+the important one: it proves the whole notify-hold-sign flow, a live veto, and a live
+SATOCHIP-authorized policy change against a real node, ending in an actual signature-satisfies-
+the-descriptor check - not just an HTTP 200.
