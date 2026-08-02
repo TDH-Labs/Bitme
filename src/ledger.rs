@@ -84,6 +84,13 @@ pub struct PendingRow {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyState {
+    pub version: u64,
+    pub policy_json: String,
+    pub updated_at: i64,
+}
+
 pub struct Ledger {
     pool: SqlitePool,
 }
@@ -162,7 +169,55 @@ impl Ledger {
         .execute(&self.pool)
         .await
         .context("creating pending_signatures table")?;
+
+        // The M6 runtime-mutable, SATOCHIP-authorized policy: exactly one row (`id = 1`),
+        // holding the currently-effective policy and a monotonic version number. A change is
+        // only ever applied by `policy_auth::apply_policy_change`, which requires the request
+        // to target `version + 1` - both preventing two racing changes from silently
+        // clobbering each other, and preventing an old signed authorization from being
+        // replayed later to roll back to a looser policy.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS policy_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL,
+                policy_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("creating policy_state table")?;
         Ok(())
+    }
+
+    /// Returns the current policy state, seeding it from `default_policy_json` (at version 1)
+    /// if this is the first time the service has ever started against this database. On every
+    /// later start, whatever is already in the database wins - `default_policy_json` (the
+    /// TOML config's `[policy]` section) only ever matters once, for a brand-new deployment.
+    pub async fn load_or_seed_policy_state(
+        &self,
+        default_policy_json: &str,
+        now: i64,
+    ) -> Result<PolicyState> {
+        let mut ltx = self.begin().await?;
+        if let Some(state) = ltx.get_policy_state().await? {
+            ltx.rollback().await?;
+            return Ok(state);
+        }
+        ltx.set_policy_state(1, default_policy_json, now).await?;
+        ltx.commit().await?;
+        Ok(PolicyState {
+            version: 1,
+            policy_json: default_policy_json.to_string(),
+            updated_at: now,
+        })
+    }
+
+    pub async fn get_policy_state(&self) -> Result<Option<PolicyState>> {
+        let mut ltx = self.begin().await?;
+        let state = ltx.get_policy_state().await?;
+        ltx.rollback().await?;
+        Ok(state)
     }
 
     /// txids of every `pending`-status row whose hold has elapsed as of `now` - what the
@@ -449,6 +504,40 @@ impl LedgerTx {
             .await
     }
 
+    pub async fn get_policy_state(&mut self) -> Result<Option<PolicyState>> {
+        let row: Option<(i64, String, i64)> = sqlx::query_as(
+            "SELECT version, policy_json, updated_at FROM policy_state WHERE id = 1",
+        )
+        .fetch_optional(&mut *self.tx)
+        .await
+        .context("querying policy_state")?;
+        Ok(row.map(|(version, policy_json, updated_at)| PolicyState {
+            version: version as u64,
+            policy_json,
+            updated_at,
+        }))
+    }
+
+    pub async fn set_policy_state(
+        &mut self,
+        version: u64,
+        policy_json: &str,
+        updated_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO policy_state (id, version, policy_json, updated_at) VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET version = excluded.version, \
+                policy_json = excluded.policy_json, updated_at = excluded.updated_at",
+        )
+        .bind(version as i64)
+        .bind(policy_json)
+        .bind(updated_at)
+        .execute(&mut *self.tx)
+        .await
+        .context("writing policy_state")?;
+        Ok(())
+    }
+
     pub async fn commit(self) -> Result<()> {
         self.tx
             .commit()
@@ -731,5 +820,56 @@ mod tests {
         let totals = tx.rolling_totals(now).await.unwrap();
         assert_eq!(totals.day_sat, 4_242);
         tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_or_seed_policy_state_seeds_version_1_on_first_run() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        assert!(ledger.get_policy_state().await.unwrap().is_none());
+
+        let state = ledger
+            .load_or_seed_policy_state("{\"max_tx_sat\":1}", 1_000)
+            .await
+            .unwrap();
+        assert_eq!(state.version, 1);
+        assert_eq!(state.policy_json, "{\"max_tx_sat\":1}");
+        assert_eq!(state.updated_at, 1_000);
+        assert_eq!(ledger.get_policy_state().await.unwrap(), Some(state));
+    }
+
+    #[tokio::test]
+    async fn load_or_seed_policy_state_does_not_reseed_an_existing_row() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        ledger
+            .load_or_seed_policy_state("{\"max_tx_sat\":1}", 1_000)
+            .await
+            .unwrap();
+
+        // A later call (as would happen on the next process restart) with a *different*
+        // default must not clobber whatever's already there.
+        let state = ledger
+            .load_or_seed_policy_state("{\"max_tx_sat\":999}", 2_000)
+            .await
+            .unwrap();
+        assert_eq!(state.version, 1);
+        assert_eq!(state.policy_json, "{\"max_tx_sat\":1}");
+    }
+
+    #[tokio::test]
+    async fn set_policy_state_upserts_and_advances_the_version() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        let mut ltx = ledger.begin().await.unwrap();
+        ltx.set_policy_state(1, "{\"max_tx_sat\":1}", 1_000)
+            .await
+            .unwrap();
+        ltx.set_policy_state(2, "{\"max_tx_sat\":2}", 2_000)
+            .await
+            .unwrap();
+        ltx.commit().await.unwrap();
+
+        let state = ledger.get_policy_state().await.unwrap().unwrap();
+        assert_eq!(state.version, 2);
+        assert_eq!(state.policy_json, "{\"max_tx_sat\":2}");
+        assert_eq!(state.updated_at, 2_000);
     }
 }

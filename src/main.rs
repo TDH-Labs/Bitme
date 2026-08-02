@@ -6,10 +6,11 @@ use clap::{Args, Parser, Subcommand};
 use cosigner::chain::{BitcoindRpc, ChainSource};
 use cosigner::config::{BitcoindConfig, WalletConfig};
 use cosigner::descriptor::{self, BuiltDescriptor};
-use cosigner::http::{self, AppState};
+use cosigner::http::{self, AppState, PolicyHandle};
 use cosigner::invariants::{self, InvariantReport, LabeledKey};
 use cosigner::ledger::Ledger;
 use cosigner::notify::{MultiNotifier, Notifier};
+use cosigner::policy::CompiledPolicy;
 use cosigner::sign;
 use cosigner::signing::ServerSigningKey;
 use miniscript::descriptor::DefiniteDescriptorKey;
@@ -29,8 +30,33 @@ enum TopCommand {
         #[command(subcommand)]
         command: DescriptorCommand,
     },
-    /// Run the HTTP API (currently: POST /inspect).
+    /// Run the HTTP API (POST /inspect, /sign_psbt, /veto/{id}, /policy).
     Serve(ServeArgs),
+    /// Helpers for the SATOCHIP-authorized runtime policy change flow (`POST /policy`).
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyCommand {
+    /// Prints the exact text a human must sign (via SATOCHIP's "Sign Message" feature) to
+    /// authorize a proposed policy change - see `policy_auth.rs`. What's printed here is
+    /// exactly what the running service recomputes and verifies the signature against.
+    Message(PolicyMessageArgs),
+}
+
+#[derive(Args)]
+struct PolicyMessageArgs {
+    /// JSON file containing the proposed policy, in the same shape as `POST /policy`'s
+    /// `"policy"` field (max_tx_sat, max_daily_sat, ..., destination_whitelist).
+    #[arg(long)]
+    policy_file: PathBuf,
+    /// The version this change should target - one more than the server's current policy
+    /// version (see `GET /policy`).
+    #[arg(long)]
+    version: u64,
 }
 
 #[derive(Args)]
@@ -90,7 +116,26 @@ fn run() -> Result<()> {
             DescriptorCommand::Check(args) => cmd_check(args),
         },
         TopCommand::Serve(args) => cmd_serve(args),
+        TopCommand::Policy { command } => match command {
+            PolicyCommand::Message(args) => cmd_policy_message(args),
+        },
     }
+}
+
+fn cmd_policy_message(args: PolicyMessageArgs) -> Result<()> {
+    let raw = std::fs::read_to_string(&args.policy_file)
+        .with_context(|| format!("reading {}", args.policy_file.display()))?;
+    let policy: cosigner::policy::PolicyConfig = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "parsing {} as a policy (max_tx_sat, max_daily_sat, ..., destination_whitelist)",
+            args.policy_file.display()
+        )
+    })?;
+    print!(
+        "{}",
+        cosigner::policy_auth::canonical_message(args.version, &policy)
+    );
+    Ok(())
 }
 
 fn cmd_serve(args: ServeArgs) -> Result<()> {
@@ -104,6 +149,12 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
         .ledger_db_path
         .clone()
         .context("config is missing server.ledger_db_path, required for /sign_psbt")?;
+    // [policy] only ever matters as the bootstrap default seeded into the ledger's
+    // policy_state table the very first time this database is used - see
+    // `Ledger::load_or_seed_policy_state`. Serializing it now (before `cfg` moves into the
+    // async block below) avoids holding a borrow of `cfg` across that move.
+    let policy_bootstrap_json =
+        serde_json::to_string(policy_cfg).context("serializing [policy] for bootstrap")?;
     let wallet = descriptor::build_descriptor(&cfg)?;
 
     let report = run_invariants(&wallet, &cfg)?;
@@ -112,7 +163,6 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
     }
 
     let server_key = ServerSigningKey::load(signing_cfg, &cfg.keys.server.xpub, cfg.network)?;
-    let policy = Arc::new(policy_cfg.compile(cfg.network)?);
     let notifier: Arc<dyn Notifier> =
         Arc::new(MultiNotifier::from_config(notify_cfg).context("configuring [notify] channels")?);
     let hold_seconds = notify_cfg.hold_seconds;
@@ -122,6 +172,7 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
     let chain: Arc<dyn ChainSource> = Arc::new(BitcoindRpc::new(client));
     let bind_addr = server_cfg.bind_addr.clone();
     let gap_limit = server_cfg.gap_limit;
+    let network = cfg.network;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -133,6 +184,22 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
                 .await
                 .with_context(|| format!("opening ledger at {ledger_db_path}"))?,
         );
+
+        let seeded = ledger
+            .load_or_seed_policy_state(&policy_bootstrap_json, now_unix())
+            .await
+            .context("loading/seeding policy_state")?;
+        let seeded_policy_cfg: cosigner::policy::PolicyConfig =
+            serde_json::from_str(&seeded.policy_json)
+                .context("parsing policy_state.policy_json")?;
+        let compiled: CompiledPolicy = seeded_policy_cfg
+            .compile(network)
+            .context("compiling policy from policy_state")?;
+        let policy = Arc::new(tokio::sync::RwLock::new(PolicyHandle {
+            version: seeded.version,
+            compiled,
+        }));
+
         let state = AppState {
             wallet: Arc::new(wallet),
             cfg: Arc::new(cfg.clone()),
@@ -150,7 +217,7 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
             state.wallet.clone(),
             state.cfg.clone(),
             state.server_key.clone(),
-            state.policy.clone(),
+            policy,
             chain,
             gap_limit,
             sweep_interval,
@@ -179,7 +246,7 @@ fn spawn_sweeper(
     wallet: Arc<BuiltDescriptor>,
     cfg: Arc<WalletConfig>,
     server_key: Arc<ServerSigningKey>,
-    policy: Arc<cosigner::policy::CompiledPolicy>,
+    policy: Arc<tokio::sync::RwLock<PolicyHandle>>,
     chain: Arc<dyn ChainSource>,
     gap_limit: u32,
     interval: std::time::Duration,
@@ -189,12 +256,15 @@ fn spawn_sweeper(
         loop {
             ticker.tick().await;
             let now = now_unix();
+            // A cheap snapshot, taken fresh each tick: never hold the policy lock across the
+            // `.await`s inside `sweep_due` - picks up any `POST /policy` change immediately.
+            let compiled = policy.read().await.compiled.clone();
             let results = sign::sweep_due(
                 &ledger,
                 &wallet,
                 &cfg,
                 &server_key,
-                &policy,
+                &compiled,
                 &chain,
                 gap_limit,
                 now,
