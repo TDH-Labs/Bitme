@@ -17,3 +17,14 @@ xpub = "tpubDEXiq2SVhhqALktxfVFgj3C9M3T2G7xL11iezYg2LJAf245YkNyqp2K9TrvHABDCp223
 master_fingerprint = "56c4fac3"
 derivation_path = "48h/1h/0h/2h"
 xpub = "tpubDEg3kqr2jo5ergkJbFqRHvCpiob7wR7Hi44J7y987G1JZfbzBND77XKTyPZzGvh3uyDf8kexMJnFD9W8FuraJ4wLMsx6YuZVXRSRRcx6QdD"
+
+# Not consulted yet (no endpoint calls into the policy engine until M4's /sign_psbt), but
+# already TOML-configured and validated at load time - see src/policy.rs.
+[policy]
+max_tx_sat = 500000           # 0.005 BTC per transaction
+max_daily_sat = 1000000       # 0.01 BTC per trailing 24h
+max_weekly_sat = 3000000      # 0.03 BTC per trailing 7d
+max_monthly_sat = 8000000     # 0.08 BTC per trailing 30d
+max_fee_sat = 50000
+max_fee_rate_sat_per_vb = 200.0
+# destination_whitelist = ["tb1q..."]  # optional; omit to allow any destination
