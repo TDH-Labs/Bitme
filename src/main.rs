@@ -1,9 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use cosigner::config::WalletConfig;
+use cosigner::chain::{BitcoindRpc, ChainSource};
+use cosigner::config::{BitcoindConfig, WalletConfig};
 use cosigner::descriptor::{self, BuiltDescriptor};
+use cosigner::http::{self, AppState};
 use cosigner::invariants::{self, InvariantReport, LabeledKey};
 use miniscript::descriptor::DefiniteDescriptorKey;
 use miniscript::{Descriptor, DescriptorPublicKey, ForEachKey};
@@ -22,6 +25,15 @@ enum TopCommand {
         #[command(subcommand)]
         command: DescriptorCommand,
     },
+    /// Run the HTTP API (currently: POST /inspect).
+    Serve(ServeArgs),
+}
+
+#[derive(Args)]
+struct ServeArgs {
+    /// Path to the TOML wallet config (keys + timelock + [bitcoind] + [server]).
+    #[arg(long)]
+    config: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -73,7 +85,59 @@ fn run() -> Result<()> {
             DescriptorCommand::Build(args) => cmd_build(args),
             DescriptorCommand::Check(args) => cmd_check(args),
         },
+        TopCommand::Serve(args) => cmd_serve(args),
     }
+}
+
+fn cmd_serve(args: ServeArgs) -> Result<()> {
+    let cfg = WalletConfig::load(&args.config)?;
+    let (bitcoind_cfg, server_cfg) = cfg.require_server_config()?;
+    let wallet = descriptor::build_descriptor(&cfg)?;
+
+    let report = run_invariants(&wallet, &cfg)?;
+    if !report.all_invariants_hold() {
+        bail!("refusing to start: descriptor failed invariant checks");
+    }
+
+    let client = bitcoind_client(bitcoind_cfg)?;
+    let chain: Arc<dyn ChainSource> = Arc::new(BitcoindRpc::new(client));
+    let state = AppState {
+        wallet: Arc::new(wallet),
+        cfg: Arc::new(cfg.clone()),
+        chain,
+        gap_limit: server_cfg.gap_limit,
+    };
+    let bind_addr = server_cfg.bind_addr.clone();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting tokio runtime")?;
+    rt.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(&bind_addr)
+            .await
+            .with_context(|| format!("binding {bind_addr}"))?;
+        println!(
+            "cosigner listening on {bind_addr} (network={:?})",
+            cfg.network
+        );
+        axum::serve(listener, http::router(state))
+            .await
+            .context("http server")
+    })
+}
+
+fn bitcoind_client(cfg: &BitcoindConfig) -> Result<bitcoincore_rpc::Client> {
+    let auth = if let Some(cookie) = &cfg.rpc_cookie_file {
+        bitcoincore_rpc::Auth::CookieFile(PathBuf::from(cookie))
+    } else {
+        bitcoincore_rpc::Auth::UserPass(
+            cfg.rpc_user.clone().context("bitcoind.rpc_user")?,
+            cfg.rpc_password.clone().context("bitcoind.rpc_password")?,
+        )
+    };
+    bitcoincore_rpc::Client::new(&cfg.rpc_url, auth)
+        .with_context(|| format!("connecting to bitcoind at {}", cfg.rpc_url))
 }
 
 fn cmd_build(args: BuildArgs) -> Result<()> {
@@ -162,11 +226,7 @@ fn role_labeled_keys(
     cfg: &WalletConfig,
 ) -> Result<Vec<LabeledKey>> {
     let definite = descriptor::at_index(external, 0)?;
-    let mut found: Vec<(String, DefiniteDescriptorKey)> = Vec::new();
-    definite.for_each_key(|k| {
-        found.push((k.to_string(), k.clone()));
-        true
-    });
+    let keys = descriptor::definite_keys(&definite);
 
     let roles = [
         ("satochip", &cfg.keys.satochip.xpub),
@@ -176,13 +236,8 @@ fn role_labeled_keys(
 
     let mut labeled = Vec::new();
     for (role, xpub) in roles {
-        let xpub = xpub.trim();
-        let (key_str, key) = found
-            .iter()
-            .find(|(s, _)| s.contains(xpub))
-            .cloned()
+        let key = descriptor::find_role_key(&keys, xpub)
             .with_context(|| format!("could not find key for role {role} in built descriptor"))?;
-        let _ = key_str;
         labeled.push(LabeledKey {
             label: role.to_string(),
             key,

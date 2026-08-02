@@ -40,6 +40,8 @@ pub fn test_wallet_config(timelock_blocks: u16) -> WalletConfig {
             mobile: test_key_spec(0x02),
             server: test_key_spec(0x03),
         },
+        bitcoind: None,
+        server: None,
     }
 }
 

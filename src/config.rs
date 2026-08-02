@@ -109,6 +109,55 @@ pub struct WalletConfig {
     /// Relative timelock (in blocks) for the RECOVERY path (SATOCHIP + MOBILE). Default 12960 (~90 days).
     pub timelock_blocks: u16,
     pub keys: KeysConfig,
+    /// Only required by `cosigner serve`; the descriptor CLI doesn't need a node.
+    pub bitcoind: Option<BitcoindConfig>,
+    /// Only required by `cosigner serve`.
+    pub server: Option<ServerConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BitcoindConfig {
+    /// e.g. "http://127.0.0.1:38332" for signet, "http://127.0.0.1:18443" for regtest.
+    pub rpc_url: String,
+    /// Path to bitcoind's .cookie file. Mutually exclusive with rpc_user/rpc_password.
+    #[serde(default)]
+    pub rpc_cookie_file: Option<String>,
+    #[serde(default)]
+    pub rpc_user: Option<String>,
+    #[serde(default)]
+    pub rpc_password: Option<String>,
+}
+
+impl BitcoindConfig {
+    fn validate(&self) -> Result<()> {
+        let has_cookie = self.rpc_cookie_file.is_some();
+        let has_userpass = self.rpc_user.is_some() || self.rpc_password.is_some();
+        if has_cookie && has_userpass {
+            bail!("bitcoind: set either rpc_cookie_file or rpc_user/rpc_password, not both");
+        }
+        if !has_cookie && !has_userpass {
+            bail!("bitcoind: one of rpc_cookie_file or rpc_user+rpc_password is required");
+        }
+        if has_userpass && (self.rpc_user.is_none() || self.rpc_password.is_none()) {
+            bail!("bitcoind: both rpc_user and rpc_password are required when not using rpc_cookie_file");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerConfig {
+    /// e.g. "127.0.0.1:8080". Bind to loopback unless you're deliberately exposing this
+    /// service - it holds one of three keys and should sit behind your own network controls.
+    pub bind_addr: String,
+    /// How many unused addresses ahead of the last-seen one to check, on each of the
+    /// external/internal chains, when deciding whether a scriptPubkey is ours.
+    #[serde(default = "default_gap_limit")]
+    pub gap_limit: u32,
+}
+
+fn default_gap_limit() -> u32 {
+    1000
 }
 
 impl WalletConfig {
@@ -164,7 +213,23 @@ impl WalletConfig {
             );
         }
 
+        if let Some(bitcoind) = &self.bitcoind {
+            bitcoind.validate()?;
+        }
+
         Ok(())
+    }
+
+    /// `cosigner serve` needs both `[bitcoind]` and `[server]`; the descriptor CLI doesn't.
+    pub fn require_server_config(&self) -> Result<(&BitcoindConfig, &ServerConfig)> {
+        let bitcoind = self.bitcoind.as_ref().context(
+            "config is missing the [bitcoind] section, required to run `cosigner serve`",
+        )?;
+        let server = self
+            .server
+            .as_ref()
+            .context("config is missing the [server] section, required to run `cosigner serve`")?;
+        Ok((bitcoind, server))
     }
 }
 

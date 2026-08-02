@@ -15,7 +15,7 @@ use std::str::FromStr;
 use anyhow::{bail, Context, Result};
 use bitcoin::Address;
 use miniscript::descriptor::{DefiniteDescriptorKey, DescriptorType};
-use miniscript::{Descriptor, DescriptorPublicKey};
+use miniscript::{Descriptor, DescriptorPublicKey, ForEachKey, ToPublicKey};
 
 use crate::config::{ChainNetwork, KeySpec, WalletConfig};
 
@@ -136,6 +136,118 @@ pub fn at_index(
         .with_context(|| format!("deriving index {index}"))
 }
 
+/// Which chain (receive/external or change/internal) a derived scriptPubkey was found on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chain {
+    External,
+    Internal,
+}
+
+/// Where in the wallet a scriptPubkey was found, from [`find_owner`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Owned {
+    pub chain: Chain,
+    pub index: u32,
+}
+
+/// Searches `desc` at indices `0..gap_limit` for one whose scriptPubkey equals `target`.
+///
+/// This is the only trustworthy way to answer "is this scriptPubkey ours": PSBT metadata
+/// (bip32_derivation, the "this is change" convention some wallets use) is supplied by
+/// whoever built the PSBT and must never be taken on faith - see `inspect.rs`.
+fn find_on_chain(
+    desc: &Descriptor<DescriptorPublicKey>,
+    target: &bitcoin::ScriptBuf,
+    gap_limit: u32,
+) -> Result<Option<u32>> {
+    for index in 0..gap_limit {
+        let definite = at_index(desc, index)?;
+        if &definite.script_pubkey() == target {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+/// Searches both the external and internal chains of `wallet` for `target`, up to
+/// `gap_limit` indices on each. Checks external first: an address a caller is *spending
+/// from* is at least as likely to be a receive address as a change one, and either way both
+/// chains resolve to the same policy, so the order only affects which `Chain` gets reported
+/// when (pathologically) both happened to match.
+pub fn find_owner(
+    wallet: &BuiltDescriptor,
+    target: &bitcoin::ScriptBuf,
+    gap_limit: u32,
+) -> Result<Option<Owned>> {
+    if let Some(index) = find_on_chain(&wallet.external, target, gap_limit)? {
+        return Ok(Some(Owned {
+            chain: Chain::External,
+            index,
+        }));
+    }
+    if let Some(index) = find_on_chain(&wallet.internal, target, gap_limit)? {
+        return Ok(Some(Owned {
+            chain: Chain::Internal,
+            index,
+        }));
+    }
+    Ok(None)
+}
+
+/// Every key in a fully-derived (non-wildcard) descriptor, paired with its own key
+/// expression string - used to pick a specific role's key back out by matching against the
+/// xpub that role was configured with (the only stable identifier we have for "which key is
+/// SATOCHIP" once everything's been derived down to raw public keys).
+pub fn definite_keys(
+    desc: &Descriptor<DefiniteDescriptorKey>,
+) -> Vec<(String, DefiniteDescriptorKey)> {
+    let mut found = Vec::new();
+    desc.for_each_key(|k| {
+        found.push((k.to_string(), k.clone()));
+        true
+    });
+    found
+}
+
+/// Picks the key belonging to `xpub` out of `keys` (as produced by [`definite_keys`]).
+pub fn find_role_key(
+    keys: &[(String, DefiniteDescriptorKey)],
+    xpub: &str,
+) -> Result<DefiniteDescriptorKey> {
+    let xpub = xpub.trim();
+    keys.iter()
+        .find(|(s, _)| s.contains(xpub))
+        .map(|(_, k)| k.clone())
+        .with_context(|| format!("key for xpub {xpub} not found in descriptor"))
+}
+
+/// The three role keys (as concrete, spendable public keys - not descriptor key
+/// expressions) at one derivation index, for matching against a PSBT's `partial_sigs`.
+pub struct RoleKeys {
+    pub satochip: bitcoin::PublicKey,
+    pub server: bitcoin::PublicKey,
+    pub mobile: bitcoin::PublicKey,
+}
+
+pub fn role_keys_at(
+    wallet: &BuiltDescriptor,
+    cfg: &WalletConfig,
+    chain: Chain,
+    index: u32,
+) -> Result<RoleKeys> {
+    let desc = match chain {
+        Chain::External => &wallet.external,
+        Chain::Internal => &wallet.internal,
+    };
+    let definite = at_index(desc, index)?;
+    let keys = definite_keys(&definite);
+    Ok(RoleKeys {
+        satochip: find_role_key(&keys, &cfg.keys.satochip.xpub)?.to_public_key(),
+        server: find_role_key(&keys, &cfg.keys.server.xpub)?.to_public_key(),
+        mobile: find_role_key(&keys, &cfg.keys.mobile.xpub)?.to_public_key(),
+    })
+}
+
 /// Parses a standalone descriptor string (e.g. loaded from a file, or produced by another
 /// tool) for `descriptor check`. Does not require key role information.
 ///
@@ -239,5 +351,53 @@ mod tests {
         let mut s = built.external.to_string();
         s.push('x'); // corrupt the checksum
         assert!(parse_descriptor(&s).is_err());
+    }
+
+    #[test]
+    fn find_owner_locates_external_and_internal_scripts() {
+        let cfg = test_wallet_config(12960);
+        let built = build_descriptor(&cfg).unwrap();
+
+        let receive3 = at_index(&built.external, 3).unwrap().script_pubkey();
+        let owned = find_owner(&built, &receive3, 10)
+            .unwrap()
+            .expect("should find it");
+        assert_eq!(
+            owned,
+            Owned {
+                chain: Chain::External,
+                index: 3
+            }
+        );
+
+        let change7 = at_index(&built.internal, 7).unwrap().script_pubkey();
+        let owned = find_owner(&built, &change7, 10)
+            .unwrap()
+            .expect("should find it");
+        assert_eq!(
+            owned,
+            Owned {
+                chain: Chain::Internal,
+                index: 7
+            }
+        );
+    }
+
+    #[test]
+    fn find_owner_respects_the_gap_limit() {
+        let cfg = test_wallet_config(12960);
+        let built = build_descriptor(&cfg).unwrap();
+        let receive50 = at_index(&built.external, 50).unwrap().script_pubkey();
+        assert!(find_owner(&built, &receive50, 10).unwrap().is_none());
+        assert!(find_owner(&built, &receive50, 51).unwrap().is_some());
+    }
+
+    #[test]
+    fn find_owner_returns_none_for_a_foreign_script() {
+        let cfg = test_wallet_config(12960);
+        let built = build_descriptor(&cfg).unwrap();
+        // A well-formed P2WSH scriptPubkey (OP_0 <32-byte hash>) that isn't ours.
+        let foreign = bitcoin::ScriptBuf::from(vec![0u8; 34]);
+        assert!(find_owner(&built, &foreign, 25).unwrap().is_none());
     }
 }
