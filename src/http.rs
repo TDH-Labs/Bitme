@@ -56,12 +56,40 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/health", get(health_handler))
         .route("/inspect", post(inspect_handler))
         .route("/sign_psbt", post(sign_psbt_handler))
         .route("/sign_psbt/{id}", get(get_sign_psbt_handler))
         .route("/veto/{id}", post(veto_handler))
         .route("/policy", get(get_policy_handler).post(post_policy_handler))
         .with_state(state)
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    service: &'static str,
+    version: &'static str,
+    network: &'static str,
+    policy_version: u64,
+}
+
+/// Deliberately minimal and non-sensitive: no key material, no ledger contents, nothing that
+/// would matter if scraped by a monitoring tool or shown by a reverse proxy's health check -
+/// just enough to confirm the service is up and pointed at the network you expect.
+async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
+    let network = match state.cfg.network {
+        crate::config::ChainNetwork::Mainnet => "mainnet",
+        crate::config::ChainNetwork::Testnet => "testnet",
+        crate::config::ChainNetwork::Signet => "signet",
+        crate::config::ChainNetwork::Regtest => "regtest",
+    };
+    let policy_version = state.policy.read().await.version;
+    Json(HealthResponse {
+        service: "cosigner",
+        version: env!("CARGO_PKG_VERSION"),
+        network,
+        policy_version,
+    })
 }
 
 fn now_unix() -> i64 {
@@ -893,6 +921,16 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "got: {body}");
         assert_eq!(body["version"], 1);
         assert_eq!(body["max_tx_sat"], 100_000);
+    }
+
+    #[tokio::test]
+    async fn health_reports_service_network_and_policy_version() {
+        let (state, _chain) = test_state(1_000_000).await;
+        let (status, body) = call(router(state), "GET", "/health", None).await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["service"], "cosigner");
+        assert_eq!(body["network"], "signet");
+        assert_eq!(body["policy_version"], 1);
     }
 
     #[tokio::test]

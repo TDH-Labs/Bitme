@@ -1,0 +1,24 @@
+# Umbrel-specific compose file. Builds the same image as the root Dockerfile (no separate
+# image to maintain), but wires bitcoind connection details from Umbrel's own `bitcoin` app
+# dependency instead of a hand-configured one - see umbrel-app.yml's `dependencies: [bitcoin]`
+# and docs/UMBREL.md for the full picture, including why key material is provided as a mounted
+# file here instead of an environment variable (Umbrel has no per-app secret-entry UI).
+services:
+  app:
+    build:
+      context: ..
+    restart: unless-stopped
+    stop_grace_period: 1m
+    ports:
+      - "${APP_PORT}:8080"
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+      - ${APP_DATA_DIR}/config:/data/config:ro
+    environment:
+      COSIGNER_HTTP_PORT: "8080"
+      BITCOIND_RPC_URL: "http://${APP_BITCOIN_NODE_IP}:${APP_BITCOIN_RPC_PORT}"
+      BITCOIND_RPC_USER: "${APP_BITCOIN_RPC_USER}"
+      BITCOIND_RPC_PASSWORD: "${APP_BITCOIN_RPC_PASS}"
+      # Read by docker-entrypoint.sh as a safety check: refuses to start if this doesn't match
+      # wallet.toml's declared `network`, rather than silently running against the wrong chain.
+      APP_BITCOIN_NETWORK: "${APP_BITCOIN_NETWORK}"

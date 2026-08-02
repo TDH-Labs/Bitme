@@ -1,0 +1,36 @@
+manifestVersion: 1
+id: bitme-cosigner
+name: Bitme Cosigner
+tagline: Policy-gated Bitcoin PSBT co-signing service
+category: bitcoin
+version: "0.1.0"
+port: 8080
+description: >-
+  Self-hosted signing service for a 3-key miniscript wallet (a SATOCHIP smartcard, a Bitcoin
+  Keeper mobile app, and this service). It holds one key and co-signs PSBTs only when policy
+  allows: per-transaction and rolling day/week/month spend caps, an out-of-band notification
+  plus a hold-and-veto window before every signature, and SATOCHIP-authorized runtime policy
+  changes. It can never spend alone, never initiates a transaction, and never finalizes or
+  broadcasts anything itself.
+
+
+  This app is API-only by design - it has no web dashboard. Opening it shows a small JSON
+  health check, not a page. Everything else happens over its HTTP API; see the project's README
+  for the full endpoint reference.
+
+
+  Start on signet, not mainnet, until you've verified your whole setup end-to-end - see
+  docs/UMBREL.md in the repo before installing.
+developer: TDH Labs
+website: https://github.com/TDH-Labs/Bitme
+dependencies:
+  - bitcoin
+repo: https://github.com/TDH-Labs/Bitme
+support: https://github.com/TDH-Labs/Bitme/issues
+# No screenshots: this is a headless API service, not something with a UI to show.
+gallery: []
+releaseNotes: >-
+  Initial release: descriptor construction and invariant verification, PSBT inspection, the
+  policy engine, signing, the notify-then-hold-then-veto flow, and SATOCHIP-authorized runtime
+  policy changes.
+path: ""
