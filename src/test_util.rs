@@ -42,6 +42,7 @@ pub fn test_wallet_config(timelock_blocks: u16) -> WalletConfig {
         },
         bitcoind: None,
         server: None,
+        policy: None,
     }
 }
 

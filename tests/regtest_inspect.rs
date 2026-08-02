@@ -91,6 +91,7 @@ fn regtest_wallet_config() -> WalletConfig {
         },
         bitcoind: None,
         server: None,
+        policy: None,
     }
 }
 

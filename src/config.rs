@@ -113,6 +113,9 @@ pub struct WalletConfig {
     pub bitcoind: Option<BitcoindConfig>,
     /// Only required by `cosigner serve`.
     pub server: Option<ServerConfig>,
+    /// Only required once policy-gated signing (`/sign_psbt`) is wired up; the descriptor
+    /// CLI and `/inspect` don't consult it.
+    pub policy: Option<crate::policy::PolicyConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -217,6 +220,10 @@ impl WalletConfig {
             bitcoind.validate()?;
         }
 
+        if let Some(policy) = &self.policy {
+            policy.compile(self.network).context("[policy]")?;
+        }
+
         Ok(())
     }
 
@@ -262,6 +269,29 @@ mod tests {
         let err = cfg.validate().unwrap_err().to_string();
         assert!(!err.contains("i_understand_this_is_mainnet"), "got: {err}");
         assert!(err.contains("network"), "got: {err}");
+    }
+
+    #[test]
+    fn no_policy_section_is_valid() {
+        let cfg = test_wallet_config(12960);
+        assert!(cfg.policy.is_none());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn malformed_policy_whitelist_address_fails_validation() {
+        let mut cfg = test_wallet_config(12960);
+        cfg.policy = Some(crate::policy::PolicyConfig {
+            max_tx_sat: 1,
+            max_daily_sat: 1,
+            max_weekly_sat: 1,
+            max_monthly_sat: 1,
+            max_fee_sat: 1,
+            max_fee_rate_sat_per_vb: 1.0,
+            destination_whitelist: Some(vec!["not-an-address".to_string()]),
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("policy"), "got: {err}");
     }
 
     #[test]

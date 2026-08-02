@@ -17,9 +17,11 @@ axum = "0.8"
 bitcoin = { version = "0.32.8", features = ["base64"] }
 bitcoincore-rpc = "0.19"
 clap = { version = "4.6", features = ["derive"] }
+libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 miniscript = { version = "12.3.7", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "macros"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 toml = "0.8"
