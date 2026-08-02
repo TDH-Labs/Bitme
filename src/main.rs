@@ -58,6 +58,42 @@ enum RecoveryKitCommand {
     Export(RecoveryKitExportArgs),
     /// Decrypt a backup blob back into a wallet.toml + a SERVER xprv file.
     Import(RecoveryKitImportArgs),
+    /// Publish an already-exported backup blob to Nostr relays, as off-machine storage.
+    Publish(RecoveryKitPublishArgs),
+    /// Fetch a previously published backup blob back from Nostr relays.
+    Fetch(RecoveryKitFetchArgs),
+}
+
+#[derive(Args)]
+struct RecoveryKitPublishArgs {
+    /// Path to an armored backup blob produced by `recovery-kit export`.
+    #[arg(long = "in")]
+    input: PathBuf,
+    /// Path to a file containing the passphrase (its trimmed contents) - must be the SAME
+    /// passphrase the blob was exported with, since it also derives the Nostr identity this is
+    /// published under.
+    #[arg(long)]
+    passphrase_file: PathBuf,
+    /// Relay URL to publish to (wss://...). Repeat for multiple relays - at least one is
+    /// required, and more than one is strongly recommended: a single relay is a new single
+    /// point of failure for something that exists specifically to remove one.
+    #[arg(long = "relay")]
+    relays: Vec<String>,
+}
+
+#[derive(Args)]
+struct RecoveryKitFetchArgs {
+    /// Path to a file containing the passphrase (its trimmed contents) - the same passphrase
+    /// used with `recovery-kit publish`.
+    #[arg(long)]
+    passphrase_file: PathBuf,
+    /// Relay URL to query (wss://...). Repeat for multiple relays.
+    #[arg(long = "relay")]
+    relays: Vec<String>,
+    /// Where to write the fetched, still-encrypted backup blob - feed this to
+    /// `recovery-kit import --in`.
+    #[arg(long)]
+    out: PathBuf,
 }
 
 #[derive(Args)]
@@ -184,7 +220,71 @@ fn run() -> Result<()> {
         TopCommand::RecoveryKit { command } => match command {
             RecoveryKitCommand::Export(args) => cmd_recovery_kit_export(args),
             RecoveryKitCommand::Import(args) => cmd_recovery_kit_import(args),
+            RecoveryKitCommand::Publish(args) => cmd_recovery_kit_publish(args),
+            RecoveryKitCommand::Fetch(args) => cmd_recovery_kit_fetch(args),
         },
+    }
+}
+
+fn cmd_recovery_kit_publish(args: RecoveryKitPublishArgs) -> Result<()> {
+    if args.relays.is_empty() {
+        bail!("at least one --relay is required");
+    }
+    let passphrase = std::fs::read_to_string(&args.passphrase_file)
+        .with_context(|| format!("reading {}", args.passphrase_file.display()))?;
+    let armored = std::fs::read_to_string(&args.input)
+        .with_context(|| format!("reading {}", args.input.display()))?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting tokio runtime")?;
+    let outcome = rt.block_on(cosigner::nostr_kit::publish(
+        &armored,
+        passphrase.trim(),
+        &args.relays,
+    ))?;
+
+    println!(
+        "Published under Nostr identity {} - {}/{} relay(s) succeeded.",
+        outcome.npub,
+        outcome.relays_succeeded,
+        outcome.relays_succeeded + outcome.relays_failed.len()
+    );
+    for (url, reason) in &outcome.relays_failed {
+        eprintln!("  {url}: FAILED - {reason}");
+    }
+    if outcome.relays_succeeded == 0 {
+        bail!("publish failed on every relay - see above");
+    }
+    Ok(())
+}
+
+fn cmd_recovery_kit_fetch(args: RecoveryKitFetchArgs) -> Result<()> {
+    if args.relays.is_empty() {
+        bail!("at least one --relay is required");
+    }
+    let passphrase = std::fs::read_to_string(&args.passphrase_file)
+        .with_context(|| format!("reading {}", args.passphrase_file.display()))?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting tokio runtime")?;
+    let content = rt.block_on(cosigner::nostr_kit::fetch(passphrase.trim(), &args.relays))?;
+
+    match content {
+        Some(armored) => {
+            std::fs::write(&args.out, &armored)
+                .with_context(|| format!("writing {}", args.out.display()))?;
+            println!("Wrote fetched backup to {}.", args.out.display());
+            Ok(())
+        }
+        None => bail!(
+            "no recovery kit event found on the given relay(s) for this passphrase's derived \
+             identity - either it was never published, the relays don't have it, or the \
+             passphrase doesn't match what it was published with"
+        ),
     }
 }
 
