@@ -63,6 +63,33 @@ pub fn canonical_message(version: u64, policy: &PolicyConfig) -> String {
     msg
 }
 
+/// The text a human must sign to lift a freeze. Bound to the current policy `version` so an
+/// unfreeze authorisation can't be captured once and replayed later to quietly re-enable
+/// signing after a subsequent freeze.
+pub fn canonical_unfreeze_message(policy_version: u64) -> String {
+    format!("cosigner unfreeze authorization v1\npolicy_version: {policy_version}")
+}
+
+/// Checks a SATOCHIP signature over [`canonical_unfreeze_message`]. Shares
+/// [`verify_satochip_signer`]'s "account key or any derived child" matching, so the same card
+/// works regardless of which address index the user's wallet software signs from.
+pub fn verify_unfreeze_authorization(
+    cfg: &WalletConfig,
+    gap_limit: u32,
+    policy_version: u64,
+    signature_base64: &str,
+) -> Result<(), PolicyAuthError> {
+    let satochip_xpub = Xpub::from_str(cfg.keys.satochip.xpub.trim())
+        .context("keys.satochip.xpub")
+        .map_err(PolicyAuthError::Internal)?;
+    verify_satochip_signer(
+        &canonical_unfreeze_message(policy_version),
+        signature_base64,
+        &satochip_xpub,
+        gap_limit,
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum PolicyAuthError {
     #[error("policy change targets version {got}, but the next expected version is {expected}")]

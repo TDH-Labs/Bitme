@@ -61,7 +61,8 @@ max_fee_rate_sat_per_vb = 200.0
 # hold_seconds has passed with no POST /veto/{id} - see src/notify.rs and src/sign.rs.
 [notify]
 hold_seconds = 900            # 15 minutes to review and veto before this service signs
-sweep_interval_seconds = 5    # how often the background sweeper checks for elapsed holds
+sweep_interval_seconds = 5
+renotify_interval_seconds = 21600  # remind every 6h while a spend is still holding    # how often the background sweeper checks for elapsed holds
 
 [notify.ntfy]
 url = "https://ntfy.sh/replace-with-a-private-topic-name"
@@ -74,3 +75,15 @@ url = "https://ntfy.sh/replace-with-a-private-topic-name"
 # password = "..."
 # from = "cosigner@example.com"
 # to = "you@example.com"
+
+# The MOBILE + SERVER path - what you use if the SATOCHIP is lost or destroyed. Its own
+# settings because a full-balance sweep is the legitimate use, so [policy]'s per-transaction
+# and rolling caps would block precisely what it's for.
+#
+# IMPORTANT: older(N) is a *relative* timelock. Coins already older than timelock_blocks
+# satisfy it right now, so for a mature wallet hold_seconds below is the PRIMARY protection
+# against a stolen phone, not a backstop. Keep it long, and set the whitelist if you can.
+[recovery]
+enabled = true                  # off would make lost-SATOCHIP recovery impossible by default
+hold_seconds = 172800           # 48h of notify-and-veto before a no-hardware spend is signed
+# destination_whitelist = ["tb1q..."]  # strongly recommended: pre-commit to where you'd sweep

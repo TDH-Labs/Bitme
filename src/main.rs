@@ -37,6 +37,20 @@ enum TopCommand {
         #[command(subcommand)]
         command: PolicyCommand,
     },
+    /// Lift a freeze using direct server access instead of a SATOCHIP signature.
+    ///
+    /// `POST /unfreeze` needs the hardware; this does not. That's deliberate and it is not a
+    /// hole: anyone who can run this already has the server and therefore the SERVER key, so
+    /// requiring hardware here would buy nothing while making a freeze permanent in exactly
+    /// the case the lost-SATOCHIP recovery path exists for.
+    Unfreeze(UnfreezeArgs),
+}
+
+#[derive(Args)]
+struct UnfreezeArgs {
+    /// Path to the same TOML wallet config `serve` uses (for `server.ledger_db_path`).
+    #[arg(long)]
+    config: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -119,7 +133,33 @@ fn run() -> Result<()> {
         TopCommand::Policy { command } => match command {
             PolicyCommand::Message(args) => cmd_policy_message(args),
         },
+        TopCommand::Unfreeze(args) => cmd_unfreeze(args),
     }
+}
+
+fn cmd_unfreeze(args: UnfreezeArgs) -> Result<()> {
+    let cfg = WalletConfig::load(&args.config)?;
+    let (_, server_cfg) = cfg.require_server_config()?;
+    let path = server_cfg
+        .ledger_db_path
+        .clone()
+        .context("config is missing server.ledger_db_path")?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting tokio runtime")?;
+    rt.block_on(async move {
+        let ledger = Ledger::connect(&path)
+            .await
+            .with_context(|| format!("opening ledger at {path}"))?;
+        if !ledger.is_frozen().await? {
+            println!("Not frozen - nothing to do.");
+            return Ok(());
+        }
+        ledger.set_frozen(false, now_unix(), None).await?;
+        println!("Co-signing UNFROZEN. Restart is not required; the running server picks this up.");
+        Ok(())
+    })
 }
 
 fn cmd_policy_message(args: PolicyMessageArgs) -> Result<()> {
@@ -166,6 +206,7 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
     let notifier: Arc<dyn Notifier> =
         Arc::new(MultiNotifier::from_config(notify_cfg).context("configuring [notify] channels")?);
     let hold_seconds = notify_cfg.hold_seconds;
+    let renotify_interval_seconds = notify_cfg.renotify_interval_seconds;
     let sweep_interval = std::time::Duration::from_secs(notify_cfg.sweep_interval_seconds.max(1));
 
     let client = bitcoind_client(bitcoind_cfg)?;
@@ -213,6 +254,8 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
         };
 
         spawn_sweeper(
+            state.notifier.clone(),
+            renotify_interval_seconds,
             state.ledger.clone(),
             state.wallet.clone(),
             state.cfg.clone(),
@@ -242,6 +285,8 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
 /// stop other rows from being retried on the next tick.
 #[allow(clippy::too_many_arguments)]
 fn spawn_sweeper(
+    notifier: Arc<dyn Notifier>,
+    renotify_interval_seconds: i64,
     ledger: Arc<Ledger>,
     wallet: Arc<BuiltDescriptor>,
     cfg: Arc<WalletConfig>,
@@ -265,11 +310,20 @@ fn spawn_sweeper(
                 &cfg,
                 &server_key,
                 &compiled,
+                &cfg.recovery_config(),
                 &chain,
                 gap_limit,
                 now,
             )
             .await;
+            match sign::renotify_pending(&ledger, notifier.as_ref(), renotify_interval_seconds, now)
+                .await
+            {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(count = n, "sent hold reminders"),
+                Err(e) => tracing::warn!(error = %e, "re-notification sweep failed"),
+            }
+
             for (txid, outcome) in results {
                 match outcome {
                     Ok(outcome) => tracing::info!(txid, ?outcome, "processed pending signature"),

@@ -93,16 +93,24 @@ The descriptor:
 wsh(thresh(2,pk(SATOCHIP),s:pk(SERVER),snj:and_v(v:pk(MOBILE),older(4320))))
 ```
 
-**Why the timelock is on the phone key.** It's doing two jobs at once. It keeps the policy
-engine meaningful — the only way to spend *without waiting a month* is SATOCHIP + SERVER, so
-there's no way to route around your own rules for day-to-day spending. And it turns both
-recovery paths into slow, loud events: if someone gets your phone and your server, they have to
-wait 30 days in the open, during which you can see it happening and sweep the funds instantly
-with your Satochip.
+**Why the timelock is on the phone key.** It keeps the policy engine meaningful: the only way
+to spend without satisfying a 30-day-deep timelock is SATOCHIP + SERVER, so there's no routing
+around your own rules for day-to-day spending.
 
-**Why 30 days.** It's a consensus rule baked into your addresses, so it's a hard floor on how
-long recovery takes, and changing it later means moving your coins. Long enough to notice a
-theft and react; short enough that legitimate recovery isn't a season of your life.
+⚠️ **Read this carefully — it is the most misunderstood part of the design.** `older(N)` is a
+*relative* timelock (BIP68). It requires **that coin to be 4320 blocks deep**, not that 30 days
+pass from now. Coins you received last week are locked out of the recovery paths; coins that
+have been sitting for six months satisfy it **already, right now**.
+
+So for a mature wallet, the recovery paths are open immediately, and the timelock is *not* a
+30-day alarm window. What actually protects mature coins on the no-hardware path is the
+server-side hold, the notification, and your veto — which is why `[recovery] hold_seconds`
+defaults to 48 hours rather than minutes, and why an offline destination whitelist is worth
+setting.
+
+**Why 30 days.** It's baked into your addresses, so it's a hard floor on how long a *fresh
+deposit* stays unrecoverable, and changing it later means moving your coins. Long enough to
+matter; short enough that recovery isn't a season of your life.
 
 > **An earlier version of this design was wrong** and it's worth saying so. It required the
 > SATOCHIP for *both* paths, which meant losing that one card — with no seed backup — lost the
@@ -320,6 +328,8 @@ the tradeoff, and a reason we haven't rushed to copy it.
 | `/veto/{id}` | POST | Cancel before it signs |
 | `/policy` | GET | Current rules and version |
 | `/policy` | POST | Change the rules (needs a Satochip signature) |
+| `/freeze` | GET/POST | Stop all co-signing. **POST is unauthenticated on purpose** — it's the "my phone was just stolen" button and must work in a hurry. Freezing can only cause denial of service; that's strictly better than theft. |
+| `/unfreeze` | POST | Resume. Needs a Satochip signature, or the `cosigner unfreeze` CLI if the Satochip is what you lost. |
 
 No web UI, by design. Everything is API.
 
@@ -350,13 +360,17 @@ What each attacker can and can't do:
 | The server, fully rooted | **No.** One key of two. They can annoy you and read your balance. |
 | Your phone | **No.** Needs a second key. |
 | Your Satochip | **No.** Needs a second key. |
-| Phone + server | Only after ~30 days of waiting, in public, with notifications firing. Sweep with your Satochip first. |
+| Phone + server | **Coins under 30 days old:** locked until they mature. **Coins older than that:** the script timelock is already satisfied, so only the 48h hold, the notification and your veto stand in the way — and none of those survive a *fully rooted* server that has the raw key. This is the sharpest edge in the design. |
 | Satochip + phone | Yes, after ~30 days. |
 | Satochip + server | Yes, immediately, within your policy limits. |
 | Network access to the API | **Currently:** can submit transactions and burn spending limits. Can't move funds — the Satochip is still required. Fixed by the Nostr transport work below. |
 
-The honest weak point: **an attacker holding both your phone and your server key gets your money
-after 30 days.** The timelock is your reaction window, not a wall. Watch your notifications.
+The honest weak point: **an attacker holding both your phone and your raw server key can take
+mature coins, and the timelock will not stop them.** It only delays coins younger than 30 days.
+Mitigations that do apply: set `[recovery] destination_whitelist` so recovery spends can only go
+somewhere you chose in advance, keep `hold_seconds` long, and actually read your notifications.
+This is the same exposure Bitkey has with app + server, and the reason both designs lean on
+notification rather than pretending the delay is a wall.
 
 ---
 
@@ -372,15 +386,18 @@ Working and tested — 117 unit tests, plus integration tests against a real reg
 - Satochip-authorised, versioned, replay-proof policy changes
 - Docker and Umbrel packaging
 
+- **Lost-Satochip recovery co-signing** (`[recovery]`), with its own policy: ordinary caps
+  don't apply (a sweep is the point), a longer default hold, and an optional destination
+  whitelist
+- **Freeze / unfreeze**, durable across restarts
+- **Repeat notifications** during a hold, so one missed message doesn't cost you the veto window
+
 Not done yet:
 
-- **Co-signing the lost-Satochip recovery path.** The descriptor supports MOBILE + SERVER; the
-  server currently refuses to co-sign it (fails closed). It needs its own policy — a full-balance
-  sweep is the legitimate use, so ordinary per-transaction caps are the wrong gate.
-- **The recovery kit** — descriptor + encrypted server key, published to Nostr relays.
+- **The recovery kit** — descriptor + encrypted server key, published to Nostr relays. This is
+  the most valuable remaining item: without it, losing the box that holds `wallet.toml` can
+  strand you even though you still have all three keys.
 - **Nostr transport** — the whole section above is designed, not built.
-- **Repeat notifications** during a hold. Currently fires once.
-- **Freeze mode** — a Satochip-signed "stop signing everything" for when a device goes missing.
 - **Migration tooling** — one command to sweep to a new descriptor when replacing a device.
 - **A setup wizard.** Right now you hand-edit TOML with three xpubs, which is not "simple to set
   up" by any reasonable standard.

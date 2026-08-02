@@ -62,6 +62,8 @@ pub fn router(state: AppState) -> Router {
         .route("/sign_psbt/{id}", get(get_sign_psbt_handler))
         .route("/veto/{id}", post(veto_handler))
         .route("/policy", get(get_policy_handler).post(post_policy_handler))
+        .route("/freeze", get(get_freeze_handler).post(post_freeze_handler))
+        .route("/unfreeze", post(post_unfreeze_handler))
         .with_state(state)
 }
 
@@ -330,7 +332,12 @@ impl From<SignPsbtError> for ApiError {
 impl From<SubmitError> for ApiError {
     fn from(e: SubmitError) -> Self {
         let status = match &e {
-            SubmitError::NotHotPath | SubmitError::Denied(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            SubmitError::NotHotPath | SubmitError::Denied(_) | SubmitError::RecoveryDisabled => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+            // 503: the service is deliberately refusing right now, but this is a temporary,
+            // operator-controlled state - not a permanent judgement about this transaction.
+            SubmitError::Frozen(_) => StatusCode::SERVICE_UNAVAILABLE,
             SubmitError::Vetoed
             | SubmitError::PreviouslyDenied(_)
             | SubmitError::PreviouslyFailed(_) => StatusCode::CONFLICT,
@@ -339,6 +346,8 @@ impl From<SubmitError> for ApiError {
         };
         let error = match &e {
             SubmitError::NotHotPath => "not_hot_path",
+            SubmitError::RecoveryDisabled => "recovery_disabled",
+            SubmitError::Frozen(_) => "frozen",
             SubmitError::Denied(_) => "policy_denied",
             SubmitError::Vetoed => "vetoed",
             SubmitError::PreviouslyDenied(_) => "previously_denied",
@@ -399,6 +408,7 @@ async fn sign_psbt_handler(
         &state.server_key,
         &state.ledger,
         &policy,
+        &state.cfg.recovery_config(),
         state.notifier.as_ref(),
         state.hold_seconds,
         now_unix(),
@@ -1059,5 +1069,89 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "got: {body}");
         assert_eq!(body["error"], "version_mismatch");
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FreezeResponse {
+    frozen: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct FreezeRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn get_freeze_handler(
+    State(state): State<AppState>,
+) -> Result<Json<FreezeResponse>, ApiError> {
+    let frozen = state.ledger.is_frozen().await.map_err(internal)?;
+    Ok(Json(FreezeResponse { frozen }))
+}
+
+/// Halts all co-signing until explicitly unfrozen. **Deliberately unauthenticated.**
+///
+/// This is the "my phone was just stolen" button, and it needs to work from whatever device is
+/// to hand, in a hurry, possibly without your Satochip. Freezing is fail-safe: the worst an
+/// attacker achieves by calling it is denial of service, which is strictly better than the
+/// theft it exists to prevent. *Unfreezing* is the privileged direction, and that one requires
+/// a SATOCHIP signature - see [`post_unfreeze_handler`].
+///
+/// A freeze survives restarts (it's a ledger row), so "turn it off and on again" will not
+/// silently disarm it.
+async fn post_freeze_handler(
+    State(state): State<AppState>,
+    body: Option<Json<FreezeRequest>>,
+) -> Result<Json<FreezeResponse>, ApiError> {
+    let reason = body.and_then(|Json(b)| b.reason);
+    state
+        .ledger
+        .set_frozen(true, now_unix(), reason.as_deref())
+        .await
+        .map_err(internal)?;
+    tracing::warn!(reason = ?reason, "co-signing FROZEN");
+    Ok(Json(FreezeResponse { frozen: true }))
+}
+
+/// Resumes co-signing. Requires a SATOCHIP-signed message over the exact text
+/// `policy_auth::canonical_unfreeze_message(version)`, where `version` is the current policy
+/// version - which both proves hardware possession and stops an old unfreeze authorisation
+/// from being replayed after the policy has moved on.
+///
+/// If you've lost the SATOCHIP itself, use the `cosigner unfreeze` CLI on the server instead:
+/// requiring the hardware here would make a freeze unrecoverable in exactly the scenario the
+/// recovery path exists for.
+async fn post_unfreeze_handler(
+    State(state): State<AppState>,
+    Json(req): Json<UnfreezeRequest>,
+) -> Result<Json<FreezeResponse>, ApiError> {
+    let version = state.policy.read().await.version;
+    policy_auth::verify_unfreeze_authorization(
+        &state.cfg,
+        state.gap_limit,
+        version,
+        &req.signature,
+    )
+    .map_err(ApiError::from)?;
+    state
+        .ledger
+        .set_frozen(false, now_unix(), None)
+        .await
+        .map_err(internal)?;
+    tracing::warn!("co-signing UNFROZEN by SATOCHIP authorization");
+    Ok(Json(FreezeResponse { frozen: false }))
+}
+
+#[derive(Debug, Deserialize)]
+struct UnfreezeRequest {
+    signature: String,
+}
+
+fn internal(e: anyhow::Error) -> ApiError {
+    ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        error: "internal",
+        message: e.to_string(),
     }
 }

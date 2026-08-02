@@ -93,6 +93,7 @@ pub fn regtest_wallet_config() -> WalletConfig {
         policy: None,
         server_signing: None,
         notify: None,
+        recovery: None,
     }
 }
 

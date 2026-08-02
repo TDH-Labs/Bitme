@@ -198,6 +198,44 @@ pub(crate) fn destination_total_sat(report: &InspectionReport) -> u64 {
         .sum()
 }
 
+/// Policy for the MOBILE + SERVER recovery path. Deliberately *not* the same function as
+/// [`evaluate_policy`]: the legitimate use of that path is sweeping the entire balance to a
+/// replacement wallet, so per-transaction and rolling caps would block precisely the thing it
+/// exists for. The only thing checked here is the destination - see `RecoveryConfig`.
+///
+/// The real protections on this path are elsewhere and deliberately layered: the `older(N)`
+/// script constraint, a long hold with notification and veto, and (if you set one) the
+/// whitelist below.
+pub fn evaluate_recovery_policy(
+    report: &InspectionReport,
+    whitelist: Option<&[Address]>,
+) -> PolicyDecision {
+    let Some(whitelist) = whitelist else {
+        return PolicyDecision::Allow;
+    };
+    let mut violations = Vec::new();
+    for (i, output) in report.outputs.iter().enumerate() {
+        if output.kind != OutputKind::Destination {
+            continue;
+        }
+        match &output.address {
+            Some(addr) if whitelist.contains(addr) => {}
+            Some(addr) => violations.push(PolicyViolation::DestinationNotWhitelisted {
+                output_index: i,
+                address: addr.to_string(),
+            }),
+            None => {
+                violations.push(PolicyViolation::DestinationAddressUnresolvable { output_index: i })
+            }
+        }
+    }
+    if violations.is_empty() {
+        PolicyDecision::Allow
+    } else {
+        PolicyDecision::Deny(violations)
+    }
+}
+
 pub fn evaluate_policy(
     report: &InspectionReport,
     rolling: &RollingTotals,
