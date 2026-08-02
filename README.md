@@ -218,8 +218,18 @@ You need:
    holding everything.
 
 Bitkey solves #4 with an encrypted descriptor backup on their servers, and #3-equivalent with an
-"Emergency Exit Kit" PDF in your cloud storage. Ours is planned as a **recovery kit** — the
-descriptor plus an encrypted copy of the server key — and that's where Nostr comes in.
+"Emergency Exit Kit" PDF in your cloud storage. Ours is a **recovery kit** — `wallet.toml` plus the
+SERVER xprv, `age`-encrypted with a passphrase:
+
+```sh
+cosigner recovery-kit export --config wallet.toml --passphrase-file pass.txt --out kit.age
+cosigner recovery-kit import --in kit.age --passphrase-file pass.txt \
+  --out-config restored.toml --out-server-key restored.xprv
+```
+
+Store `kit.age` somewhere other than the box it came from — a second machine, a paper/QR backup,
+or Nostr relays (below). It backs up the *box*, not the keys: Satochip and Mobile already have
+their own seed backups, so this has nothing to add there.
 
 ---
 
@@ -266,17 +276,28 @@ What that buys:
 
 ### 2. Storing the recovery kit
 
-An encrypted recovery kit needs to survive losing your house. The usual answer is iCloud or
-Google Drive — which is an account that can be SIM-swapped, locked, or closed, and a company
-that can be compelled.
+**Built.** An encrypted recovery kit needs to survive losing your house. The usual answer is
+iCloud or Google Drive — which is an account that can be SIM-swapped, locked, or closed, and a
+company that can be compelled.
 
-Publishing the encrypted blob to a dozen independent relays instead: no account to hijack,
-nothing to ask permission from, replicated across operators who don't know each other. It's
-still just ciphertext — useless without a key you hold.
+```sh
+cosigner recovery-kit publish --in kit.age --passphrase-file pass.txt \
+  --relay wss://relay.damus.io --relay wss://nos.lol --relay wss://relay.snort.social
+cosigner recovery-kit fetch --passphrase-file pass.txt \
+  --relay wss://relay.damus.io --relay wss://nos.lol --out kit.age
+```
 
-**Tradeoffs, honestly:** you depend on relays being reachable (use several, keep HTTP as a
-fallback), relays can see *that* two npubs are talking and roughly how much, and it's real
-engineering — websockets, NIP-44, subscription handling. Not a weekend.
+Publishing the (already `age`-encrypted) blob to a handful of independent relays instead: no
+account to hijack, nothing to ask permission from, replicated across operators who don't know
+each other. It's still just ciphertext — useless without the passphrase.
+
+The identity used to publish/locate it is derived deterministically *from that same passphrase*
+(NIP-78 application data, kind 30078) — one secret to remember, not a passphrase plus a separate
+Nostr key to also back up. Relay URLs are always yours to choose; nothing is hardcoded.
+
+**Tradeoffs, honestly:** you depend on relays being reachable (use several — pick at least 3),
+and relays can see *that* this identity published something and roughly how large it is, even
+though the content itself stays opaque.
 
 ---
 
@@ -376,7 +397,7 @@ notification rather than pretending the delay is a wall.
 
 ## Current status
 
-Working and tested — 117 unit tests, plus integration tests against a real regtest node:
+Working and tested — 137 unit tests, plus integration tests against a real regtest node:
 
 - Descriptor construction with machine-checked invariant proofs
 - Transaction inspection with independent on-chain verification
@@ -385,20 +406,24 @@ Working and tested — 117 unit tests, plus integration tests against a real reg
 - Notify → hold → veto
 - Satochip-authorised, versioned, replay-proof policy changes
 - Docker and Umbrel packaging
-
 - **Lost-Satochip recovery co-signing** (`[recovery]`), with its own policy: ordinary caps
   don't apply (a sweep is the point), a longer default hold, and an optional destination
   whitelist
 - **Freeze / unfreeze**, durable across restarts
 - **Repeat notifications** during a hold, so one missed message doesn't cost you the veto window
+- **The recovery kit** — `wallet.toml` + encrypted server key (`recovery-kit export/import`),
+  publishable to Nostr relays (`recovery-kit publish/fetch`) as decentralized off-machine
+  storage. Live-relay round-tripping is verified structurally here and pending confirmation
+  against real relays from a machine with network access to them.
+- **Migration tooling** (`migrate-build-sweep`) — builds the unsigned sweep PSBT for moving funds
+  off an old descriptor to a new one when replacing a lost device. Signing still goes through the
+  normal channels (hardware apps + the old wallet's own `/sign_psbt`); this only builds the PSBT.
 
 Not done yet:
 
-- **The recovery kit** — descriptor + encrypted server key, published to Nostr relays. This is
-  the most valuable remaining item: without it, losing the box that holds `wallet.toml` can
-  strand you even though you still have all three keys.
-- **Nostr transport** — the whole section above is designed, not built.
-- **Migration tooling** — one command to sweep to a new descriptor when replacing a device.
+- **Nostr transport** for PSBT delivery itself (the "talking to the cosigner without exposing it"
+  section above) — designed, not built. Comparable in scope to a full milestone: relay pool
+  management, NIP-44, request/response correlation, npub-allowlist auth.
 - **A setup wizard.** Right now you hand-edit TOML with three xpubs, which is not "simple to set
   up" by any reasonable standard.
 - **Nothing has touched real hardware.** No Satochip, no Bitcoin Keeper, no mainnet. Signet

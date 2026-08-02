@@ -5,6 +5,7 @@ pub mod http;
 pub mod inspect;
 pub mod invariants;
 pub mod ledger;
+pub mod migrate;
 pub mod nostr_kit;
 pub mod notify;
 pub mod policy;
