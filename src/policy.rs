@@ -200,35 +200,57 @@ pub(crate) fn destination_total_sat(report: &InspectionReport) -> u64 {
 
 /// Policy for the MOBILE + SERVER recovery path. Deliberately *not* the same function as
 /// [`evaluate_policy`]: the legitimate use of that path is sweeping the entire balance to a
-/// replacement wallet, so per-transaction and rolling caps would block precisely the thing it
-/// exists for. The only thing checked here is the destination - see `RecoveryConfig`.
+/// replacement wallet, so the per-transaction and rolling *amount* caps would block precisely
+/// the thing it exists for, and are skipped here on purpose.
 ///
-/// The real protections on this path are elsewhere and deliberately layered: the `older(N)`
-/// script constraint, a long hold with notification and veto, and (if you set one) the
-/// whitelist below.
+/// Fee caps are a different matter and are **not** skipped: `[policy]`'s `max_fee_sat` /
+/// `max_fee_rate_sat_per_vb` still apply. Nothing about "this is a full-balance sweep" makes an
+/// oversized fee legitimate - a sweep with no fee cap at all could burn the entire balance to
+/// miners, which isn't a recovery, it's a loss with extra steps. Skipping the amount caps here
+/// is a deliberate, documented design choice; skipping the fee caps too was an oversight, not a
+/// choice, and is fixed by checking them here explicitly.
+///
+/// The whitelist (if configured - see `RecoveryConfig`) is checked as before. The remaining
+/// protections on this path are elsewhere and deliberately layered: the `older(N)` script
+/// constraint, and a long hold with notification and veto.
 pub fn evaluate_recovery_policy(
     report: &InspectionReport,
     whitelist: Option<&[Address]>,
+    policy: &CompiledPolicy,
 ) -> PolicyDecision {
-    let Some(whitelist) = whitelist else {
-        return PolicyDecision::Allow;
-    };
     let mut violations = Vec::new();
-    for (i, output) in report.outputs.iter().enumerate() {
-        if output.kind != OutputKind::Destination {
-            continue;
-        }
-        match &output.address {
-            Some(addr) if whitelist.contains(addr) => {}
-            Some(addr) => violations.push(PolicyViolation::DestinationNotWhitelisted {
-                output_index: i,
-                address: addr.to_string(),
-            }),
-            None => {
-                violations.push(PolicyViolation::DestinationAddressUnresolvable { output_index: i })
+
+    let fee_sat = report.fee.to_sat();
+    if fee_sat > policy.max_fee_sat {
+        violations.push(PolicyViolation::ExceedsMaxFee {
+            fee_sat,
+            cap_sat: policy.max_fee_sat,
+        });
+    }
+    if report.fee_rate_sat_per_vb > policy.max_fee_rate_sat_per_vb {
+        violations.push(PolicyViolation::ExceedsMaxFeeRate {
+            fee_rate_sat_per_vb: report.fee_rate_sat_per_vb,
+            cap_sat_per_vb: policy.max_fee_rate_sat_per_vb,
+        });
+    }
+
+    if let Some(whitelist) = whitelist {
+        for (i, output) in report.outputs.iter().enumerate() {
+            if output.kind != OutputKind::Destination {
+                continue;
+            }
+            match &output.address {
+                Some(addr) if whitelist.contains(addr) => {}
+                Some(addr) => violations.push(PolicyViolation::DestinationNotWhitelisted {
+                    output_index: i,
+                    address: addr.to_string(),
+                }),
+                None => violations
+                    .push(PolicyViolation::DestinationAddressUnresolvable { output_index: i }),
             }
         }
     }
+
     if violations.is_empty() {
         PolicyDecision::Allow
     } else {
@@ -712,5 +734,92 @@ mod tests {
             destination_whitelist: Some(vec![mainnet_address.to_string()]),
         };
         assert!(cfg.compile(ChainNetwork::Regtest).is_err());
+    }
+
+    // ---- evaluate_recovery_policy ----
+    //
+    // A recovery sweep deliberately ignores the amount caps (max_tx_sat / daily / weekly /
+    // monthly) - that's the whole point of the path, and covered by sign.rs's
+    // `recovery_spend_is_cosigned_and_ignores_the_ordinary_caps`. These tests cover the fee
+    // caps specifically, since skipping those was the actual bug: an earlier version of this
+    // function had no fee check at all, meaning a recovery sweep could burn the entire balance
+    // to miner fees and nothing here would refuse it.
+
+    #[test]
+    fn recovery_allows_a_sweep_within_the_fee_caps_and_no_whitelist() {
+        let policy = generous_policy();
+        let r = report(vec![destination(900_000, 1)], 100_000, 50.0);
+        assert_eq!(
+            evaluate_recovery_policy(&r, None, &policy),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn recovery_denies_a_fee_over_the_cap_even_though_amount_caps_are_skipped() {
+        let mut policy = generous_policy();
+        policy.max_fee_sat = 50_000;
+        // A huge destination amount (would fail max_tx_sat under evaluate_policy) must still be
+        // ALLOWED on amount alone - only the oversized fee should deny this.
+        let r = report(vec![destination(50_000_000, 1)], 100_000, 10.0);
+        let decision = evaluate_recovery_policy(&r, None, &policy);
+        assert_eq!(
+            decision,
+            PolicyDecision::Deny(vec![PolicyViolation::ExceedsMaxFee {
+                fee_sat: 100_000,
+                cap_sat: 50_000,
+            }])
+        );
+    }
+
+    #[test]
+    fn recovery_denies_a_fee_rate_over_the_cap() {
+        let mut policy = generous_policy();
+        policy.max_fee_rate_sat_per_vb = 100.0;
+        let r = report(vec![destination(900_000, 1)], 100_000, 500.0);
+        let decision = evaluate_recovery_policy(&r, None, &policy);
+        assert_eq!(
+            decision,
+            PolicyDecision::Deny(vec![PolicyViolation::ExceedsMaxFeeRate {
+                fee_rate_sat_per_vb: 500.0,
+                cap_sat_per_vb: 100.0,
+            }])
+        );
+    }
+
+    #[test]
+    fn recovery_fee_check_applies_regardless_of_whether_a_whitelist_is_set() {
+        // Before the fix, an absent whitelist made the whole function return Allow immediately,
+        // skipping fee checks entirely. Confirm that early-return is gone.
+        let mut policy = generous_policy();
+        policy.max_fee_sat = 1;
+        let r = report(vec![destination(900_000, 1)], 100_000, 10.0);
+        assert!(!evaluate_recovery_policy(&r, None, &policy).is_allowed());
+    }
+
+    #[test]
+    fn recovery_still_enforces_the_whitelist_alongside_fee_caps() {
+        let policy = generous_policy();
+        let whitelist = vec![address(2)];
+        let r = report(vec![destination(900_000, 1)], 100_000, 10.0);
+        let decision = evaluate_recovery_policy(&r, Some(&whitelist), &policy);
+        assert_eq!(
+            decision,
+            PolicyDecision::Deny(vec![PolicyViolation::DestinationNotWhitelisted {
+                output_index: 0,
+                address: address(1).to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    fn recovery_allows_a_whitelisted_destination_within_fee_caps() {
+        let policy = generous_policy();
+        let whitelist = vec![address(1)];
+        let r = report(vec![destination(900_000, 1)], 100_000, 10.0);
+        assert_eq!(
+            evaluate_recovery_policy(&r, Some(&whitelist), &policy),
+            PolicyDecision::Allow
+        );
     }
 }

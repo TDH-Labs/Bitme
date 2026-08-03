@@ -63,11 +63,19 @@ pub fn canonical_message(version: u64, policy: &PolicyConfig) -> String {
     msg
 }
 
-/// The text a human must sign to lift a freeze. Bound to the current policy `version` so an
-/// unfreeze authorisation can't be captured once and replayed later to quietly re-enable
-/// signing after a subsequent freeze.
-pub fn canonical_unfreeze_message(policy_version: u64) -> String {
-    format!("cosigner unfreeze authorization v1\npolicy_version: {policy_version}")
+/// The text a human must sign to lift a freeze. Bound to the current *freeze generation* - a
+/// counter in `ledger.rs`'s `freeze_state` table that increments on every freeze and never on
+/// an unfreeze - not the policy version.
+///
+/// This distinction matters and was originally gotten wrong: policy version only changes when
+/// `POST /policy` succeeds, which has nothing to do with freezing. Binding to it meant a single
+/// captured unfreeze signature stayed valid forever (as long as nobody happened to also change
+/// the policy) and could relift *any future* freeze - including the next one, triggered for an
+/// unrelated, real emergency. Binding to the freeze generation instead means an authorization
+/// signed for generation N can only ever lift *that* freeze; the next freeze is generation N+1,
+/// and the old signature no longer matches anything.
+pub fn canonical_unfreeze_message(freeze_generation: u64) -> String {
+    format!("cosigner unfreeze authorization v1\nfreeze_generation: {freeze_generation}")
 }
 
 /// Checks a SATOCHIP signature over [`canonical_unfreeze_message`]. Shares
@@ -76,14 +84,14 @@ pub fn canonical_unfreeze_message(policy_version: u64) -> String {
 pub fn verify_unfreeze_authorization(
     cfg: &WalletConfig,
     gap_limit: u32,
-    policy_version: u64,
+    freeze_generation: u64,
     signature_base64: &str,
 ) -> Result<(), PolicyAuthError> {
     let satochip_xpub = Xpub::from_str(cfg.keys.satochip.xpub.trim())
         .context("keys.satochip.xpub")
         .map_err(PolicyAuthError::Internal)?;
     verify_satochip_signer(
-        &canonical_unfreeze_message(policy_version),
+        &canonical_unfreeze_message(freeze_generation),
         signature_base64,
         &satochip_xpub,
         gap_limit,

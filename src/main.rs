@@ -44,6 +44,12 @@ enum TopCommand {
     /// requiring hardware here would buy nothing while making a freeze permanent in exactly
     /// the case the lost-SATOCHIP recovery path exists for.
     Unfreeze(UnfreezeArgs),
+    /// Prints the exact text a human must sign (via SATOCHIP's "Sign Message" feature) to
+    /// authorize lifting the CURRENT freeze via `POST /unfreeze` - see `policy_auth.rs`. Reads
+    /// the freeze generation straight from the ledger, so this works even if the HTTP server
+    /// isn't reachable (freezing never stops it running, but this doesn't depend on that
+    /// either way).
+    UnfreezeMessage(UnfreezeMessageArgs),
     /// Encrypted, off-machine backup/restore of wallet.toml + the SERVER xprv - protects
     /// against losing the box that runs this service, not against losing any of the three keys.
     RecoveryKit {
@@ -194,6 +200,13 @@ struct UnfreezeArgs {
     config: PathBuf,
 }
 
+#[derive(Args)]
+struct UnfreezeMessageArgs {
+    /// Path to the same TOML wallet config `serve` uses (for `server.ledger_db_path`).
+    #[arg(long)]
+    config: PathBuf,
+}
+
 #[derive(Subcommand)]
 enum PolicyCommand {
     /// Prints the exact text a human must sign (via SATOCHIP's "Sign Message" feature) to
@@ -275,6 +288,7 @@ fn run() -> Result<()> {
             PolicyCommand::Message(args) => cmd_policy_message(args),
         },
         TopCommand::Unfreeze(args) => cmd_unfreeze(args),
+        TopCommand::UnfreezeMessage(args) => cmd_unfreeze_message(args),
         TopCommand::RecoveryKit { command } => match command {
             RecoveryKitCommand::Export(args) => cmd_recovery_kit_export(args),
             RecoveryKitCommand::Import(args) => cmd_recovery_kit_import(args),
@@ -533,6 +547,30 @@ fn cmd_unfreeze(args: UnfreezeArgs) -> Result<()> {
         }
         ledger.set_frozen(false, now_unix(), None).await?;
         println!("Co-signing UNFROZEN. Restart is not required; the running server picks this up.");
+        Ok(())
+    })
+}
+
+fn cmd_unfreeze_message(args: UnfreezeMessageArgs) -> Result<()> {
+    let cfg = WalletConfig::load(&args.config)?;
+    let (_, server_cfg) = cfg.require_server_config()?;
+    let path = server_cfg
+        .ledger_db_path
+        .clone()
+        .context("config is missing server.ledger_db_path")?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting tokio runtime")?;
+    rt.block_on(async move {
+        let ledger = Ledger::connect(&path)
+            .await
+            .with_context(|| format!("opening ledger at {path}"))?;
+        let generation = ledger.freeze_generation().await?;
+        print!(
+            "{}",
+            cosigner::policy_auth::canonical_unfreeze_message(generation)
+        );
         Ok(())
     })
 }
