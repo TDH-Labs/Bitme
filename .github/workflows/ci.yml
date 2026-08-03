@@ -48,6 +48,10 @@ jobs:
         image: btcpayserver/bitcoin:29.2
         env:
           BITCOIN_NETWORK: regtest
+          # txindex=1: tests/common/mod.rs calls get_raw_transaction_info (getrawtransaction) on
+          # a just-confirmed tx. Without the index, bitcoind can only serve that RPC for mempool
+          # transactions, so it starts failing the moment the preceding generate_to_address call
+          # confirms it into a block.
           BITCOIN_EXTRA_ARGS: |
             server=1
             rpcbind=0.0.0.0
@@ -55,6 +59,7 @@ jobs:
             rpcuser=cosigner
             rpcpassword=cosigner
             fallbackfee=0.0001
+            txindex=1
         ports:
           - 18443:18443
     steps:
