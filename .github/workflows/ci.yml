@@ -15,6 +15,12 @@ jobs:
   test:
     name: Build, unit test, lint
     runs-on: ubuntu-latest
+    # The crate lives in bitme-cosigner/ (not the repo root) so Umbrel's installer - which only
+    # ever copies that one folder into the app's data directory - has a self-contained build
+    # context. See bitme-cosigner/docker-compose.yml.
+    defaults:
+      run:
+        working-directory: bitme-cosigner
     steps:
       - uses: actions/checkout@v4
 
@@ -23,6 +29,8 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "bitme-cosigner -> target"
 
       - name: Build (lib, bin, tests)
         run: cargo build --all-targets
@@ -39,6 +47,9 @@ jobs:
   regtest:
     name: Regtest integration tests
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bitme-cosigner
     # Same image already used by docker-compose.signet.yml and
     # bitme-cosigner/docker-compose.simulate-umbrel.yml, so its BITCOIN_NETWORK/
     # BITCOIN_EXTRA_ARGS interface is already relied on elsewhere in this repo, not introduced
@@ -48,7 +59,7 @@ jobs:
         image: btcpayserver/bitcoin:29.2
         env:
           BITCOIN_NETWORK: regtest
-          # txindex=1: tests/common/mod.rs calls get_raw_transaction_info (getrawtransaction) on
+          # txindex=1: bitme-cosigner/tests/common/mod.rs calls get_raw_transaction_info (getrawtransaction) on
           # a just-confirmed tx. Without the index, bitcoind can only serve that RPC for mempool
           # transactions, so it starts failing the moment the preceding generate_to_address call
           # confirms it into a block.
@@ -68,6 +79,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "bitme-cosigner -> target"
 
       - name: Wait for bitcoind RPC
         run: |
@@ -84,7 +97,7 @@ jobs:
           exit 1
 
       # Both integration test files gracefully skip (not fail) without COSIGNER_REGTEST_RPC_URL
-      # set - see tests/common/mod.rs - so this job only ever adds coverage, never blocks on a
+      # set - see bitme-cosigner/tests/common/mod.rs - so this job only ever adds coverage, never blocks on a
       # missing node. Run together, single-threaded: both files share the same live node/mempool,
       # and running them as concurrent processes against it would race.
       - name: Regtest integration tests

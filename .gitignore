@@ -1,4 +1,4 @@
-/target
+bitme-cosigner/target
 .env
 config/wallet.toml
 bitme-cosigner/wallet.toml

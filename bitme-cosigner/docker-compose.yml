@@ -3,10 +3,15 @@
 # dependency instead of a hand-configured one - see umbrel-app.yml's `dependencies: [bitcoin]`
 # and docs/UMBREL.md for the full picture, including why key material is provided as a mounted
 # file here instead of an environment variable (Umbrel has no per-app secret-entry UI).
+#
+# context is "." (this directory), not "..": Umbrel's installer only ever copies this
+# `bitme-cosigner/` folder into the app's data directory (umbreld's app-store rsync targets
+# `<repo>/<appId>` specifically), so the Dockerfile and everything it COPYs must live inside
+# this folder, not the repo root - see the Rust project files sitting alongside this file.
 services:
   app:
     build:
-      context: ..
+      context: .
     restart: unless-stopped
     stop_grace_period: 1m
     ports:
