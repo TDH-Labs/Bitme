@@ -8,10 +8,12 @@ port. What is *not* yet verified: anything past that point - `/health`, a real d
 signing round trip - because all of those need the three real keys, which no amount of packaging
 work can substitute for.
 
-That first install found two packaging bugs that only appear on a real device (a build context
-that resolved outside the app's folder, and a port variable Umbrel doesn't actually export to
-apps); both are fixed, and `scripts/simulate-umbrel.sh` now reproduces the conditions that hid
-them. Still treat your own first install as a test rather than a known-good deployment.
+That first install found three packaging bugs that only appear on a real device: a build context
+that resolved outside the app's folder, a port variable Umbrel doesn't actually export to apps,
+and a runtime uid that couldn't write its own data directory (the last one stayed hidden because
+the missing-config check fires first). All three are fixed, and `scripts/simulate-umbrel.sh` now
+reproduces the conditions that hid the first two. Still treat your own first install as a test
+rather than a known-good deployment.
 
 **Start on signet.** Set your Umbrel's Bitcoin Core app to signet mode before installing this
 (Umbrel's Bitcoin Core app supports it), and don't set `i_understand_this_is_mainnet = true`
@@ -82,18 +84,22 @@ You need to place two files in `~/umbrel/app-data/bitme-cosigner/config/`:
    `[keys.server]` in `wallet.toml`). This service never generates keys - generate this yourself,
    the same way you would for the plain Docker deployment (see [`docs/DOCKER.md`](DOCKER.md)).
 
-Both directories are created by Docker on first start and are owned by `root`, so writing into
-them needs `sudo` even though the app directory above them belongs to `umbrel`:
+Both directories ship empty in this app's folder, so Umbrel's installer creates them owned by
+`1000:1000` - the same uid the container runs as - and no `sudo`/`chown` dance is needed:
 
 ```sh
 ssh umbrel@umbrel.local
 cd ~/umbrel/app-data/bitme-cosigner/config     # NOT .../data/config - see the table above
 # copy wallet.toml.example in from this repo (scp, or paste with an editor), then:
-sudo $EDITOR wallet.toml
-sudo $EDITOR server.xprv     # just the xprv, nothing else
-sudo chmod 600 server.xprv
-sudo chown 1000:1000 wallet.toml server.xprv   # the container runs as uid 1000
+$EDITOR wallet.toml
+$EDITOR server.xprv     # just the xprv, nothing else
+chmod 600 server.xprv
 ```
+
+> If you installed a version before this was fixed, those directories may still exist as
+> `root:root` from when Docker auto-created them. In that case the container exits with
+> `cannot create /data/generated.toml: Permission denied` as soon as a valid `wallet.toml` is in
+> place. Fix with `sudo chown -R 1000:1000 ~/umbrel/app-data/bitme-cosigner/{data,config}`.
 
 Then restart the app from the Umbrel dashboard (**Bitme Cosigner → ⋮ → Restart**).
 
@@ -143,9 +149,7 @@ docker run --rm -it -v "$(pwd)/config:/out" <image-from-above> init --out /out/w
 output to `/data` (the *other* mount, which is writable) - run them the same way, e.g.:
 
 ```sh
-# config/ is root-owned (Docker created it), hence the sudo - see the Configure section
-echo "your long passphrase here" | sudo tee config/recovery-kit-passphrase.txt >/dev/null
-sudo chown 1000:1000 config/recovery-kit-passphrase.txt
+echo "your long passphrase here" > config/recovery-kit-passphrase.txt
 
 docker run --rm \
   -v "$(pwd)/data:/data" -v "$(pwd)/config:/data/config:ro" \
@@ -154,7 +158,7 @@ docker run --rm \
     --passphrase-file /data/config/recovery-kit-passphrase.txt \
     --out /data/recovery-kit.age
 
-sudo rm config/recovery-kit-passphrase.txt   # don't leave the passphrase sitting on disk
+rm config/recovery-kit-passphrase.txt   # don't leave the passphrase sitting on disk
 
 # the blob lands in the writable mount, i.e. on the host at:
 #   ~/umbrel/app-data/bitme-cosigner/data/recovery-kit.age
@@ -175,9 +179,9 @@ service's Nostr secret key goes in as a third mounted file, not an environment v
 ```sh
 ssh umbrel@umbrel.local
 cd ~/umbrel/app-data/bitme-cosigner
-sudo $EDITOR config/nostr.nsec   # just the nsec, nothing else
-sudo chmod 600 config/nostr.nsec && sudo chown 1000:1000 config/nostr.nsec
-sudo $EDITOR config/wallet.toml  # uncomment [nostr_transport]; nsec_file = "/data/config/nostr.nsec"
+$EDITOR config/nostr.nsec   # just the nsec, nothing else
+chmod 600 config/nostr.nsec
+$EDITOR config/wallet.toml  # uncomment [nostr_transport]; nsec_file = "/data/config/nostr.nsec"
 ```
 
 Then restart the app from the Umbrel dashboard. Removing a device's npub from

@@ -3,3 +3,11 @@ bitme-cosigner/target
 config/wallet.toml
 bitme-cosigner/wallet.toml
 bitme-cosigner/server.xprv
+
+# The app folder now ships empty data/ and config/ dirs (via .gitkeep) so Umbrel's installer
+# creates them owned by 1000:1000 instead of Docker auto-creating them as root. Never commit
+# anything real that lands in them at runtime.
+bitme-cosigner/config/*
+!bitme-cosigner/config/.gitkeep
+bitme-cosigner/data/*
+!bitme-cosigner/data/.gitkeep
