@@ -61,8 +61,8 @@ max_fee_rate_sat_per_vb = 200.0
 # hold_seconds has passed with no POST /veto/{id} - see src/notify.rs and src/sign.rs.
 [notify]
 hold_seconds = 900            # 15 minutes to review and veto before this service signs
-sweep_interval_seconds = 5
-renotify_interval_seconds = 21600  # remind every 6h while a spend is still holding    # how often the background sweeper checks for elapsed holds
+sweep_interval_seconds = 5    # how often the background sweeper checks for elapsed holds
+renotify_interval_seconds = 21600  # remind every 6h while a spend is still holding
 
 [notify.ntfy]
 url = "https://ntfy.sh/replace-with-a-private-topic-name"
