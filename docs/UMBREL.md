@@ -1,11 +1,17 @@
 # Running cosigner on Umbrel
 
-**Honesty first: this packaging has been validated as far as I could without a real Umbrel
-instance to install it on** - the manifest matches Umbrel's documented schema, the compose file
-was checked with `docker compose config`, and the injected-variable names for the Bitcoin Core
-dependency were confirmed against Umbrel's own app store source. What I could *not* do is
-actually install it on an Umbrel and watch it come up - please treat the first install as a real
-test, not a known-good deployment, and expect to troubleshoot.
+**Status: installed and started on real Umbrel hardware** (umbrelOS on x86_64, Bitcoin Core app
+present) as of the commit that added this note. What is verified: the app store picks the repo
+up, the image builds on-device from source, the container is created and started, Umbrel's
+Bitcoin Core connection details are injected correctly, and the app publishes on its manifest
+port. What is *not* yet verified: anything past that point - `/health`, a real descriptor, or a
+signing round trip - because all of those need the three real keys, which no amount of packaging
+work can substitute for.
+
+That first install found two packaging bugs that only appear on a real device (a build context
+that resolved outside the app's folder, and a port variable Umbrel doesn't actually export to
+apps); both are fixed, and `scripts/simulate-umbrel.sh` now reproduces the conditions that hid
+them. Still treat your own first install as a test rather than a known-good deployment.
 
 **Start on signet.** Set your Umbrel's Bitcoin Core app to signet mode before installing this
 (Umbrel's Bitcoin Core app supports it), and don't set `i_understand_this_is_mainnet = true`

@@ -4,18 +4,30 @@
 # and docs/UMBREL.md for the full picture, including why key material is provided as a mounted
 # file here instead of an environment variable (Umbrel has no per-app secret-entry UI).
 #
-# context is "." (this directory), not "..": Umbrel's installer only ever copies this
-# `bitme-cosigner/` folder into the app's data directory (umbreld's app-store rsync targets
-# `<repo>/<appId>` specifically), so the Dockerfile and everything it COPYs must live inside
-# this folder, not the repo root - see the Rust project files sitting alongside this file.
+# Two Umbrel-specific gotchas below, both verified against a real device:
+#
+# 1. The build context must be the ABSOLUTE ${APP_DATA_DIR}, not "." or "..". Umbrel invokes
+#    `docker compose` with several --file fragments of its own and no --project-directory, so
+#    Compose resolves relative paths against the FIRST fragment's directory (umbreld's
+#    legacy-compat dir), not this file's. A relative context silently points somewhere in
+#    umbreld's own source tree and the build fails with "failed to read dockerfile". Umbrel
+#    rsyncs this whole folder to ${APP_DATA_DIR}, so the Dockerfile and the Rust project are
+#    all there at build time.
+#
+# 2. ${APP_PORT} is NOT a variable Umbrel exports to an app's own compose file - it only exists
+#    as a pass-through inside Umbrel's app_proxy fragment, which this app deliberately doesn't
+#    use (no web UI - see docs/UMBREL.md). Using it leaves the host port blank and Docker
+#    publishes on a random port instead of 8080. ${APP_PROXY_PORT} is the one Umbrel actually
+#    exports, and it's read straight from `port:` in umbrel-app.yml, so the manifest stays the
+#    single source of truth for the published port.
 services:
   app:
     build:
-      context: .
+      context: ${APP_DATA_DIR}
     restart: unless-stopped
     stop_grace_period: 1m
     ports:
-      - "${APP_PORT}:8080"
+      - "${APP_PROXY_PORT}:8080"
     volumes:
       - ${APP_DATA_DIR}/data:/data
       - ${APP_DATA_DIR}/config:/data/config:ro
