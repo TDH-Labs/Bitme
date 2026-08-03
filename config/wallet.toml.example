@@ -1,7 +1,8 @@
-# Copy this file into the cosigner data volume as config/wallet.toml and fill in your real
-# values. In Docker, that's the volume mounted at /data - e.g.
-#   docker compose cp config/wallet.toml.example cosigner:/data/config/wallet.toml
-# then edit it in place, or edit this file first and copy the filled-in version in.
+# Copy this file to config/wallet.toml (right here on the host, next to this one) and fill in
+# your real values - config/ is bind-mounted straight into the container at /data/config, so
+# there's no volume to copy into and no container that needs to be running first:
+#   cp config/wallet.toml.example config/wallet.toml
+# See docs/DOCKER.md.
 #
 # [bitcoind] and [server] must NOT appear in this file - the container generates both itself,
 # fresh on every start, from its own environment (BITCOIND_RPC_URL, COSIGNER_HTTP_PORT, etc. -
