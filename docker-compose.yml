@@ -8,7 +8,10 @@
 # in below) and fill it in before starting - see docs/DOCKER.md.
 services:
   cosigner:
-    build: .
+    # The Rust project (Dockerfile, Cargo.toml, src/) lives under bitme-cosigner/ - that's also
+    # what Umbrel's installer copies verbatim as this app's build context, so there's one
+    # source of truth instead of two copies drifting apart. See bitme-cosigner/docker-compose.yml.
+    build: ./bitme-cosigner
     image: cosigner:latest
     restart: unless-stopped
     ports:

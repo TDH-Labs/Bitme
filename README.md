@@ -48,7 +48,7 @@ Three properties hold no matter what:
    someone else built.
 
 These are enforced by Bitcoin consensus, not by this code being correct. There are
-[machine-checked proofs](src/invariants.rs) of each one, run on every build.
+[machine-checked proofs](bitme-cosigner/src/invariants.rs) of each one, run on every build.
 
 ---
 
@@ -116,7 +116,7 @@ matter; short enough that recovery isn't a season of your life.
 > SATOCHIP for *both* paths, which meant losing that one card — with no seed backup — lost the
 > funds permanently. That's a single point of catastrophic failure. The shape above fixes it:
 > every single-device loss is survivable. There's a test named
-> [`every_pair_can_eventually_spend`](src/invariants.rs) that fails the build if that ever
+> [`every_pair_can_eventually_spend`](bitme-cosigner/src/invariants.rs) that fails the build if that ever
 > stops being true.
 
 ---
@@ -466,12 +466,16 @@ Not done yet:
 
 ## Development
 
+The crate lives in `bitme-cosigner/`, not the repo root - Umbrel's installer only ever copies
+that one folder onto the device, so it needs to be a self-contained build context.
+
 ```sh
+cd bitme-cosigner
 cargo build && cargo test && cargo clippy --all-targets && cargo fmt
 ```
 
 `cargo test` runs the mocked-chain unit tests. The regtest integration tests need a real node
-and skip cleanly without one — see [`tests/regtest_inspect.rs`](tests/regtest_inspect.rs) for the
+and skip cleanly without one — see [`tests/regtest_inspect.rs`](bitme-cosigner/tests/regtest_inspect.rs) for the
 command. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs both on every push:
 unit tests/clippy/fmt always, and the regtest suite for real against a bitcoind service
 container.
