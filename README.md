@@ -407,12 +407,12 @@ What each attacker can and can't do:
 | They have | Can they spend? |
 |---|---|
 | The server, fully rooted | **No.** One key of two. They can annoy you and read your balance. |
-| Your phone | **No.** Needs a second key. |
+| Your phone, alone | **No.** Needs a second key — and under stock defaults (`recovery.enabled = true`), that second key doesn't have to be the Satochip. See *Phone + server*, below. |
 | Your Satochip | **No.** Needs a second key. |
 | Phone + server | **Coins under 30 days old:** locked until they mature. **Coins older than that:** the script timelock is already satisfied, so only the 48h hold, the notification and your veto stand in the way — and none of those survive a *fully rooted* server that has the raw key. This is the sharpest edge in the design. |
 | Satochip + phone | Yes, after ~30 days. |
 | Satochip + server | Yes, immediately, within your policy limits. |
-| Network access to the HTTP API | Can submit transactions and burn spending limits. Can't move funds — the Satochip is still required. HTTP itself has no built-in auth, so bind it to loopback or a private network; `[nostr_transport]` (above) is the authenticated alternative if you need to reach it from elsewhere. |
+| Network access to the HTTP API | Can submit transactions and burn spending limits. Can't move funds by itself — a MOBILE or SATOCHIP signature must already be in the submitted PSBT. But under stock defaults (`recovery.enabled = true`), that second signer doesn't have to be the Satochip: see *Phone + server*, above. HTTP itself has no built-in auth, so bind it to loopback or a private network; `[nostr_transport]` (above) is the authenticated alternative if you need to reach it from elsewhere. |
 
 The honest weak point: **an attacker holding both your phone and your raw server key can take
 mature coins, and the timelock will not stop them.** It only delays coins younger than 30 days.
