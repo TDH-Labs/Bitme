@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Bitme Cosigner">
+  <title>Bitme Cosigner</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1B2334"/>
+      <stop offset="1" stop-color="#0B0F18"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFB454"/>
+      <stop offset="0.55" stop-color="#F7931A"/>
+      <stop offset="1" stop-color="#DC7A05"/>
+    </linearGradient>
+    <clipPath id="shieldClip">
+      <path d="M256 92 L400 146 L400 268 C400 350 334 406 256 432 C178 406 112 350 112 268 L112 146 Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- backdrop -->
+  <rect width="512" height="512" rx="114" fill="url(#bg)"/>
+
+  <!-- shield body -->
+  <path d="M256 92 L400 146 L400 268 C400 350 334 406 256 432 C178 406 112 350 112 268 L112 146 Z" fill="url(#shield)"/>
+
+  <!-- two seams split the shield into three parts: the three keys -->
+  <g clip-path="url(#shieldClip)">
+    <rect x="200" y="80" width="13" height="360" fill="#0B0F18" opacity="0.92"/>
+    <rect x="299" y="80" width="13" height="360" fill="#0B0F18" opacity="0.92"/>
+  </g>
+
+  <!-- one keyhole across all three: three keys, one lock -->
+  <path d="M256 194 a40 40 0 0 1 21 74 l10 62 a1 1 0 0 1 -1 1 l-60 0 a1 1 0 0 1 -1 -1 l10 -62 a40 40 0 0 1 21 -74 Z" fill="#FFFFFF"/>
+</svg>

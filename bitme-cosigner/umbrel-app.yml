@@ -27,6 +27,13 @@ dependencies:
   - bitcoin
 repo: https://github.com/TDH-Labs/Bitme
 support: https://github.com/TDH-Labs/Bitme/issues
+# Umbrel only auto-resolves icons for apps in its own official store (it falls back to
+# umbrel-apps-gallery/<id>/icon.svg, which doesn't exist for community apps), so community
+# apps have to point at their icon explicitly. Must be a reachable https URL: umbrelOS's CSP
+# is `img-src * blob:`, which permits any host but NOT a data: URI, so the file can't be
+# inlined here. This URL requires the repo to stay public - if it goes private the icon 404s
+# and the app shows a blank tile, in which case host icon.svg somewhere public and update this.
+icon: https://raw.githubusercontent.com/TDH-Labs/Bitme/main/bitme-cosigner/icon.svg
 # No screenshots: this is a headless API service, not something with a UI to show.
 gallery: []
 releaseNotes: >-
