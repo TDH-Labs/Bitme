@@ -187,8 +187,16 @@ genuine, they're just no longer answered.
 ## Updating
 
 Umbrel's App Store update mechanism handles pulling new versions of this repo; since the app is
-built from source (`build: context: ..` in `bitme-cosigner/docker-compose.yml`, not a
-pre-published image), the first install and every update rebuild the Rust binary on your device.
-On Umbrel Home (Intel N100) this is a few minutes; on a Raspberry Pi it will be noticeably
-slower. Your `wallet.toml`, `server.xprv`, and the ledger database all live in the persistent
-data directory and survive updates.
+built from source (`build: context: ${APP_DATA_DIR}` in `bitme-cosigner/docker-compose.yml`, not
+a pre-published image), the first install and every update rebuild the Rust binary on your
+device. On Umbrel Home (Intel N100) this is a few minutes; on a Raspberry Pi it will be
+noticeably slower. Your `wallet.toml`, `server.xprv`, and the ledger database all live in the
+persistent data directory and survive updates.
+
+**One gotcha found on-device:** Umbrel injects this app's Bitcoin Core connection details
+(including `APP_BITCOIN_NETWORK`) as environment variables baked in when the container is
+*created*, not re-read on every start. If you change your Bitcoin Core app's network *after*
+installing Bitme Cosigner, a plain restart won't pick up the new value - the container needs to
+be recreated (uninstall and reinstall) before `docker logs` will show the network you actually
+switched to. Config file changes (`wallet.toml`, `server.xprv`) don't have this problem - those
+are read fresh from the mounted volume on every start, restart is enough for those.

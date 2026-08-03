@@ -380,10 +380,12 @@ No web UI, by design. Everything is API.
 - **[docs/DOCKER.md](docs/DOCKER.md)** — Docker Compose, for a Mac or a VPS.
 - **[docs/UMBREL.md](docs/UMBREL.md)** — installing on Umbrel via a community app store.
 
-Quick look without installing anything:
+Quick look without installing anything (the crate lives in `bitme-cosigner/`, not the repo root —
+see [Development](#development) below for why):
 
 ```sh
-cargo run -- descriptor build --config examples/signet-demo.toml
+cd bitme-cosigner
+cargo run -- descriptor build --config ../examples/signet-demo.toml
 ```
 
 That prints the descriptor, some addresses, and the full invariant report — no node, no server,

@@ -3,7 +3,7 @@ id: bitme-cosigner
 name: Bitme Cosigner
 tagline: Policy-gated Bitcoin PSBT co-signing service
 category: bitcoin
-version: "0.1.0"
+version: "0.1.1"
 port: 8080
 description: >-
   Self-hosted signing service for a 3-key miniscript wallet (a SATOCHIP smartcard, a Bitcoin
@@ -37,7 +37,12 @@ icon: https://raw.githubusercontent.com/TDH-Labs/Bitme/main/bitme-cosigner/icon.
 # No screenshots: this is a headless API service, not something with a UI to show.
 gallery: []
 releaseNotes: >-
-  Initial release: descriptor construction and invariant verification, PSBT inspection, the
-  policy engine, signing, the notify-then-hold-then-veto flow, and SATOCHIP-authorized runtime
-  policy changes.
+  0.1.1: fixes two bugs found installing on real Umbrel hardware that made every install fail -
+  a build context that resolved outside this app's folder, and a port variable Umbrel doesn't
+  actually export to apps (was left unpublished on a random port instead of 8080). See
+  docs/UMBREL.md for details. No functional/wallet-logic changes.
+
+
+  0.1.0: descriptor construction and invariant verification, PSBT inspection, the policy engine,
+  signing, the notify-then-hold-then-veto flow, and SATOCHIP-authorized runtime policy changes.
 path: ""
