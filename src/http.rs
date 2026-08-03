@@ -1075,6 +1075,9 @@ mod tests {
 #[derive(Debug, Serialize)]
 struct FreezeResponse {
     frozen: bool,
+    /// The current freeze generation - what an unfreeze authorization must be signed for (see
+    /// `policy_auth::canonical_unfreeze_message`). 0 if this service has never been frozen.
+    generation: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1087,7 +1090,8 @@ async fn get_freeze_handler(
     State(state): State<AppState>,
 ) -> Result<Json<FreezeResponse>, ApiError> {
     let frozen = state.ledger.is_frozen().await.map_err(internal)?;
-    Ok(Json(FreezeResponse { frozen }))
+    let generation = state.ledger.freeze_generation().await.map_err(internal)?;
+    Ok(Json(FreezeResponse { frozen, generation }))
 }
 
 /// Halts all co-signing until explicitly unfrozen. **Deliberately unauthenticated.**
@@ -1110,14 +1114,20 @@ async fn post_freeze_handler(
         .set_frozen(true, now_unix(), reason.as_deref())
         .await
         .map_err(internal)?;
-    tracing::warn!(reason = ?reason, "co-signing FROZEN");
-    Ok(Json(FreezeResponse { frozen: true }))
+    let generation = state.ledger.freeze_generation().await.map_err(internal)?;
+    tracing::warn!(reason = ?reason, generation, "co-signing FROZEN");
+    Ok(Json(FreezeResponse {
+        frozen: true,
+        generation,
+    }))
 }
 
 /// Resumes co-signing. Requires a SATOCHIP-signed message over the exact text
-/// `policy_auth::canonical_unfreeze_message(version)`, where `version` is the current policy
-/// version - which both proves hardware possession and stops an old unfreeze authorisation
-/// from being replayed after the policy has moved on.
+/// `policy_auth::canonical_unfreeze_message(generation)`, where `generation` is the *current
+/// freeze generation* (see `GET /freeze`) - which both proves hardware possession and stops an
+/// old unfreeze authorization from being replayed to lift a later, unrelated freeze. Generation,
+/// not policy version: freezing and policy changes are unrelated events, and binding to the
+/// latter would let one captured signature re-unfreeze indefinitely.
 ///
 /// If you've lost the SATOCHIP itself, use the `cosigner unfreeze` CLI on the server instead:
 /// requiring the hardware here would make a freeze unrecoverable in exactly the scenario the
@@ -1126,11 +1136,11 @@ async fn post_unfreeze_handler(
     State(state): State<AppState>,
     Json(req): Json<UnfreezeRequest>,
 ) -> Result<Json<FreezeResponse>, ApiError> {
-    let version = state.policy.read().await.version;
+    let generation = state.ledger.freeze_generation().await.map_err(internal)?;
     policy_auth::verify_unfreeze_authorization(
         &state.cfg,
         state.gap_limit,
-        version,
+        generation,
         &req.signature,
     )
     .map_err(ApiError::from)?;
@@ -1139,8 +1149,11 @@ async fn post_unfreeze_handler(
         .set_frozen(false, now_unix(), None)
         .await
         .map_err(internal)?;
-    tracing::warn!("co-signing UNFROZEN by SATOCHIP authorization");
-    Ok(Json(FreezeResponse { frozen: false }))
+    tracing::warn!(generation, "co-signing UNFROZEN by SATOCHIP authorization");
+    Ok(Json(FreezeResponse {
+        frozen: false,
+        generation,
+    }))
 }
 
 #[derive(Debug, Deserialize)]

@@ -18,6 +18,14 @@
 //!
 //! Outbound-only: this only ever opens connections *to* relays. No inbound port, no domain, no
 //! certificate.
+//!
+//! Every dispatched event's ID is recorded in the ledger (`Ledger::mark_nostr_event_seen`) and
+//! checked before processing (`Ledger::has_seen_nostr_event`), because relays don't guarantee
+//! at-most-once delivery and - the case that actually matters - every process restart opens a
+//! fresh subscription with no lower time bound, which replays this identity's *entire*
+//! gift-wrap history from each relay. Without this, an old captured request sitting on a public
+//! relay (e.g. a superseded `/unfreeze`) would silently re-fire on every restart, with no
+//! attacker needed at all.
 
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -32,6 +40,7 @@ use tower::ServiceExt;
 
 use crate::config::NostrTransportConfig;
 use crate::http::{self, AppState};
+use crate::ledger::Ledger;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct InboundEnvelope {
@@ -139,8 +148,31 @@ async fn handle_gift_wrap(
     client: &Client,
     router: &axum::Router,
     allowed: &HashSet<PublicKey>,
+    ledger: &Ledger,
     event: Event,
 ) -> Result<()> {
+    // Relays don't guarantee at-most-once delivery, and - critically - every process restart
+    // creates a fresh subscription with no `since` bound, which replays this identity's *entire*
+    // gift-wrap history from every relay, not just what's new. Without this check, a historical
+    // request sitting on a relay (e.g. an old /unfreeze) would silently re-fire on every
+    // restart, with no attacker involved at all. Dedup on the outer gift-wrap event's own ID,
+    // before unwrapping - cheaper, and the ID is stable/known before any decryption happens.
+    let event_id = event.id.to_hex();
+    if ledger
+        .has_seen_nostr_event(&event_id)
+        .await
+        .context("checking nostr_seen_events")?
+    {
+        return Ok(());
+    }
+    // Marked *before* dispatching, not after: a crash mid-dispatch must not risk replaying the
+    // same request on the next restart. If the sender never got a reply, that's on them to
+    // resend as a new event (new ID) - normal request/response retry, not a replay concern.
+    ledger
+        .mark_nostr_event_seen(&event_id, now_unix())
+        .await
+        .context("recording nostr_seen_events")?;
+
     let unwrapped = client
         .unwrap_gift_wrap(&event)
         .await
@@ -190,6 +222,7 @@ pub async fn run(cfg: &NostrTransportConfig, state: AppState) -> Result<()> {
     let secret_key = read_nsec(cfg)?;
     let keys = Keys::new(secret_key);
     let allowed: HashSet<PublicKey> = cfg.compiled_allowlist()?.into_iter().collect();
+    let ledger = state.ledger.clone();
 
     let client = Client::new(keys.clone());
     for url in &cfg.relays {
@@ -221,10 +254,13 @@ pub async fn run(cfg: &NostrTransportConfig, state: AppState) -> Result<()> {
             let client = client.clone();
             let router = router.clone();
             let allowed = allowed.clone();
+            let ledger = ledger.clone();
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::GiftWrap {
-                        if let Err(e) = handle_gift_wrap(&client, &router, &allowed, *event).await {
+                        if let Err(e) =
+                            handle_gift_wrap(&client, &router, &allowed, &ledger, *event).await
+                        {
                             tracing::warn!(error = %e, "failed to handle an inbound nostr message");
                         }
                     }
@@ -234,6 +270,13 @@ pub async fn run(cfg: &NostrTransportConfig, state: AppState) -> Result<()> {
         })
         .await
         .context("nostr notification loop ended")
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before 1970")
+        .as_secs() as i64
 }
 
 #[cfg(test)]
@@ -411,6 +454,91 @@ mod tests {
         )
         .await;
         assert_eq!(reply.status, 404);
+    }
+
+    /// A syntactically-real, signed `Kind::GiftWrap` event - but with plain-text (not NIP-59
+    /// sealed/encrypted) content, so `unwrap_gift_wrap` is guaranteed to fail on it. That's
+    /// deliberate: these tests are about the dedup check that runs *before* unwrapping, not
+    /// about a full real gift-wrap round trip (covered structurally by `dispatch`'s tests and
+    /// left for live-relay verification, same as `nostr_kit.rs`).
+    fn fake_gift_wrap_event(keys: &Keys) -> Event {
+        EventBuilder::new(Kind::GiftWrap, "not a real NIP-59 seal")
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn handle_gift_wrap_skips_an_event_already_marked_seen() {
+        let (state, _chain, _wallet) = test_state().await;
+        let ledger = state.ledger.clone();
+        let router = http::router(state);
+        let allowed: HashSet<PublicKey> = HashSet::new();
+
+        let service_keys = Keys::generate();
+        let client = Client::new(service_keys.clone()); // no relays added
+        let event = fake_gift_wrap_event(&service_keys);
+
+        ledger
+            .mark_nostr_event_seen(&event.id.to_hex(), 0)
+            .await
+            .unwrap();
+
+        // If the dedup check didn't short-circuit, this would fail downstream (bad unwrap, then
+        // a reply attempt with no relay configured) instead of returning Ok(()) immediately.
+        let result = handle_gift_wrap(&client, &router, &allowed, &ledger, event).await;
+        assert!(
+            result.is_ok(),
+            "an already-seen event must be skipped cleanly: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_gift_wrap_processes_a_new_event_and_marks_it_seen_even_on_failure() {
+        let (state, _chain, _wallet) = test_state().await;
+        let ledger = state.ledger.clone();
+        let router = http::router(state);
+        let allowed: HashSet<PublicKey> = HashSet::new();
+
+        let service_keys = Keys::generate();
+        let client = Client::new(service_keys.clone());
+        let event = fake_gift_wrap_event(&service_keys);
+        let event_id = event.id.to_hex();
+
+        assert!(!ledger.has_seen_nostr_event(&event_id).await.unwrap());
+
+        // Expected to fail downstream (the content isn't a real seal) - the point here is that
+        // it got PAST the dedup check to fail there at all, and that marking-seen happens
+        // regardless of that later failure (a crash/error after marking must not cause endless
+        // reprocessing on retry either).
+        let result = handle_gift_wrap(&client, &router, &allowed, &ledger, event).await;
+        assert!(result.is_err());
+        assert!(ledger.has_seen_nostr_event(&event_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_relay_redelivering_the_same_event_only_ever_dispatches_it_once() {
+        // The actual scenario this bug produced: a fresh subscription (every restart) replays
+        // history, so the SAME event can arrive for processing more than once in a row.
+        let (state, _chain, _wallet) = test_state().await;
+        let ledger = state.ledger.clone();
+        let router = http::router(state);
+        let allowed: HashSet<PublicKey> = HashSet::new();
+
+        let service_keys = Keys::generate();
+        let client = Client::new(service_keys.clone());
+        let event = fake_gift_wrap_event(&service_keys);
+
+        let first = handle_gift_wrap(&client, &router, &allowed, &ledger, event.clone()).await;
+        assert!(
+            first.is_err(),
+            "first delivery attempts real processing and fails downstream"
+        );
+
+        let second = handle_gift_wrap(&client, &router, &allowed, &ledger, event).await;
+        assert!(
+            second.is_ok(),
+            "redelivery of the exact same event must be a clean no-op, not reprocessed: {second:?}"
+        );
     }
 
     #[test]

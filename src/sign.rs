@@ -114,7 +114,9 @@ async fn decide_and_sign(
     // sweep by nature, so the ordinary caps would deny exactly the thing the path exists for -
     // see `policy::evaluate_recovery_policy`.
     let decision = match report.spending_path {
-        SpendingPath::Recovery => policy::evaluate_recovery_policy(report, recovery_whitelist),
+        SpendingPath::Recovery => {
+            policy::evaluate_recovery_policy(report, recovery_whitelist, policy)
+        }
         _ => {
             let rolling = ltx.rolling_totals(now).await?;
             policy::evaluate_policy(report, &rolling, policy)
@@ -323,7 +325,7 @@ pub async fn submit_for_signing(
     }
 
     let submission_decision = if is_recovery {
-        policy::evaluate_recovery_policy(&report, recovery_whitelist)
+        policy::evaluate_recovery_policy(&report, recovery_whitelist, policy)
     } else {
         let rolling = ltx.rolling_totals(now).await?;
         policy::evaluate_policy(&report, &rolling, policy)
@@ -456,6 +458,16 @@ pub async fn process_due_pending_row(
             ltx.rollback().await?;
             return Ok(PendingOutcome::Skipped);
         }
+    }
+    // Freeze is also checked at the very top of this function, before the (potentially slow)
+    // chain RPC above - but that leaves a window: a freeze arriving mid-inspection would
+    // otherwise go unnoticed for this row. Re-checking here, immediately before the actual sign
+    // decision, closes it down to negligible. Read through `ltx` itself (not `ledger`): the
+    // pool is single-connection, and `ltx` already holds it, so a fresh `ledger.is_frozen()`
+    // here would deadlock against its own open transaction.
+    if ltx.is_frozen().await? {
+        ltx.rollback().await?;
+        return Ok(PendingOutcome::Skipped);
     }
 
     let path_ok = match report.spending_path {
@@ -1575,7 +1587,9 @@ pub async fn renotify_pending(
 mod recovery_and_freeze_tests {
     use super::tests::*;
     use super::*;
+    use crate::chain::Utxo;
     use crate::notify::mock::RecordingNotifier;
+    use bitcoin::OutPoint;
 
     /// Freeze must stop a submission dead, before anything is queued or notified.
     #[tokio::test]
@@ -1761,6 +1775,158 @@ mod recovery_and_freeze_tests {
             matches!(results[0].1.as_ref().unwrap(), PendingOutcome::Signed(_)),
             "MOBILE+SERVER recovery must be co-signed despite the 1000 sat cap: {results:?}"
         );
+    }
+
+    /// Amount caps are deliberately skipped for a recovery sweep (see the test above) - fee
+    /// caps are not, and must still deny an oversized fee. This is the regression test for the
+    /// bug: an earlier version of `evaluate_recovery_policy` had no fee check at all, so a
+    /// recovery sweep could burn the entire balance to miner fees and this call would have
+    /// returned `Queued`, not `Denied`.
+    #[tokio::test]
+    async fn recovery_spend_is_denied_by_a_fee_cap_even_though_amount_caps_are_skipped() {
+        let mut f = queue_fixture("COSIGNER_TEST_RECOVERY_FEE_CAP", u64::MAX, u64::MAX).await;
+        f.policy.max_fee_sat = 50_000;
+        let notifier = RecordingNotifier::new();
+        let recovery = RecoveryConfig::default();
+
+        // Fee (100,000 sat) is over the 50,000 sat cap; the destination amount is huge (would
+        // fail an ordinary max_tx_sat check) but that's exactly what recovery must ignore.
+        let psbt = recovery_psbt(&f.chain, &f.wallet, &f.cfg, 66, 0, 50_000_000, 100_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        assert_eq!(report.spending_path, SpendingPath::Recovery);
+
+        let err = submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &recovery,
+            &notifier,
+            0,
+            1_000_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SubmitError::Denied(ref v) if v.iter().any(|violation| matches!(
+                    violation,
+                    crate::policy::PolicyViolation::ExceedsMaxFee { .. }
+                ))
+            ),
+            "expected a fee-cap denial, got {err:?}"
+        );
+    }
+
+    /// A `ChainSource` that pauses on its first `get_utxo` call - signaling `started` and then
+    /// blocking until told to `proceed` - so a test can land something (here: a freeze)
+    /// deterministically in the middle of `process_due_pending_row`'s inspection step, instead
+    /// of relying on timing luck.
+    struct PausingChainSource {
+        inner: Arc<dyn ChainSource>,
+        started_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        proceed_rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl ChainSource for PausingChainSource {
+        fn get_utxo(&self, outpoint: OutPoint) -> anyhow::Result<Option<Utxo>> {
+            // Only the first call pauses - inspecting a multi-input PSBT would otherwise
+            // deadlock on the second call, since `proceed_tx` is only ever sent once.
+            if let Some(tx) = self.started_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+                let _ = self.proceed_rx.lock().unwrap().recv();
+            }
+            self.inner.get_utxo(outpoint)
+        }
+    }
+
+    /// The regression test for the actual race: `process_due_pending_row` checks `is_frozen()`
+    /// once, before its (potentially slow) chain RPC - without the re-check added alongside the
+    /// veto re-check, a freeze landing in that window would go completely unnoticed and the row
+    /// would still get signed.
+    #[tokio::test]
+    async fn a_freeze_landing_mid_inspection_is_caught_before_signing() {
+        let f = queue_fixture("COSIGNER_TEST_FREEZE_MID_INSPECT", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+
+        let psbt = hot_psbt(&f.chain, &f.wallet, 70, 0, 100_000, 1_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &RecoveryConfig::default(),
+            &notifier,
+            0,
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        assert!(!f.ledger.is_frozen().await.unwrap(), "not frozen yet");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let pausing_chain: Arc<dyn ChainSource> = Arc::new(PausingChainSource {
+            inner: f.chain_as_dyn(),
+            started_tx: std::sync::Mutex::new(Some(started_tx)),
+            proceed_rx: std::sync::Mutex::new(proceed_rx),
+        });
+
+        let ledger = std::sync::Arc::new(f.ledger);
+        let wallet = f.wallet.clone();
+        let cfg = f.cfg.clone();
+        let server_key = f.server_key;
+        let policy = f.policy.clone();
+        let recovery = RecoveryConfig::default();
+        let txid_for_task = txid.clone();
+        let ledger_for_task = ledger.clone();
+
+        let processing = tokio::spawn(async move {
+            process_due_pending_row(
+                ledger_for_task.as_ref(),
+                &wallet,
+                &cfg,
+                &server_key,
+                &policy,
+                &recovery,
+                &pausing_chain,
+                50,
+                &txid_for_task,
+                1_000_000 + 1,
+            )
+            .await
+        });
+
+        // Wait for inspection to actually start, then freeze - landing squarely in the window
+        // between the top-of-function check and the sign decision - then let it continue.
+        tokio::task::spawn_blocking(move || started_rx.recv())
+            .await
+            .unwrap()
+            .expect("process_due_pending_row should have started inspecting");
+        ledger
+            .set_frozen(true, 1_000_001, Some("test"))
+            .await
+            .unwrap();
+        proceed_tx.send(()).unwrap();
+
+        let outcome = processing.await.unwrap().unwrap();
+        assert!(
+            matches!(outcome, PendingOutcome::Skipped),
+            "a freeze landing mid-inspection must stop the sign, not just the next tick: {outcome:?}"
+        );
+
+        // And the row must still be there, pending, to fire once unfrozen - not lost.
+        let row = ledger.get_pending(&txid).await.unwrap().unwrap();
+        assert_eq!(row.status, PendingStatus::Pending);
     }
 
     #[tokio::test]

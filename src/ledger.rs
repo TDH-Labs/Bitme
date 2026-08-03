@@ -218,6 +218,38 @@ impl Ledger {
             Err(e) if e.to_string().contains("duplicate column name") => {}
             Err(e) => return Err(anyhow::Error::new(e).context("adding last_notified_at column")),
         }
+
+        // A counter that increments on every freeze (never on unfreeze), so an unfreeze
+        // authorization signed for one freeze can never lift a *later* one - see
+        // `policy_auth::canonical_unfreeze_message`. Existing rows backfill to 0 via the
+        // column default, same idempotent-ALTER pattern as `last_notified_at` above.
+        let alter_generation = sqlx::query(
+            "ALTER TABLE freeze_state ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await;
+        match alter_generation {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(anyhow::Error::new(e).context("adding generation column")),
+        }
+
+        // Every Nostr gift-wrap event this service has ever dispatched (see
+        // `nostr_transport.rs`), by ID. Durable on purpose: relays don't guarantee at-most-once
+        // delivery, and a fresh subscription (which every process restart creates) replays a
+        // client's *entire* matching history from each relay - without this, an old captured
+        // message (e.g. a since-superseded /unfreeze request) would silently re-fire on every
+        // restart, with no attacker needed at all.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS nostr_seen_events (
+                event_id TEXT PRIMARY KEY,
+                seen_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .context("creating nostr_seen_events table")?;
+
         Ok(())
     }
 
@@ -269,23 +301,80 @@ impl Ledger {
         Ok(row.is_some_and(|(f,)| f != 0))
     }
 
+    /// Freezing bumps `generation`; unfreezing never does. Every distinct freeze event therefore
+    /// gets a generation number no signed unfreeze authorization has ever targeted before -
+    /// see `policy_auth::canonical_unfreeze_message`.
     pub async fn set_frozen(
         &self,
         frozen: bool,
         changed_at: i64,
         reason: Option<&str>,
     ) -> Result<()> {
+        if frozen {
+            sqlx::query(
+                "INSERT INTO freeze_state (id, frozen, changed_at, reason, generation)
+                 VALUES (1, 1, ?1, ?2, 1)
+                 ON CONFLICT(id) DO UPDATE SET frozen = 1, changed_at = excluded.changed_at, \
+                    reason = excluded.reason, generation = freeze_state.generation + 1",
+            )
+            .bind(changed_at)
+            .bind(reason)
+            .execute(&self.pool)
+            .await
+            .context("writing freeze_state")?;
+        } else {
+            // No ON CONFLICT needed: if no row exists yet, this affects zero rows, which is
+            // correct - `is_frozen()` already treats an absent row as "not frozen".
+            sqlx::query(
+                "UPDATE freeze_state SET frozen = 0, changed_at = ?1, reason = ?2 WHERE id = 1",
+            )
+            .bind(changed_at)
+            .bind(reason)
+            .execute(&self.pool)
+            .await
+            .context("writing freeze_state")?;
+        }
+        Ok(())
+    }
+
+    /// The current freeze generation - 0 if this service has never been frozen. Used both to
+    /// answer `GET /freeze` and to compute the exact text an unfreeze authorization must sign
+    /// over (see `policy_auth::canonical_unfreeze_message`).
+    pub async fn freeze_generation(&self) -> Result<u64> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT generation FROM freeze_state WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await
+                .context("querying freeze_state generation")?;
+        Ok(row.map(|(g,)| g as u64).unwrap_or(0))
+    }
+
+    /// Whether this exact Nostr gift-wrap event ID has already been dispatched - see
+    /// `nostr_transport.rs`. Check this *before* unwrapping/dispatching a newly-received event,
+    /// so a relay-replayed or restart-replayed event never fires twice.
+    pub async fn has_seen_nostr_event(&self, event_id: &str) -> Result<bool> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM nostr_seen_events WHERE event_id = ?1")
+                .bind(event_id)
+                .fetch_optional(&self.pool)
+                .await
+                .context("querying nostr_seen_events")?;
+        Ok(row.is_some())
+    }
+
+    /// Records that `event_id` has been dispatched, so a future duplicate delivery of it (a
+    /// relay redelivering, or the next process restart's fresh subscription replaying history)
+    /// is recognized and skipped.
+    pub async fn mark_nostr_event_seen(&self, event_id: &str, seen_at: i64) -> Result<()> {
         sqlx::query(
-            "INSERT INTO freeze_state (id, frozen, changed_at, reason) VALUES (1, ?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET frozen = excluded.frozen, \
-                changed_at = excluded.changed_at, reason = excluded.reason",
+            "INSERT INTO nostr_seen_events (event_id, seen_at) VALUES (?1, ?2)
+             ON CONFLICT(event_id) DO NOTHING",
         )
-        .bind(i64::from(frozen))
-        .bind(changed_at)
-        .bind(reason)
+        .bind(event_id)
+        .bind(seen_at)
         .execute(&self.pool)
         .await
-        .context("writing freeze_state")?;
+        .context("writing nostr_seen_events")?;
         Ok(())
     }
 
@@ -554,6 +643,18 @@ impl LedgerTx {
             },
         )
         .transpose()
+    }
+
+    /// Same check as [`Ledger::is_frozen`], but read through this held transaction's own
+    /// connection rather than a fresh pool acquire. The pool is `max_connections(1)`, so calling
+    /// `Ledger::is_frozen` while a `LedgerTx` is open self-deadlocks: the transaction holds the
+    /// only connection, and the fresh acquire blocks behind it until the pool's acquire timeout.
+    pub async fn is_frozen(&mut self) -> Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT frozen FROM freeze_state WHERE id = 1")
+            .fetch_optional(&mut *self.tx)
+            .await
+            .context("querying freeze_state")?;
+        Ok(row.is_some_and(|(f,)| f != 0))
     }
 
     async fn set_pending_status(
@@ -971,5 +1072,65 @@ mod tests {
         assert_eq!(state.version, 2);
         assert_eq!(state.policy_json, "{\"max_tx_sat\":2}");
         assert_eq!(state.updated_at, 2_000);
+    }
+
+    #[tokio::test]
+    async fn freeze_generation_starts_at_zero_and_survives_before_any_freeze() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        assert_eq!(ledger.freeze_generation().await.unwrap(), 0);
+        assert!(!ledger.is_frozen().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn freezing_increments_generation_but_unfreezing_never_does() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+
+        ledger.set_frozen(true, 1_000, Some("first")).await.unwrap();
+        assert!(ledger.is_frozen().await.unwrap());
+        assert_eq!(ledger.freeze_generation().await.unwrap(), 1);
+
+        ledger.set_frozen(false, 2_000, None).await.unwrap();
+        assert!(!ledger.is_frozen().await.unwrap());
+        assert_eq!(
+            ledger.freeze_generation().await.unwrap(),
+            1,
+            "unfreezing must not advance the generation - only a NEW freeze does"
+        );
+
+        ledger
+            .set_frozen(true, 3_000, Some("second"))
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger.freeze_generation().await.unwrap(),
+            2,
+            "a second, later freeze must get a fresh generation - an authorization signed for \
+             generation 1 must never be able to lift this one"
+        );
+    }
+
+    #[tokio::test]
+    async fn unfreezing_a_never_frozen_ledger_is_a_harmless_no_op() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        ledger.set_frozen(false, 1_000, None).await.unwrap();
+        assert!(!ledger.is_frozen().await.unwrap());
+        assert_eq!(ledger.freeze_generation().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn nostr_event_seen_tracking_is_idempotent_and_persists() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        assert!(!ledger.has_seen_nostr_event("abc123").await.unwrap());
+
+        ledger.mark_nostr_event_seen("abc123", 1_000).await.unwrap();
+        assert!(ledger.has_seen_nostr_event("abc123").await.unwrap());
+        assert!(
+            !ledger.has_seen_nostr_event("different-id").await.unwrap(),
+            "a different event id must not be treated as seen"
+        );
+
+        // Marking the same id twice (e.g. two relays redelivering it) must not error.
+        ledger.mark_nostr_event_seen("abc123", 2_000).await.unwrap();
+        assert!(ledger.has_seen_nostr_event("abc123").await.unwrap());
     }
 }
