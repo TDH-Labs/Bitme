@@ -35,6 +35,20 @@ design rule (see the main README): **no web UI, HTTP API only**.
 - Opening it from the Umbrel dashboard shows a bare JSON health check (`GET /health`), not a
   page. That's intentional, not a bug.
 
+A known consequence of the first point, seen on the device this was verified on: if your Umbrel
+has **remote Tor access enabled**, Umbrel adds a `tor_server` sidecar to every app and points its
+hidden service at that app's `app_proxy` container. This app has no `app_proxy`, so the address
+is unresolvable and the sidecar (`bitme-cosigner-tor_server-1`) crash-loops with "Unparseable
+address in hidden service port configuration". The cosigner itself is unaffected - it's a
+separate container - but you'll see a container restarting forever.
+
+Deciding what *should* happen here is a security question, not a packaging one, so it's
+deliberately left open: pointing the hidden service straight at the app container would work,
+but it would publish an unauthenticated signing API as an onion service, which is exactly the
+kind of thing the "treat network access to it as sensitive" warning above is about. If you don't
+want that, the options are to leave the sidecar crash-looping (harmless, noisy) or turn off
+remote Tor access for the device.
+
 ## Install
 
 1. In your Umbrel: **App Store → ⋮ → Community App Stores → Add App Store**, and paste:
@@ -44,10 +58,21 @@ design rule (see the main README): **no web UI, HTTP API only**.
 
 ## Configure
 
-Umbrel gives every app a persistent data directory at
-`~/umbrel/app-data/bitme-cosigner/data` on the host (exact path may vary by Umbrel version -
-check **Settings → Advanced → Terminal**, or SSH in). You need to place two files under
-`.../data/config/`:
+Umbrel gives every app a persistent data directory at `~/umbrel/app-data/bitme-cosigner` on the
+host (exact path may vary by Umbrel version - check **Settings → Advanced → Terminal**, or SSH
+in). Two host directories are mounted into the container, and the config one is easy to get
+wrong:
+
+| host | container | |
+|---|---|---|
+| `~/umbrel/app-data/bitme-cosigner/data` | `/data` | read-write - ledger DB, generated.toml |
+| `~/umbrel/app-data/bitme-cosigner/config` | `/data/config` | read-only - **your config goes here** |
+
+Note `config/` sits **next to** `data/`, not inside it. `data/config/` on the host looks like the
+right place and is not - the second mount shadows it, so anything you put there is invisible to
+the service and you'll just keep getting "missing /data/config/wallet.toml".
+
+You need to place two files in `~/umbrel/app-data/bitme-cosigner/config/`:
 
 1. `wallet.toml` - copy [`bitme-cosigner/wallet.toml.example`](../bitme-cosigner/wallet.toml.example)
    from this repo and fill in your real SATOCHIP/MOBILE/SERVER xpubs, `[policy]`, and `[notify]`.
@@ -57,14 +82,17 @@ check **Settings → Advanced → Terminal**, or SSH in). You need to place two 
    `[keys.server]` in `wallet.toml`). This service never generates keys - generate this yourself,
    the same way you would for the plain Docker deployment (see [`docs/DOCKER.md`](DOCKER.md)).
 
+Both directories are created by Docker on first start and are owned by `root`, so writing into
+them needs `sudo` even though the app directory above them belongs to `umbrel`:
+
 ```sh
 ssh umbrel@umbrel.local
-cd ~/umbrel/app-data/bitme-cosigner/data
-mkdir -p config
+cd ~/umbrel/app-data/bitme-cosigner/config     # NOT .../data/config - see the table above
 # copy wallet.toml.example in from this repo (scp, or paste with an editor), then:
-$EDITOR config/wallet.toml
-$EDITOR config/server.xprv   # just the xprv, nothing else
-chmod 600 config/server.xprv
+sudo $EDITOR wallet.toml
+sudo $EDITOR server.xprv     # just the xprv, nothing else
+sudo chmod 600 server.xprv
+sudo chown 1000:1000 wallet.toml server.xprv   # the container runs as uid 1000
 ```
 
 Then restart the app from the Umbrel dashboard (**Bitme Cosigner → ⋮ → Restart**).
@@ -94,14 +122,14 @@ than `serve` straight through, so they work the same way here as in a plain Dock
 
 The one Umbrel-specific wrinkle: Umbrel manages this app's compose lifecycle itself, so there's
 no `docker compose run` from a checkout the way DOCKER.md describes - use `docker run` directly
-against the image Umbrel already built for this app instead. Confirm the exact image name/tag on
-your device first (this wasn't verified against real Umbrel hardware - see the honesty note at
-the top of this doc):
+against the image Umbrel already built for this app instead. On the device this was verified on,
+Umbrel names that image `bitme-cosigner-app:latest` (Compose derives it from the project and
+service names), but confirm on your own device rather than assuming:
 
 ```sh
 ssh umbrel@umbrel.local
-docker images | grep bitme-cosigner   # find the built image name/tag
-cd ~/umbrel/app-data/bitme-cosigner/data
+docker images | grep bitme-cosigner   # expect bitme-cosigner-app
+cd ~/umbrel/app-data/bitme-cosigner
 ```
 
 `config/` is mounted read-only into the running `app` container, so anything that *writes*
@@ -115,7 +143,9 @@ docker run --rm -it -v "$(pwd)/config:/out" <image-from-above> init --out /out/w
 output to `/data` (the *other* mount, which is writable) - run them the same way, e.g.:
 
 ```sh
-echo "your long passphrase here" > config/recovery-kit-passphrase.txt
+# config/ is root-owned (Docker created it), hence the sudo - see the Configure section
+echo "your long passphrase here" | sudo tee config/recovery-kit-passphrase.txt >/dev/null
+sudo chown 1000:1000 config/recovery-kit-passphrase.txt
 
 docker run --rm \
   -v "$(pwd)/data:/data" -v "$(pwd)/config:/data/config:ro" \
@@ -124,7 +154,11 @@ docker run --rm \
     --passphrase-file /data/config/recovery-kit-passphrase.txt \
     --out /data/recovery-kit.age
 
-rm config/recovery-kit-passphrase.txt   # don't leave the passphrase sitting on disk afterward
+sudo rm config/recovery-kit-passphrase.txt   # don't leave the passphrase sitting on disk
+
+# the blob lands in the writable mount, i.e. on the host at:
+#   ~/umbrel/app-data/bitme-cosigner/data/recovery-kit.age
+# move it OFF this device - see docs/DOCKER.md §3a
 ```
 
 The full command set (`recovery-kit publish/fetch/import`, `migrate-build-sweep`'s other flags)
@@ -140,10 +174,10 @@ service's Nostr secret key goes in as a third mounted file, not an environment v
 
 ```sh
 ssh umbrel@umbrel.local
-cd ~/umbrel/app-data/bitme-cosigner/data
-$EDITOR config/nostr.nsec   # just the nsec, nothing else
-chmod 600 config/nostr.nsec
-$EDITOR config/wallet.toml  # uncomment [nostr_transport]; nsec_file = "/data/config/nostr.nsec"
+cd ~/umbrel/app-data/bitme-cosigner
+sudo $EDITOR config/nostr.nsec   # just the nsec, nothing else
+sudo chmod 600 config/nostr.nsec && sudo chown 1000:1000 config/nostr.nsec
+sudo $EDITOR config/wallet.toml  # uncomment [nostr_transport]; nsec_file = "/data/config/nostr.nsec"
 ```
 
 Then restart the app from the Umbrel dashboard. Removing a device's npub from
