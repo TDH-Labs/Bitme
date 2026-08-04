@@ -64,6 +64,32 @@ enum TopCommand {
     /// Interactive wizard that writes a validated wallet.toml, instead of hand-editing TOML
     /// with three xpubs and ~30 other fields.
     Init(InitArgs),
+    /// Serves the browser-based first-run setup wizard, for deployments with no terminal
+    /// access to run `init` in (Umbrel has neither a file editor nor a secret-entry UI).
+    /// `docker-entrypoint.sh` runs this automatically when config/wallet.toml is absent.
+    Setup(SetupArgs),
+}
+
+#[derive(Args)]
+struct SetupArgs {
+    /// Directory to write wallet.toml and server.xprv into. Must already exist.
+    #[arg(long, default_value = "/data/config")]
+    config_dir: PathBuf,
+    /// The app's data directory, used to site the ledger database in the generated config.
+    #[arg(long, default_value = "/data")]
+    data_dir: PathBuf,
+    /// Address to serve the wizard on - the same port the API will use afterwards.
+    #[arg(long, default_value = "0.0.0.0:8080")]
+    bind: String,
+    /// Which chain this deployment is wired to. Determines the xpub prefix the wizard accepts,
+    /// the coin type in the default derivation path, and the network of the generated key.
+    /// One of: mainnet, testnet, signet, regtest.
+    #[arg(long)]
+    network: String,
+    /// Shown on the wizard so the operator can confirm which node it will talk to. The real
+    /// value is regenerated into [bitcoind] by the entrypoint on every start.
+    #[arg(long, default_value = "")]
+    bitcoind_rpc_url: String,
 }
 
 #[derive(Args)]
@@ -297,7 +323,63 @@ fn run() -> Result<()> {
         },
         TopCommand::MigrateBuildSweep(args) => cmd_migrate_build_sweep(args),
         TopCommand::Init(args) => cmd_init(args),
+        TopCommand::Setup(args) => cmd_setup(args),
     }
+}
+
+fn cmd_setup(args: SetupArgs) -> Result<()> {
+    use cosigner::config::ChainNetwork;
+
+    let network = match args.network.trim().to_lowercase().as_str() {
+        "mainnet" | "bitcoin" | "main" => ChainNetwork::Mainnet,
+        "testnet" | "testnet4" | "test" => ChainNetwork::Testnet,
+        "signet" => ChainNetwork::Signet,
+        "regtest" => ChainNetwork::Regtest,
+        other => bail!("unknown --network {other:?} (expected mainnet, testnet, signet or regtest)"),
+    };
+
+    if !args.config_dir.is_dir() {
+        bail!(
+            "--config-dir {} does not exist or is not a directory",
+            args.config_dir.display()
+        );
+    }
+
+    let deployment = cosigner::setup::Deployment {
+        network,
+        config_dir: args.config_dir,
+        data_dir: args.data_dir,
+        bind_addr: args.bind.clone(),
+        bitcoind_rpc_url: args.bitcoind_rpc_url,
+    };
+
+    tokio::runtime::Runtime::new()
+        .context("starting the tokio runtime")?
+        .block_on(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let state = Arc::new(cosigner::setup::SetupState::new(deployment, tx));
+
+            let listener = tokio::net::TcpListener::bind(&args.bind)
+                .await
+                .with_context(|| format!("binding {}", args.bind))?;
+            println!(
+                "cosigner is UNCONFIGURED - serving the setup wizard on {} (network={network:?})",
+                args.bind
+            );
+
+            // Graceful shutdown rather than a bare exit: the request that triggers it still has
+            // to finish sending its response, or the browser reports a failure for a click that
+            // actually succeeded.
+            axum::serve(listener, cosigner::setup::router(state))
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await
+                .context("setup http server")?;
+
+            println!("setup complete - exiting so the container restarts into `serve`");
+            Ok(())
+        })
 }
 
 fn cmd_init(args: InitArgs) -> Result<()> {

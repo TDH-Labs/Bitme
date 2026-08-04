@@ -19,17 +19,30 @@ if [ "${1:-}" != "serve" ]; then
 fi
 shift
 
+# No config yet: serve the browser-based setup wizard on the app's own port instead of dying.
+# This used to be a hard `exit 1` telling the operator to go and write TOML by hand, which on
+# Umbrel meant SSHing into the box - there is no file editor or secret-entry UI there. The
+# wizard writes wallet.toml and server.xprv and then shuts itself down, at which point Docker's
+# restart policy brings the container back here and the branch below takes over. It is only
+# ever a wizard OR the API, never both, so an unconfigured process never holds a signing key.
 if [ ! -f "$USER_CONFIG" ]; then
-    cat >&2 <<EOF
-ERROR: missing $USER_CONFIG
+    if [ ! -w "$CONFIG_DIR" ]; then
+        cat >&2 <<EOF
+ERROR: $CONFIG_DIR is not writable by this container (running as uid $(id -u)).
 
-This must contain: network, timelock_blocks, [keys.satochip], [keys.mobile], [keys.server],
-[policy], [server_signing], and [notify]. Copy config/wallet.toml.example into your mounted
-data volume as config/wallet.toml and fill in your real xpubs before starting this container.
-[bitcoind] and [server] must NOT be in this file - the container generates those itself from
-its own environment. See docs/DOCKER.md.
+The setup wizard needs to write wallet.toml and server.xprv there. On Umbrel this directory
+should already be owned by 1000:1000; if you bind-mounted it yourself, chown it to the uid
+above. See docs/DOCKER.md.
 EOF
-    exit 1
+        exit 1
+    fi
+    echo "No $USER_CONFIG yet - starting the setup wizard." >&2
+    exec cosigner setup \
+        --config-dir "$CONFIG_DIR" \
+        --data-dir "$DATA_DIR" \
+        --bind "0.0.0.0:${COSIGNER_HTTP_PORT:-8080}" \
+        --network "${APP_BITCOIN_NETWORK:-${COSIGNER_NETWORK:-signet}}" \
+        --bitcoind-rpc-url "${BITCOIND_RPC_URL:-}"
 fi
 
 if [ -z "${BITCOIND_RPC_URL:-}" ]; then

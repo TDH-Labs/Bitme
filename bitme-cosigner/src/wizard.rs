@@ -273,7 +273,7 @@ fn prompt_required_list_validated<R: BufRead, W: Write>(
     }
 }
 
-fn validate_relay_url(v: &str) -> Result<(), String> {
+pub(crate) fn validate_relay_url(v: &str) -> Result<(), String> {
     if v.starts_with("wss://") || v.starts_with("ws://") {
         Ok(())
     } else {
@@ -281,13 +281,13 @@ fn validate_relay_url(v: &str) -> Result<(), String> {
     }
 }
 
-fn validate_npub(v: &str) -> Result<(), String> {
+pub(crate) fn validate_npub(v: &str) -> Result<(), String> {
     nostr_sdk::PublicKey::from_bech32(v.trim())
         .map(|_| ())
         .map_err(|e| format!("not a valid npub: {e}"))
 }
 
-fn validate_fingerprint(v: &str) -> Result<(), String> {
+pub(crate) fn validate_fingerprint(v: &str) -> Result<(), String> {
     if v.len() == 8 && v.chars().all(|c| c.is_ascii_hexdigit()) {
         Ok(())
     } else {
@@ -295,7 +295,7 @@ fn validate_fingerprint(v: &str) -> Result<(), String> {
     }
 }
 
-fn validate_derivation_path(v: &str) -> Result<(), String> {
+pub(crate) fn validate_derivation_path(v: &str) -> Result<(), String> {
     v.parse::<DerivationPath>()
         .map(|_| ())
         .map_err(|e| format!("not a valid derivation path: {e}"))
@@ -304,7 +304,7 @@ fn validate_derivation_path(v: &str) -> Result<(), String> {
 /// Checks the xpub parses, is on the right network, and has the same depth as `path` - the
 /// exact same checks `KeySpec::validate` runs later, surfaced here so a mismatch is caught
 /// immediately instead of at the very end of the wizard.
-fn validate_xpub_for(network: ChainNetwork, path: &str) -> impl Fn(&str) -> Result<(), String> {
+pub(crate) fn validate_xpub_for(network: ChainNetwork, path: &str) -> impl Fn(&str) -> Result<(), String> {
     let path = path.to_string();
     move |v: &str| {
         let xpub: Xpub = v
@@ -645,7 +645,7 @@ pub fn run_interactive<R: BufRead, W: Write>(
     })
 }
 
-fn network_str(n: ChainNetwork) -> &'static str {
+pub(crate) fn network_str(n: ChainNetwork) -> &'static str {
     match n {
         ChainNetwork::Mainnet => "mainnet",
         ChainNetwork::Testnet => "testnet",
@@ -659,9 +659,28 @@ fn toml_list(items: &[String]) -> String {
     format!("[{}]", quoted.join(", "))
 }
 
-/// Renders collected answers as `wallet.toml` text, in the same shape/style as
-/// `examples/signet-demo.toml`. Pure - no IO, so this is exhaustively unit-testable.
+/// Renders collected answers as a complete `wallet.toml`, including the deployment-specific
+/// `[bitcoind]` and `[server]` sections. This is what `cosigner init` writes: a standalone
+/// config that `cosigner serve --config` can be pointed at directly.
+///
+/// Pure - no IO, so this is exhaustively unit-testable.
 pub fn render_toml(a: &WizardAnswers) -> String {
+    render(a, true)
+}
+
+/// Renders the same answers *without* `[bitcoind]` and `[server]`, for containerised
+/// deployments where `docker-entrypoint.sh` appends those two sections itself on every start
+/// from environment variables (see docs/DOCKER.md). Emitting them here too would produce
+/// duplicate TOML tables the moment the entrypoint concatenated the two, so the web setup UI
+/// must use this variant rather than [`render_toml`].
+///
+/// The result is still a valid [`crate::config::WalletConfig`] on its own - `bitcoind` and
+/// `server` are both `Option` - so it can be parsed and validated before being written.
+pub fn render_user_toml(a: &WizardAnswers) -> String {
+    render(a, false)
+}
+
+fn render(a: &WizardAnswers, include_deployment: bool) -> String {
     let mut out = String::new();
 
     out.push_str(&format!("network = \"{}\"\n", network_str(a.network)));
@@ -681,22 +700,24 @@ pub fn render_toml(a: &WizardAnswers) -> String {
         out.push_str(&format!("xpub = \"{}\"\n\n", key.xpub));
     }
 
-    out.push_str("[bitcoind]\n");
-    out.push_str(&format!("rpc_url = \"{}\"\n", a.bitcoind_rpc_url));
-    match &a.bitcoind_auth {
-        BitcoindAuthAnswer::Cookie(path) => {
-            out.push_str(&format!("rpc_cookie_file = \"{path}\"\n\n"));
+    if include_deployment {
+        out.push_str("[bitcoind]\n");
+        out.push_str(&format!("rpc_url = \"{}\"\n", a.bitcoind_rpc_url));
+        match &a.bitcoind_auth {
+            BitcoindAuthAnswer::Cookie(path) => {
+                out.push_str(&format!("rpc_cookie_file = \"{path}\"\n\n"));
+            }
+            BitcoindAuthAnswer::UserPass(user, pass) => {
+                out.push_str(&format!("rpc_user = \"{user}\"\n"));
+                out.push_str(&format!("rpc_password = \"{pass}\"\n\n"));
+            }
         }
-        BitcoindAuthAnswer::UserPass(user, pass) => {
-            out.push_str(&format!("rpc_user = \"{user}\"\n"));
-            out.push_str(&format!("rpc_password = \"{pass}\"\n\n"));
-        }
-    }
 
-    out.push_str("[server]\n");
-    out.push_str(&format!("bind_addr = \"{}\"\n", a.bind_addr));
-    out.push_str(&format!("gap_limit = {}\n", a.gap_limit));
-    out.push_str(&format!("ledger_db_path = \"{}\"\n\n", a.ledger_db_path));
+        out.push_str("[server]\n");
+        out.push_str(&format!("bind_addr = \"{}\"\n", a.bind_addr));
+        out.push_str(&format!("gap_limit = {}\n", a.gap_limit));
+        out.push_str(&format!("ledger_db_path = \"{}\"\n\n", a.ledger_db_path));
+    }
 
     out.push_str("[server_signing]\n");
     match &a.server_signing {

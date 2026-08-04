@@ -3,7 +3,7 @@ id: bitme-cosigner
 name: Bitme Cosigner
 tagline: Policy-gated Bitcoin PSBT co-signing service
 category: bitcoin
-version: "0.1.1"
+version: "0.2.0"
 port: 8080
 description: >-
   Self-hosted signing service for a 3-key miniscript wallet (a SATOCHIP smartcard, a Bitcoin
@@ -14,9 +14,11 @@ description: >-
   broadcasts anything itself.
 
 
-  This app is API-only by design - it has no web dashboard. Opening it shows a small JSON
-  health check, not a page. Everything else happens over its HTTP API; see the project's README
-  for the full endpoint reference.
+  Opening the app the first time walks you through setup in the browser: it takes the xpubs
+  off your SATOCHIP and Bitcoin Keeper, generates its own key on the box, and hands you back a
+  descriptor to register in Keeper. After that it is an API - opening it shows a JSON health
+  check, and everything else happens over its HTTP API; see the project's README for the full
+  endpoint reference.
 
 
   Start on signet, not mainnet, until you've verified your whole setup end-to-end - see
@@ -34,9 +36,17 @@ support: https://github.com/TDH-Labs/Bitme/issues
 # inlined here. This URL requires the repo to stay public - if it goes private the icon 404s
 # and the app shows a blank tile, in which case host icon.svg somewhere public and update this.
 icon: https://raw.githubusercontent.com/TDH-Labs/Bitme/main/bitme-cosigner/icon.svg
-# No screenshots: this is a headless API service, not something with a UI to show.
+# No screenshots yet. The only UI is the first-run setup wizard, which is gone once setup is
+# done - a gallery of it would misrepresent what the app looks like in normal use.
 gallery: []
 releaseNotes: >-
+  0.2.0: first-run setup now happens in the browser instead of by hand-writing wallet.toml over
+  SSH - it collects the two external xpubs, generates the SERVER key on the box from the OS
+  CSPRNG, writes the config, and shows the descriptor (plus a QR) to register in Bitcoin Keeper.
+  Also fixes a Tor sidecar that crash-looped on every install, and a uid mismatch that made the
+  app unable to write its own data directory the moment it had a valid config.
+
+
   0.1.1: fixes two bugs found installing on real Umbrel hardware that made every install fail -
   a build context that resolved outside this app's folder, and a port variable Umbrel doesn't
   actually export to apps (was left unpublished on a random port instead of 8080). See

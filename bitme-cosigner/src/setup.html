@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bitme Cosigner &middot; Setup</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #14171a; --muted: #5c6570;
+    --line: #dfe3e8; --accent: #f7931a; --accent-ink: #1a1005;
+    --danger: #b4232a; --ok: #1a7f45; --code-bg: #f0f2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111417; --panel: #1a1e22; --ink: #e8eaed; --muted: #98a2ad;
+      --line: #2c3238; --accent: #f7931a; --accent-ink: #1a1005;
+      --danger: #ff7b72; --ok: #56d38a; --code-bg: #101316;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 32px 20px 80px; }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px; }
+  h1 { font-size: 21px; margin: 0; letter-spacing: -0.01em; }
+  .net {
+    font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em;
+    padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted);
+  }
+  .net.mainnet { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+  .sub { color: var(--muted); margin: 0 0 24px; font-size: 14px; }
+  .steps { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 20px; }
+  .steps i {
+    flex: 1 1 0; min-width: 24px; height: 3px; border-radius: 2px; background: var(--line);
+  }
+  .steps i.done { background: var(--accent); }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 24px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 17px; margin: 0 0 6px; }
+  .card p { color: var(--muted); margin: 0 0 18px; }
+  ol.guide { color: var(--muted); margin: 0 0 18px; padding-left: 20px; }
+  ol.guide li { margin-bottom: 8px; }
+  ol.guide b { color: var(--ink); font-weight: 600; }
+  label { display: block; font-weight: 600; font-size: 13px; margin: 14px 0 5px; }
+  label .hint { display: block; font-weight: 400; color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  input, textarea {
+    width: 100%; padding: 9px 11px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--ink); font-size: 14px; font-family: inherit;
+  }
+  input.mono, textarea.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+  input.bad { border-color: var(--danger); }
+  .err { color: var(--danger); font-size: 13px; margin-top: 6px; display: none; }
+  .err.show { display: block; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 200px; }
+  .actions { display: flex; gap: 10px; margin-top: 24px; align-items: center; }
+  button {
+    font: inherit; font-weight: 600; padding: 9px 18px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink);
+  }
+  button.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .spacer { flex: 1; }
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--code-bg); border-radius: 6px;
+  }
+  code { padding: 1px 5px; font-size: 13px; }
+  pre {
+    padding: 12px; overflow-x: auto; font-size: 12.5px; border: 1px solid var(--line);
+    white-space: pre-wrap; word-break: break-all; margin: 0;
+  }
+  .kv { display: flex; justify-content: space-between; gap: 16px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+  .kv:last-child { border-bottom: 0; }
+  .kv span:first-child { color: var(--muted); }
+  .kv span:last-child { text-align: right; font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; word-break: break-all; }
+  .note {
+    border-left: 3px solid var(--accent); padding: 10px 14px; background: var(--code-bg);
+    border-radius: 0 8px 8px 0; font-size: 13.5px; color: var(--muted); margin: 16px 0;
+  }
+  .note b { color: var(--ink); }
+  .qr { text-align: center; margin: 18px 0; }
+  .qr svg { width: 240px; height: 240px; background: #fff; padding: 10px; border-radius: 8px; }
+  .hidden { display: none; }
+  .ok { color: var(--ok); font-size: 13px; margin-top: 6px; }
+  footer { color: var(--muted); font-size: 12.5px; text-align: center; margin-top: 28px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Bitme Cosigner</h1>
+    <span class="net" id="net">…</span>
+  </header>
+  <p class="sub">First-run setup. Nothing is written to disk until the last step.</p>
+  <div class="steps" id="steps"></div>
+  <div id="panel"></div>
+  <footer>This service holds one of three keys. It can never spend on its own.</footer>
+</div>
+
+<script>
+"use strict";
+
+const S = {
+  step: 0,
+  network: null,
+  defaultPath: "48h/1h/0h/2h",
+  timelock: 12960,
+  satochip: null,
+  mobile: null,
+  server: null,
+  policy: { max_tx_sat: 500000, max_daily_sat: 1000000, max_weekly_sat: 3000000,
+            max_monthly_sat: 10000000, max_fee_sat: 50000, max_fee_rate_sat_per_vb: 100 },
+  hold_seconds: 3600,
+  recovery_hold_seconds: 86400,
+  ntfy_url: "",
+  result: null,
+};
+
+const STEPS = [welcome, keyStep("satochip"), keyStep("mobile"), serverKey, limits, holdStep, review, done];
+
+const el = (h) => { const d = document.createElement("div"); d.innerHTML = h.trim(); return d.firstElementChild; };
+const esc = (s) => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+const sats = (n) => Number(n).toLocaleString("en-US");
+const btc = (n) => (Number(n) / 1e8).toLocaleString("en-US", { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+
+async function api(path, body) {
+  const r = await fetch(path, {
+    method: body === undefined ? "GET" : "POST",
+    headers: { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await r.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (_) { /* non-JSON error body */ }
+  if (!r.ok) throw new Error((data && data.error) || text || ("HTTP " + r.status));
+  return data;
+}
+
+function render() {
+  document.getElementById("steps").innerHTML =
+    STEPS.map((_, i) => `<i class="${i <= S.step ? "done" : ""}"></i>`).join("");
+  const panel = document.getElementById("panel");
+  panel.innerHTML = "";
+  panel.appendChild(STEPS[S.step]());
+  window.scrollTo(0, 0);
+}
+const go = (n) => { S.step = n; render(); };
+const next = () => go(S.step + 1);
+const back = () => go(S.step - 1);
+
+// --- step 0 -----------------------------------------------------------------------------------
+function welcome() {
+  const mainnetWarning = S.network === "mainnet" ? `
+    <div class="note"><b>This is mainnet.</b> The limits you set here govern real money.
+    Every one of them can be tightened later, but only with a signature from your Satochip.</div>` : "";
+  const c = el(`<div class="card">
+    <h2>Before you start</h2>
+    <p>This wallet needs three keys. You will set up two of them yourself; this box generates the third.</p>
+    <ol class="guide">
+      <li><b>Your Satochip card</b> — set up with its own PIN in the Satochip app. You will need its
+          master fingerprint and account xpub.</li>
+      <li><b>Bitcoin Keeper</b> on your phone — this is the app that coordinates the wallet and builds
+          transactions. You will need a key from it, and at the end you will register the finished
+          wallet back into it.</li>
+      <li><b>This server</b> — generates its own key in the next few minutes. It never leaves this box.</li>
+    </ol>
+    <div class="note">Any two of the three can spend. This server will only ever supply the
+    <b>second</b> signature, and only when your policy allows it — so losing any single key never
+    loses the coins, and compromising this box alone never moves them.</div>
+    ${mainnetWarning}
+    <div class="actions"><div class="spacer"></div><button id="n">Start setup</button></div>
+  </div>`);
+  c.querySelector("#n").onclick = next;
+  return c;
+}
+
+// --- steps 1 & 2: the two external keys ---------------------------------------------------------
+const KEY_COPY = {
+  satochip: {
+    title: "Your Satochip key",
+    lede: "Read these three values off the Satochip app and paste them here.",
+    guide: `<ol class="guide">
+      <li>Open the <b>Satochip</b> app and unlock the card with its PIN.</li>
+      <li>Choose to export a <b>multisig / P2WSH account</b> at derivation path
+          <code id="p"></code>.</li>
+      <li>It will show a <b>master fingerprint</b> (8 hex characters) and an
+          <b>account xpub</b>. Copy both below.</li>
+    </ol>`,
+  },
+  mobile: {
+    title: "Your Bitcoin Keeper key",
+    lede: "Bitcoin Keeper coordinates this wallet. Add a key from it here.",
+    guide: `<ol class="guide">
+      <li>Open <b>Bitcoin Keeper</b> and add or select the key you want as the second signer —
+          a mobile key or a hardware device it supports.</li>
+      <li>Export that key's details for a <b>multisig</b> wallet at derivation path
+          <code id="p"></code>.</li>
+      <li>Copy its <b>master fingerprint</b> and <b>account xpub</b> below.</li>
+    </ol>`,
+  },
+};
+
+function keyStep(role) {
+  return function () {
+    const copy = KEY_COPY[role];
+    const cur = S[role] || { fingerprint: "", derivation_path: S.defaultPath, xpub: "" };
+    const c = el(`<div class="card">
+      <h2>${copy.title}</h2>
+      <p>${copy.lede}</p>
+      ${copy.guide}
+      <label>Master fingerprint
+        <span class="hint">Exactly 8 hex characters, e.g. <code>1a2b3c4d</code>. This identifies the
+        device, not the account.</span></label>
+      <input class="mono" id="fp" value="${esc(cur.fingerprint)}" placeholder="1a2b3c4d" autocapitalize="off" spellcheck="false">
+      <label>Derivation path
+        <span class="hint">Leave this alone unless the app above showed you something different.</span></label>
+      <input class="mono" id="path" value="${esc(cur.derivation_path)}" autocapitalize="off" spellcheck="false">
+      <label>Account xpub
+        <span class="hint">The extended public key <i>at that exact path</i> — not the wallet's master key.</span></label>
+      <textarea class="mono" id="xpub" rows="3" placeholder="xpub…" autocapitalize="off" spellcheck="false">${esc(cur.xpub)}</textarea>
+      <div class="err" id="e"></div>
+      <div class="actions">
+        <button class="ghost" id="b">Back</button><div class="spacer"></div>
+        <button id="n">Check and continue</button>
+      </div>
+    </div>`);
+    c.querySelectorAll("#p").forEach(n => n.textContent = S.defaultPath);
+    c.querySelector("#b").onclick = back;
+    c.querySelector("#n").onclick = async (ev) => {
+      const btn = ev.target, err = c.querySelector("#e");
+      const payload = {
+        fingerprint: c.querySelector("#fp").value.trim(),
+        derivation_path: c.querySelector("#path").value.trim(),
+        xpub: c.querySelector("#xpub").value.trim(),
+      };
+      btn.disabled = true; btn.textContent = "Checking…"; err.classList.remove("show");
+      try {
+        await api("/api/validate-key", payload);
+        S[role] = payload;
+        next();
+      } catch (e) {
+        err.textContent = e.message; err.classList.add("show");
+        btn.disabled = false; btn.textContent = "Check and continue";
+      }
+    };
+    return c;
+  };
+}
+
+// --- step 3: server key ---------------------------------------------------------------------
+function serverKey() {
+  const g = S.server;
+  const c = el(`<div class="card">
+    <h2>This server's key</h2>
+    <p>Generated here, on this box, from the operating system's random number generator.</p>
+    <div class="note">The private key is written to this app's own data directory and never
+    transmitted anywhere. It is shown to you only as a <b>public</b> key. If you lose this box,
+    the other two keys can still move your coins together — that is what the recovery path exists for.</div>
+    <div id="out" class="${g ? "" : "hidden"}">
+      <div class="kv"><span>Master fingerprint</span><span id="ofp">${g ? esc(g.master_fingerprint) : ""}</span></div>
+      <div class="kv"><span>Derivation path</span><span id="opath">${g ? esc(g.derivation_path) : ""}</span></div>
+      <div class="kv"><span>Account xpub</span><span id="oxpub">${g ? esc(g.xpub) : ""}</span></div>
+      <div class="ok">Key generated. It is held in memory only until you finish setup.</div>
+    </div>
+    <div class="err" id="e"></div>
+    <div class="actions">
+      <button class="ghost" id="b">Back</button><div class="spacer"></div>
+      <button id="gen" class="${g ? "ghost" : ""}">${g ? "Generate a different key" : "Generate the key"}</button>
+      <button id="n" class="${g ? "" : "hidden"}">Continue</button>
+    </div>
+  </div>`);
+  c.querySelector("#b").onclick = back;
+  c.querySelector("#n").onclick = next;
+  c.querySelector("#gen").onclick = async (ev) => {
+    const btn = ev.target, err = c.querySelector("#e");
+    btn.disabled = true; btn.textContent = "Generating…"; err.classList.remove("show");
+    try {
+      S.server = await api("/api/server-key", {});
+      render();
+    } catch (e) {
+      err.textContent = e.message; err.classList.add("show");
+      btn.disabled = false; btn.textContent = "Generate the key";
+    }
+  };
+  return c;
+}
+
+// --- step 4: spending limits -------------------------------------------------------------------
+const LIMITS = [
+  ["max_tx_sat", "Per transaction", "The largest single payment this server will co-sign."],
+  ["max_daily_sat", "Per day", "Rolling 24 hours, counted across every transaction it signs."],
+  ["max_weekly_sat", "Per week", "Rolling 7 days."],
+  ["max_monthly_sat", "Per month", "Rolling 30 days."],
+  ["max_fee_sat", "Maximum fee", "Absolute fee ceiling for any one transaction."],
+];
+
+function limits() {
+  const rows = LIMITS.map(([k, label, hint]) => `
+    <label>${label} <span class="hint">${hint}</span></label>
+    <input class="mono lim" data-k="${k}" inputmode="numeric" value="${S.policy[k]}">
+    <div class="hint" style="color:var(--muted);font-size:12.5px" id="h_${k}"></div>`).join("");
+  const c = el(`<div class="card">
+    <h2>Spending limits</h2>
+    <p>All values in satoshis. This server refuses to co-sign anything over these — checked when
+    you submit, and again the instant before it signs.</p>
+    ${rows}
+    <label>Maximum fee rate <span class="hint">sat/vByte.</span></label>
+    <input class="mono" id="rate" inputmode="decimal" value="${S.policy.max_fee_rate_sat_per_vb}">
+    <div class="note">These seed the policy once. After that the live policy lives in this app's
+    database and can only be changed with a <b>Satochip signature</b> — not by editing a file, and
+    not by anyone who merely gets into this box.</div>
+    <div class="err" id="e"></div>
+    <div class="actions">
+      <button class="ghost" id="b">Back</button><div class="spacer"></div>
+      <button id="n">Continue</button>
+    </div>
+  </div>`);
+  const sync = () => c.querySelectorAll(".lim").forEach(i => {
+    const v = Number(i.value.replace(/[, _]/g, ""));
+    c.querySelector("#h_" + i.dataset.k).textContent =
+      Number.isFinite(v) && v > 0 ? `${sats(v)} sats = ${btc(v)} BTC` : "";
+  });
+  c.querySelectorAll(".lim").forEach(i => i.oninput = sync);
+  sync();
+  c.querySelector("#b").onclick = back;
+  c.querySelector("#n").onclick = () => {
+    const err = c.querySelector("#e");
+    const next_policy = {};
+    for (const i of c.querySelectorAll(".lim")) {
+      const v = Number(i.value.replace(/[, _]/g, ""));
+      if (!Number.isFinite(v) || v <= 0 || !Number.isInteger(v)) {
+        err.textContent = "Every limit must be a whole number of satoshis, greater than zero.";
+        err.classList.add("show"); i.classList.add("bad"); return;
+      }
+      i.classList.remove("bad");
+      next_policy[i.dataset.k] = v;
+    }
+    const rate = Number(c.querySelector("#rate").value);
+    if (!Number.isFinite(rate) || rate <= 0) {
+      err.textContent = "The fee rate must be a positive number."; err.classList.add("show"); return;
+    }
+    if (next_policy.max_daily_sat < next_policy.max_tx_sat) {
+      err.textContent = "The daily limit is below the per-transaction limit, so no transaction at the per-transaction limit could ever be signed.";
+      err.classList.add("show"); return;
+    }
+    next_policy.max_fee_rate_sat_per_vb = rate;
+    S.policy = next_policy;
+    next();
+  };
+  return c;
+}
+
+// --- step 5: hold window + notifications --------------------------------------------------------
+function holdStep() {
+  const c = el(`<div class="card">
+    <h2>Hold window</h2>
+    <p>An approved transaction is never signed immediately. It is queued, you are notified, and it
+    is only signed once the hold has passed without you vetoing it.</p>
+    <div class="row">
+      <div>
+        <label>Normal hold <span class="hint">Seconds. 3600 = 1 hour.</span></label>
+        <input class="mono" id="hold" inputmode="numeric" value="${S.hold_seconds}">
+      </div>
+      <div>
+        <label>Recovery hold <span class="hint">Seconds, for the phone-plus-server path. 86400 = 1 day.</span></label>
+        <input class="mono" id="rhold" inputmode="numeric" value="${S.recovery_hold_seconds}">
+      </div>
+    </div>
+    <div class="note">The recovery path exists so a lost Satochip doesn't lock you out — but it also
+    means a stolen phone plus this box could spend. <b>The recovery hold is the main thing standing
+    in the way of that</b>, so keep it long enough that you would notice and veto.</div>
+    <label>Notification URL <span class="hint">Required. An
+      <a href="https://ntfy.sh" target="_blank" rel="noreferrer noopener">ntfy</a> topic URL gets a push
+      on your phone the moment a signature is requested. Pick a long, unguessable topic name —
+      anyone who knows it can read your notifications.</span></label>
+    <input class="mono" id="ntfy" placeholder="https://ntfy.sh/your-private-topic" value="${esc(S.ntfy_url)}" autocapitalize="off" spellcheck="false">
+    <div class="note">There is deliberately no way to skip this. The hold window is only
+    protective if you find out a signature was requested — without a notification channel this
+    service would wait quietly and then sign, with nobody in a position to veto.</div>
+    <div class="err" id="e"></div>
+    <div class="actions">
+      <button class="ghost" id="b">Back</button><div class="spacer"></div>
+      <button id="n">Continue</button>
+    </div>
+  </div>`);
+  c.querySelector("#b").onclick = back;
+  c.querySelector("#n").onclick = () => {
+    const err = c.querySelector("#e");
+    const h = Number(c.querySelector("#hold").value), r = Number(c.querySelector("#rhold").value);
+    if (!Number.isInteger(h) || h < 0 || !Number.isInteger(r) || r < 0) {
+      err.textContent = "Both holds must be whole numbers of seconds (0 or more).";
+      err.classList.add("show"); return;
+    }
+    const u = c.querySelector("#ntfy").value.trim();
+    if (!u) {
+      err.textContent = "A notification URL is required — the hold window only protects you if you find out a signature was requested.";
+      err.classList.add("show"); return;
+    }
+    if (!/^https?:\/\//i.test(u)) {
+      err.textContent = "The notification URL must start with http:// or https://.";
+      err.classList.add("show"); return;
+    }
+    S.hold_seconds = h; S.recovery_hold_seconds = r; S.ntfy_url = u;
+    next();
+  };
+  return c;
+}
+
+// --- step 6: review ----------------------------------------------------------------------------
+function review() {
+  const kv = (k, v) => `<div class="kv"><span>${k}</span><span>${esc(v)}</span></div>`;
+  const c = el(`<div class="card">
+    <h2>Review</h2>
+    <p>Nothing has been written yet. Creating the wallet writes two files into this app's data
+    directory and cannot be undone from here.</p>
+    ${kv("Network", S.network)}
+    ${kv("Satochip", S.satochip.fingerprint + " @ " + S.satochip.derivation_path)}
+    ${kv("Bitcoin Keeper", S.mobile.fingerprint + " @ " + S.mobile.derivation_path)}
+    ${kv("This server", S.server.master_fingerprint + " @ " + S.server.derivation_path)}
+    ${kv("Recovery timelock", S.timelock + " blocks (~" + Math.round(S.timelock / 144) + " days)")}
+    ${kv("Per transaction", sats(S.policy.max_tx_sat) + " sats")}
+    ${kv("Per day", sats(S.policy.max_daily_sat) + " sats")}
+    ${kv("Per week", sats(S.policy.max_weekly_sat) + " sats")}
+    ${kv("Per month", sats(S.policy.max_monthly_sat) + " sats")}
+    ${kv("Maximum fee", sats(S.policy.max_fee_sat) + " sats @ " + S.policy.max_fee_rate_sat_per_vb + " sat/vB")}
+    ${kv("Normal hold", S.hold_seconds + "s")}
+    ${kv("Recovery hold", S.recovery_hold_seconds + "s")}
+    ${kv("Notifications", S.ntfy_url || "none")}
+    <div class="err" id="e"></div>
+    <div class="actions">
+      <button class="ghost" id="b">Back</button><div class="spacer"></div>
+      <button id="n">Create the wallet</button>
+    </div>
+  </div>`);
+  c.querySelector("#b").onclick = back;
+  c.querySelector("#n").onclick = async (ev) => {
+    const btn = ev.target, err = c.querySelector("#e");
+    btn.disabled = true; btn.textContent = "Creating…"; err.classList.remove("show");
+    try {
+      S.result = await api("/api/finish", {
+        timelock_blocks: S.timelock,
+        satochip: S.satochip,
+        mobile: S.mobile,
+        policy: S.policy,
+        hold_seconds: S.hold_seconds,
+        recovery_hold_seconds: S.recovery_hold_seconds,
+        ntfy_url: S.ntfy_url || null,
+      });
+      next();
+    } catch (e) {
+      err.textContent = e.message; err.classList.add("show");
+      btn.disabled = false; btn.textContent = "Create the wallet";
+    }
+  };
+  return c;
+}
+
+// --- step 7: register in Keeper + start ---------------------------------------------------------
+function done() {
+  const r = S.result;
+  const c = el(`<div class="card">
+    <h2>Register this wallet in Bitcoin Keeper</h2>
+    <p>The wallet is created. Bitcoin Keeper doesn't know about it yet — it needs the descriptor
+    below, which is what tells it the three keys and the rules binding them.</p>
+    <ol class="guide">
+      <li>In <b>Bitcoin Keeper</b>, add a wallet by <b>importing a descriptor</b>.</li>
+      <li>Scan the QR, or paste the text.</li>
+      <li>Keeper should show three keys and recognise two of them as yours — the third,
+          <code>${esc(r.server_fingerprint)}</code>, is this server.</li>
+      <li>Confirm the first receive address matches: <code>${esc(r.first_address)}</code></li>
+    </ol>
+    ${r.descriptor_qr_svg ? `<div class="qr">${r.descriptor_qr_svg}</div>` : ""}
+    <pre id="desc">${esc(r.descriptor)}</pre>
+    <div class="actions" style="margin-top:12px">
+      <button class="ghost" id="copy">Copy descriptor</button>
+      <button class="ghost" id="dl">Download as file</button>
+    </div>
+    <div class="note"><b>Keep a copy of this descriptor somewhere safe.</b> Your keys alone cannot
+    rebuild the wallet without it. It contains no private keys — it is safe to store as plain text.</div>
+    <div class="err" id="e"></div>
+    <div class="actions">
+      <div class="spacer"></div><button id="start">Start the cosigner</button>
+    </div>
+  </div>`);
+  c.querySelector("#copy").onclick = async (ev) => {
+    try {
+      await navigator.clipboard.writeText(r.descriptor);
+      ev.target.textContent = "Copied";
+      setTimeout(() => { ev.target.textContent = "Copy descriptor"; }, 1500);
+    } catch (_) {
+      // Clipboard needs a secure context; over plain LAN http it may be unavailable.
+      const sel = window.getSelection(); const range = document.createRange();
+      range.selectNodeContents(c.querySelector("#desc")); sel.removeAllRanges(); sel.addRange(range);
+      ev.target.textContent = "Selected — press Ctrl/Cmd+C";
+    }
+  };
+  c.querySelector("#dl").onclick = () => {
+    const blob = new Blob([r.descriptor + "\n"], { type: "text/plain" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "bitme-cosigner-descriptor.txt";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  c.querySelector("#start").onclick = async (ev) => {
+    const btn = ev.target, err = c.querySelector("#e");
+    btn.disabled = true; btn.textContent = "Starting…"; err.classList.remove("show");
+    try {
+      await api("/api/start", {});
+      document.getElementById("panel").innerHTML = `<div class="card">
+        <h2>Starting</h2>
+        <p>The cosigner is restarting into normal operation. This setup page is now gone — reload in
+        a few seconds and you should get the service's health response instead.</p></div>`;
+    } catch (e) {
+      err.textContent = e.message; err.classList.add("show");
+      btn.disabled = false; btn.textContent = "Start the cosigner";
+    }
+  };
+  return c;
+}
+
+// --- boot ---------------------------------------------------------------------------------------
+(async function () {
+  try {
+    const st = await api("/api/state");
+    S.network = st.network;
+    S.defaultPath = st.default_derivation_path;
+    S.timelock = st.default_timelock_blocks;
+    const badge = document.getElementById("net");
+    badge.textContent = st.network;
+    if (st.network === "mainnet") badge.classList.add("mainnet");
+    if (st.configured) {
+      document.getElementById("panel").innerHTML = `<div class="card">
+        <h2>Already configured</h2>
+        <p>This cosigner already has a <code>wallet.toml</code>, so setup has nothing left to do.
+        Restart the app to start serving with it.</p></div>`;
+      return;
+    }
+    render();
+  } catch (e) {
+    document.getElementById("panel").innerHTML =
+      `<div class="card"><h2>Couldn't load setup</h2><p>${esc(e.message)}</p></div>`;
+  }
+})();
+</script>
+</body>
+</html>
