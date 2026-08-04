@@ -365,7 +365,7 @@ struct FinishResponse {
 /// Renders `data` as an inline SVG QR, or `None` if it's too long to encode. Callers always
 /// show the same payload as selectable text too, so a missing QR degrades to "type it" rather
 /// than blocking anything.
-fn qr_svg(data: &str) -> Option<String> {
+pub(crate) fn qr_svg(data: &str) -> Option<String> {
     use qrcode::render::svg;
     use qrcode::{EcLevel, QrCode};
 

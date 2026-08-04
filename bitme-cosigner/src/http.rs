@@ -56,6 +56,10 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        // `/` had no route at all, so opening the app from Umbrel's dashboard after setup
+        // returned a bare 404. It also gives the wallet descriptor a permanent home: the setup
+        // wizard showed it once and then vanished on the first restart.
+        .route("/", get(status_page_handler))
         .route("/health", get(health_handler))
         .route("/inspect", post(inspect_handler))
         .route("/sign_psbt", post(sign_psbt_handler))
@@ -65,6 +69,16 @@ pub fn router(state: AppState) -> Router {
         .route("/freeze", get(get_freeze_handler).post(post_freeze_handler))
         .route("/unfreeze", post(post_unfreeze_handler))
         .with_state(state)
+}
+
+/// The human-facing landing page for a configured service. Everything else here is API.
+async fn status_page_handler(State(state): State<AppState>) -> axum::response::Html<String> {
+    let policy_version = state.policy.read().await.version;
+    axum::response::Html(crate::status_page::render(
+        &state.wallet,
+        &state.cfg,
+        policy_version,
+    ))
 }
 
 #[derive(Debug, Serialize)]
