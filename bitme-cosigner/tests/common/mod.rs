@@ -16,7 +16,7 @@ use bitcoin::{
     transaction, Address, Amount, NetworkKind, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
     TxOut, Witness,
 };
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Client, RpcApi};
 use cosigner::config::{ChainNetwork, KeySpec, KeysConfig, ServerSigningConfig, WalletConfig};
 use cosigner::ledger::Ledger;
 use cosigner::policy::PolicyConfig;
@@ -35,13 +35,7 @@ pub const KEY_PATH: &str = "48h/1h/0h/2h";
 /// with no node available, while still running for real wherever one is.
 pub fn regtest_client() -> Option<Client> {
     let url = std::env::var("COSIGNER_REGTEST_RPC_URL").ok()?;
-    let user = std::env::var("COSIGNER_REGTEST_RPC_USER").unwrap_or_else(|_| "cosigner".into());
-    let password =
-        std::env::var("COSIGNER_REGTEST_RPC_PASSWORD").unwrap_or_else(|_| "cosigner".into());
-    Some(
-        Client::new(&url, Auth::UserPass(user, password))
-            .expect("constructing bitcoind RPC client"),
-    )
+    Some(client_for(&url))
 }
 
 /// A second RPC client scoped to a fresh node-wallet named `name` (bitcoind's "no wallet
@@ -49,14 +43,33 @@ pub fn regtest_client() -> Option<Client> {
 pub fn node_wallet_client(node: &Client, name: &str) -> Client {
     let _ = node.create_wallet(name, None, None, None, None);
     let rpc_url = std::env::var("COSIGNER_REGTEST_RPC_URL").unwrap();
-    Client::new(
-        &format!("{rpc_url}/wallet/{name}"),
-        Auth::UserPass(
-            std::env::var("COSIGNER_REGTEST_RPC_USER").unwrap_or_else(|_| "cosigner".into()),
-            std::env::var("COSIGNER_REGTEST_RPC_PASSWORD").unwrap_or_else(|_| "cosigner".into()),
-        ),
-    )
-    .unwrap()
+    client_for(&format!("{rpc_url}/wallet/{name}"))
+}
+
+/// `bitcoincore_rpc::Client::new` hardcodes a 15-second transport timeout, which is not a
+/// sensible bound for the *setup* these tests do: `fund_node_wallet` mines 101 blocks in one
+/// call, and on a loaded or I/O-bound machine that alone can take over a minute (measured at
+/// 72s on the umbrelOS test box while other apps were saturating its disk). The result was
+/// three failures that all pointed at a transport timeout during funding, with nothing wrong
+/// in the code under test.
+///
+/// Nothing here is being made lenient in a way that could mask a real failure: this is a
+/// socket read timeout, not an assertion or a retry, so a genuinely wrong RPC answer still
+/// fails exactly as loudly. The wait is bounded, just generously.
+fn client_for(url: &str) -> Client {
+    use bitcoincore_rpc::jsonrpc;
+
+    let user = std::env::var("COSIGNER_REGTEST_RPC_USER").unwrap_or_else(|_| "cosigner".into());
+    let password =
+        std::env::var("COSIGNER_REGTEST_RPC_PASSWORD").unwrap_or_else(|_| "cosigner".into());
+
+    let transport = jsonrpc::simple_http::SimpleHttpTransport::builder()
+        .url(url)
+        .expect("parsing the regtest RPC URL")
+        .timeout(std::time::Duration::from_secs(300))
+        .auth(user, Some(password))
+        .build();
+    Client::from_jsonrpc(jsonrpc::Client::with_transport(transport))
 }
 
 pub fn key_spec_with_xpriv(seed_byte: u8, path: &str) -> (KeySpec, Xpriv) {

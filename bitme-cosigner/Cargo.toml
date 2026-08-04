@@ -1,6 +1,6 @@
 [package]
 name = "cosigner"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -24,6 +24,9 @@ lettre = { version = "0.11", default-features = false, features = ["tokio1-rustl
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 miniscript = { version = "12.3.7", features = ["serde"] }
 nostr-sdk = { version = "0.44.1", features = ["nip59"] }
+# Renders the finished descriptor as a scannable QR on the setup UI's last screen, so it can
+# be carried to a phone without retyping ~300 characters. Pure Rust, no C, SVG output only.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 scrypt = "0.11"
 serde = { version = "1", features = ["derive"] }
