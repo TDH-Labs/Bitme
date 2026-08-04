@@ -55,7 +55,19 @@ If you already have a node (your own VPS, home server, etc.), skip this and just
 
 ## 3. Write your wallet config
 
-`config/` is bind-mounted straight into the container (read-only), so you just edit a normal
+Three ways to do this, in rough order of least to most manual. All three produce the same file.
+
+**The browser wizard.** Start the container with `config/` empty and it serves a setup wizard on
+its own port instead of the API. Point a browser at it and it collects the two external xpubs,
+generates the SERVER key itself from the OS CSPRNG, writes both `wallet.toml` and `server.xprv`
+mode `0600`, and shows you the descriptor to register in your coordinator. This is the only one
+of the three that also *generates* the SERVER key, so it's the path to prefer unless you have a
+reason to make that key yourself. Finishing it shuts the wizard down; with `restart:
+unless-stopped` the container comes straight back up serving the real API.
+
+**`cosigner init`.** The same flow as guided terminal prompts - see below.
+
+**By hand.** `config/` is bind-mounted straight into the container, so you can just edit a normal
 file on your host:
 
 ```sh
@@ -69,11 +81,12 @@ touch `[bitcoind]`/`[server]` - they don't belong in this file (see the comments
 itself for why). `config/wallet.toml` is gitignored - it will hold your real xpubs, never commit
 it.
 
-**Or, instead of hand-editing:** `cosigner init` is an interactive wizard for this same file -
-guided prompts with sensible defaults and inline validation, instead of copying the example and
-filling in ~30 fields by hand. Because `config/` is mounted read-only into the `cosigner`
-service, run it against a throwaway container with a *writable* mount instead, pointed straight
-at your host's `config/` directory (build the image first if you haven't yet):
+**The terminal wizard:** `cosigner init` covers this same file with guided prompts, sensible
+defaults and inline validation, instead of copying the example and filling in ~30 fields by hand.
+It shares its validators and its renderer with the browser wizard above, so the two cannot drift
+into producing different configs. Unlike the browser wizard it does *not* generate a SERVER key -
+you supply one. Run it against a throwaway container with a writable mount pointed at your host's
+`config/` directory (build the image first if you haven't yet):
 
 ```sh
 docker compose build
