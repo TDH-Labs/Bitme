@@ -74,6 +74,10 @@ Clicking **Start the cosigner** shuts the wizard down; Umbrel restarts the conta
 back serving the real API. It is a wizard *or* the API, never both, and a restart is the only
 transition - so a half-configured process never holds a signing key.
 
+[Screenshots of every step](screenshots/) - captured by driving the real wizard, not mocked up.
+The SERVER key is generated on the box from the kernel CSPRNG; if you want to know exactly how,
+or would rather supply your own key, see [`KEY-GENERATION.md`](KEY-GENERATION.md).
+
 Nothing is written to disk until the last step, and it refuses to overwrite an existing
 `wallet.toml`. If you want to start over, delete both files from
 `~/umbrel/app-data/bitme-cosigner/config/` and restart the app.
