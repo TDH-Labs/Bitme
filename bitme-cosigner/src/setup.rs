@@ -354,6 +354,12 @@ struct FinishResponse {
     /// it. `None` if the descriptor is too long to encode - the copy/download paths in the UI
     /// always work, so this is a convenience that's allowed to be absent rather than an error.
     descriptor_qr_svg: Option<String>,
+    /// The same wallet as a single-path receive descriptor. BIP389 multipath (`<0;1>`) is the
+    /// compact form and what this service prefers, but plenty of wallets - Bitcoin Keeper among
+    /// them, on the version this was tested against - reject it outright as an unrecognised
+    /// format. Offering both turns "your descriptor is broken" into "try the other one".
+    receive_qr_svg: Option<String>,
+    change_qr_svg: Option<String>,
 }
 
 /// Renders `data` as an inline SVG QR, or `None` if it's too long to encode. Callers always
@@ -496,11 +502,15 @@ async fn finish_handler(
     }
 
     let multipath = built.multipath.to_string();
+    let receive = built.external.to_string();
+    let change = built.internal.to_string();
     let response = FinishResponse {
         descriptor_qr_svg: qr_svg(&multipath),
+        receive_qr_svg: qr_svg(&receive),
+        change_qr_svg: qr_svg(&change),
         descriptor: multipath,
-        receive_descriptor: built.external.to_string(),
-        change_descriptor: built.internal.to_string(),
+        receive_descriptor: receive,
+        change_descriptor: change,
         first_address,
         server_fingerprint: generated.master_fingerprint.clone(),
         config_path: state.wallet_toml_path().display().to_string(),
