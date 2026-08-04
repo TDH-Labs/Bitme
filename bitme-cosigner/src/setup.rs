@@ -365,13 +365,29 @@ fn qr_svg(data: &str) -> Option<String> {
 /// A descriptor key expression: `[fingerprint/derivation]xpub`. This is the standard way to
 /// hand a co-signer key to another wallet - a bare xpub loses the key origin, and without it a
 /// coordinator cannot build a PSBT this service will recognise as its own.
+///
+/// The hardened marker is normalised to an apostrophe rather than passed through as written.
+/// BIP380 permits both `'` and `h`, but `'` is what is actually accepted everywhere, and it's
+/// what `descriptor.rs` emits for the finished wallet descriptor - so emitting `48h/0h/0h/2h`
+/// here meant this service handed out the same key in two different notations depending on
+/// which screen you were looking at. Parsing and re-displaying via [`DerivationPath`] gets the
+/// canonical form for free instead of doing string surgery on whatever was typed in.
 fn key_expression(fingerprint: &str, derivation_path: &str, xpub: &str) -> String {
-    let path = derivation_path.trim().trim_start_matches(['m', 'M']).trim_start_matches('/');
-    if path.is_empty() {
-        format!("[{}]{}", fingerprint.trim().to_lowercase(), xpub.trim())
-    } else {
-        format!("[{}/{}]{}", fingerprint.trim().to_lowercase(), path, xpub.trim())
+    let fp = fingerprint.trim().to_lowercase();
+    let raw = derivation_path
+        .trim()
+        .trim_start_matches(['m', 'M'])
+        .trim_start_matches('/');
+    if raw.is_empty() {
+        return format!("[{fp}]{}", xpub.trim());
     }
+    let path = match raw.parse::<DerivationPath>() {
+        Ok(p) => p.to_string(),
+        // Unparseable paths can't reach here - every path is validated before a key is
+        // accepted - but falling back to the input beats panicking on a display string.
+        Err(_) => raw.to_string(),
+    };
+    format!("[{fp}/{path}]{}", xpub.trim())
 }
 
 /// Writes the config. This is the only handler that touches disk, and it is all-or-nothing:
@@ -766,6 +782,58 @@ mod tests {
         let xpub: Xpub = g.xpub.parse().expect("xpub should parse");
         let depth = path.parse::<DerivationPath>().expect("path parses").len();
         assert_eq!(xpub.depth as usize, depth);
+    }
+
+    /// The key handed out on the setup screen and the key inside the finished descriptor must
+    /// be byte-identical, notation included. They were not: `key_expression` passed the
+    /// configured path through verbatim (`48h/1h/0h/2h`) while `descriptor.rs` emits the
+    /// canonical apostrophe form, so this service advertised the same key two different ways.
+    #[test]
+    fn key_expression_notation_matches_the_descriptor() {
+        let expr = key_expression("AB12CD34", "48h/1h/0h/2h", "tpubEXAMPLE");
+        assert_eq!(expr, "[ab12cd34/48'/1'/0'/2']tpubEXAMPLE");
+        assert!(!expr.contains('h'), "hardened marker must be an apostrophe: {expr}");
+
+        // Already-canonical input is left alone, and `m/` prefixes are stripped.
+        assert_eq!(
+            key_expression("ab12cd34", "48'/1'/0'/2'", "tpubEXAMPLE"),
+            "[ab12cd34/48'/1'/0'/2']tpubEXAMPLE"
+        );
+        assert_eq!(
+            key_expression("ab12cd34", "m/48h/1h/0h/2h", "tpubEXAMPLE"),
+            "[ab12cd34/48'/1'/0'/2']tpubEXAMPLE"
+        );
+    }
+
+    /// End to end: the origin the wizard shows for the SERVER key has to be exactly the origin
+    /// that ends up in the descriptor a coordinator imports, or the coordinator builds PSBTs
+    /// this service won't recognise as its own.
+    #[test]
+    fn advertised_server_key_appears_verbatim_in_the_built_descriptor() {
+        let network = ChainNetwork::Signet;
+        let path = default_derivation_path(network);
+        let g = generate_server_key(network, &path).expect("generation");
+        let advertised = key_expression(&g.master_fingerprint, &g.derivation_path, &g.xpub);
+
+        let (satochip, _) = crate::test_util::test_key_spec_with_xpriv(1);
+        let (mobile, _) = crate::test_util::test_key_spec_with_xpriv(2);
+        let mut cfg = crate::test_util::test_wallet_config(144);
+        cfg.network = network;
+        cfg.keys.satochip = satochip;
+        cfg.keys.mobile = mobile;
+        cfg.keys.server = crate::config::KeySpec {
+            master_fingerprint: g.master_fingerprint.clone(),
+            derivation_path: g.derivation_path.clone(),
+            xpub: g.xpub.clone(),
+        };
+
+        let built = descriptor::build_descriptor(&cfg).expect("descriptor should build");
+        let desc = built.multipath.to_string();
+        let origin = advertised.split(']').next().expect("has an origin");
+        assert!(
+            desc.contains(origin),
+            "descriptor does not contain the advertised origin\n  advertised: {origin}]\n  descriptor: {desc}"
+        );
     }
 
     #[test]
