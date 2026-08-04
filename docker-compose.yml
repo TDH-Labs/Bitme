@@ -21,11 +21,20 @@ services:
       # More specific than the volume mount above, so this wins for anything under /data/config:
       # the ledger database still lives in the named volume, but the config you actually edit
       # is a plain file on your host, not something hidden inside a Docker volume.
-      - ./config:/data/config:ro
+      #
+      # Writable, not :ro - starting with this directory empty serves the browser setup wizard,
+      # which writes wallet.toml and server.xprv here. Nothing rewrites them afterwards.
+      - ./config:/data/config
     environment:
       COSIGNER_HTTP_PORT: "8080"
       COSIGNER_GAP_LIMIT: "${COSIGNER_GAP_LIMIT:-1000}"
-      COSIGNER_SERVER_XPRV: "${COSIGNER_SERVER_XPRV:?set this in .env - see .env.example. Never commit a real xprv.}"
+      # Optional, and only consulted if your wallet.toml actually names it via
+      # server_signing.xprv_env_var. It used to be `:?` (compose refuses to start without it),
+      # which is wrong now that the setup wizard exists: the wizard generates the SERVER key and
+      # writes it to config/server.xprv, so a deployment configured that way has no xprv to put
+      # here. A missing key is still caught at startup, by ServerSigningKey::load, with a better
+      # message than compose's - so nothing is actually unguarded by this being optional.
+      COSIGNER_SERVER_XPRV: "${COSIGNER_SERVER_XPRV:-}"
       BITCOIND_RPC_URL: "${BITCOIND_RPC_URL:?set this in .env - see .env.example}"
       BITCOIND_RPC_USER: "${BITCOIND_RPC_USER:-}"
       BITCOIND_RPC_PASSWORD: "${BITCOIND_RPC_PASSWORD:-}"

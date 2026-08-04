@@ -372,7 +372,13 @@ the tradeoff, and a reason we haven't rushed to copy it.
 | `/freeze` | GET/POST | Stop all co-signing. **POST is unauthenticated on purpose** — it's the "my phone was just stolen" button and must work in a hurry. Freezing can only cause denial of service; that's strictly better than theft. |
 | `/unfreeze` | POST | Resume. Needs a Satochip signature, or the `cosigner unfreeze` CLI if the Satochip is what you lost. |
 
-No web UI, by design. Everything is API.
+One screen of web UI, and only one: the first time it starts with no config, it serves a setup
+wizard on this same port instead of the API — collect the two external xpubs, generate the
+SERVER key on the box, write the config, hand back the descriptor to register in Bitcoin Keeper.
+Finishing it restarts the service into the API and the wizard is gone for good. It's a wizard
+*or* the API, never both, so an unconfigured process never holds a signing key.
+
+Everything after that is API.
 
 ---
 
