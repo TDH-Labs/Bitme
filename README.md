@@ -380,6 +380,8 @@ Finishing it restarts the service into the API and the wizard is gone for good. 
 
 Everything after that is API.
 
+[What the wizard looks like](docs/screenshots/) &middot; [how the SERVER key is generated](docs/KEY-GENERATION.md)
+
 ---
 
 ## Running it

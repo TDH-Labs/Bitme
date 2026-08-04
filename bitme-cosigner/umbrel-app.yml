@@ -36,9 +36,15 @@ support: https://github.com/TDH-Labs/Bitme/issues
 # inlined here. This URL requires the repo to stay public - if it goes private the icon 404s
 # and the app shows a blank tile, in which case host icon.svg somewhere public and update this.
 icon: https://raw.githubusercontent.com/TDH-Labs/Bitme/main/bitme-cosigner/icon.svg
-# No screenshots yet. The only UI is the first-run setup wizard, which is gone once setup is
-# done - a gallery of it would misrepresent what the app looks like in normal use.
-gallery: []
+# The first-run setup wizard - the only UI this app has, and it's gone once setup is done. Same
+# https-URL constraint as `icon` above: umbrelOS's CSP permits any host but not data: URIs, so
+# these are raw.githubusercontent links and the repo has to stay public for them to resolve.
+gallery:
+  - https://raw.githubusercontent.com/TDH-Labs/Bitme/main/docs/screenshots/01-welcome.png
+  - https://raw.githubusercontent.com/TDH-Labs/Bitme/main/docs/screenshots/02-satochip.png
+  - https://raw.githubusercontent.com/TDH-Labs/Bitme/main/docs/screenshots/05-serverkey-generated.png
+  - https://raw.githubusercontent.com/TDH-Labs/Bitme/main/docs/screenshots/06-limits.png
+  - https://raw.githubusercontent.com/TDH-Labs/Bitme/main/docs/screenshots/10-register-in-keeper.png
 releaseNotes: >-
   0.2.0: first-run setup now happens in the browser instead of by hand-writing wallet.toml over
   SSH - it collects the two external xpubs, generates the SERVER key on the box from the OS
