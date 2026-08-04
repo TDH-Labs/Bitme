@@ -1,11 +1,11 @@
 # Bitme Cosigner
 
-A self-hosted, policy-gated Bitcoin co-signing service. It holds one key in a 3-key wallet and
-countersigns transactions only when your rules allow — it can never spend alone, never starts a
-transaction, and never broadcasts one.
+Bitme Cosigner holds one key in a 3-key Bitcoin wallet, running on hardware you control. It only
+signs a transaction when your policy allows it. Root the box, and there still isn't a usable key
+sitting on it: two signatures move funds here, and the server only ever holds one of them.
 
-Think of it as the third signer in a 2-of-3 wallet, except it's *your* server, running *your*
-rules, and you can read every line of it.
+It's basically the third signer you'd have in an ordinary 2-of-3 wallet. Here, you're the one
+running it. You picked its rules, and the code behind it is sitting in this repo for you to read.
 
 > **Status: signet only.** The service refuses to run on mainnet unless you explicitly opt in,
 > and you shouldn't opt in until you've run the whole thing end to end. See
@@ -30,25 +30,26 @@ rules, and you can read every line of it.
 
 ## The idea
 
-A single-key wallet has an obvious problem: one compromised device, one lost phone, one bad
-moment, and the money is gone. Multisig fixes that but introduces a new one — now you're
-juggling several keys and there's still nothing watching *what* gets signed.
+A single-key wallet has one big flaw. Lose the device, or just fat-finger something at 2am, and
+the coins go with it. Multisig gets rid of that single point of failure. Now you're juggling
+several keys, and none of them are watching what gets signed before it ships.
 
-Bitme adds a third signer that is a **policy engine**: it knows your spending limits, it tells
-you out loud before it signs anything, and it gives you a window to say no. Because that signer
-is a key in the wallet rather than an app in front of it, its rules can't be clicked past.
+Bitme's third signer is a policy engine loaded with your spending limits. It pages you before it
+signs anything you didn't pre-approve. You also get a window to kill the signature before it
+goes out, if something looks wrong. That signer is baked into the wallet itself, as a real key,
+so its checks aren't something a compromised app could route around.
 
-Three properties hold no matter what:
+A few things hold regardless of what happens to the server:
 
-1. **The server can never spend on its own.** Not with a bug, not if it's rooted, not ever. It's
-   one key of the two required.
-2. **If the server disappears forever, your money doesn't.** There are two recovery paths that
-   don't involve it at all.
-3. **The server can't initiate anything.** It only ever adds a signature to a transaction
-   someone else built.
+1. **It can't spend on its own, full stop.** Even fully rooted, it's still just one of the two
+   keys a spend needs.
+2. **Lose the server for good and your coins are untouched.** Two other paths reach them, and
+   neither needs it.
+3. **Starting a transaction isn't something it can do.** Someone else builds one first. This
+   thing only ever signs what's already sitting there.
 
-These are enforced by Bitcoin consensus, not by this code being correct. There are
-[machine-checked proofs](bitme-cosigner/src/invariants.rs) of each one, run on every build.
+Bitcoin's consensus rules enforce all three. Each one also has a
+[machine-checked proof](bitme-cosigner/src/invariants.rs) in the code, run on every build.
 
 ---
 
