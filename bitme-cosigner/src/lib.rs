@@ -15,6 +15,7 @@ pub mod recovery_kit;
 pub mod setup;
 pub mod sign;
 pub mod signing;
+pub mod status_page;
 pub mod wizard;
 
 #[cfg(test)]
