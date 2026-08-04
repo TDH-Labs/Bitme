@@ -646,7 +646,17 @@ function done() {
           <code>${esc(r.server_fingerprint)}</code>, is this server.</li>
       <li>Confirm the first receive address matches: <code>${esc(r.first_address)}</code></li>
     </ol>
-    ${r.descriptor_qr_svg ? `<div class="qr">${r.descriptor_qr_svg}</div>` : ""}
+    <div class="tabs">
+      <button type="button" class="tab on" data-f="descriptor">Combined</button>
+      <button type="button" class="tab" data-f="receive_descriptor">Receive only</button>
+      <button type="button" class="tab" data-f="change_descriptor">Change only</button>
+    </div>
+    <div class="note" id="fmtnote"><b>Start with Combined.</b> It carries receive and change in
+    one descriptor using <code>&lt;0;1&gt;</code> (BIP389). If your wallet says the data doesn't
+    match a supported format, it likely can't read multipath — switch to <b>Receive only</b>, and
+    import <b>Change only</b> as well if it asks for a second descriptor. All three describe the
+    same wallet.</div>
+    <div class="qr" id="qrbox"></div>
     <pre id="desc">${esc(r.descriptor)}</pre>
     <div class="actions" style="margin-top:12px">
       <button class="ghost" id="copy">Copy descriptor</button>
@@ -659,9 +669,19 @@ function done() {
       <div class="spacer"></div><button id="start">Start the cosigner</button>
     </div>
   </div>`);
+  const QRS = { descriptor: r.descriptor_qr_svg, receive_descriptor: r.receive_qr_svg,
+                change_descriptor: r.change_qr_svg };
+  let fmt = "descriptor";
+  const showFmt = () => {
+    c.querySelector("#desc").textContent = r[fmt];
+    c.querySelector("#qrbox").innerHTML = QRS[fmt] || "";
+    c.querySelectorAll(".tab").forEach(t => t.classList.toggle("on", t.dataset.f === fmt));
+  };
+  c.querySelectorAll(".tab").forEach(t => t.onclick = () => { fmt = t.dataset.f; showFmt(); });
+  showFmt();
   c.querySelector("#copy").onclick = async (ev) => {
     try {
-      await navigator.clipboard.writeText(r.descriptor);
+      await navigator.clipboard.writeText(r[fmt]);
       ev.target.textContent = "Copied";
       setTimeout(() => { ev.target.textContent = "Copy descriptor"; }, 1500);
     } catch (_) {
@@ -672,7 +692,10 @@ function done() {
     }
   };
   c.querySelector("#dl").onclick = () => {
-    const blob = new Blob([r.descriptor + "\n"], { type: "text/plain" });
+    const blob = new Blob([
+      "# combined (BIP389 multipath)\n" + r.descriptor +
+      "\n\n# receive only\n" + r.receive_descriptor +
+      "\n\n# change only\n" + r.change_descriptor + "\n"], { type: "text/plain" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = "bitme-cosigner-descriptor.txt";
