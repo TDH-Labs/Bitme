@@ -27,11 +27,17 @@ RUN touch src/main.rs src/lib.rs \
 ### Runtime stage ###############################################################################
 FROM debian:bookworm-slim
 
+# The runtime user is uid/gid 1000 deliberately, not a floating --system id. Umbrel chowns app
+# data to 1000:1000 and its own apps run as '1000:1000'. With a --system uid (999 in practice)
+# this container cannot write /data/generated.toml - which docker-entrypoint.sh regenerates on
+# EVERY start - so it exits with "Permission denied" the moment a valid wallet.toml exists.
+# That stayed invisible for a long time because the missing-config check fires first, masking it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --create-home --home-dir /data --shell /usr/sbin/nologin cosigner \
+    && useradd --create-home --home-dir /data --uid 1000 --user-group \
+        --shell /usr/sbin/nologin cosigner \
     && mkdir -p /data/config \
     && chown -R cosigner:cosigner /data
 
