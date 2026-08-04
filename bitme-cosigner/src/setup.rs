@@ -107,8 +107,11 @@ pub fn router(state: Arc<SetupState>) -> Router {
         .route("/api/state", get(state_handler))
         .route("/api/validate-key", post(validate_key_handler))
         .route("/api/server-key", post(server_key_handler))
+        .route("/api/decode-qr", post(decode_qr_handler))
         .route("/api/finish", post(finish_handler))
         .route("/api/start", post(start_handler))
+        // Axum's default request body cap is 2 MB; a phone photo of a QR is routinely larger.
+        .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -223,6 +226,14 @@ struct ServerKeyResponse {
     master_fingerprint: String,
     derivation_path: String,
     xpub: String,
+    /// `[fingerprint/path]xpub` - what another wallet needs to register this as a co-signer.
+    key_expression: String,
+    /// The same key expression as a scannable QR, for adding this key to a phone wallet without
+    /// retyping it.
+    key_expression_qr_svg: Option<String>,
+    /// Coldcard's generic export shape, which a lot of wallets accept as a key-import file even
+    /// when they don't parse a raw key expression. Offered as a fallback, not a preference.
+    import_json: String,
 }
 
 /// Generates the SERVER key on the box, from the operating system's CSPRNG.
@@ -245,7 +256,23 @@ async fn server_key_handler(
     let generated = generate_server_key(network, &path_str)
         .map_err(|e| SetupError::internal(format!("generating the SERVER key failed: {e}")))?;
 
+    let expr = key_expression(
+        &generated.master_fingerprint,
+        &generated.derivation_path,
+        &generated.xpub,
+    );
     let response = ServerKeyResponse {
+        key_expression_qr_svg: qr_svg(&expr),
+        import_json: serde_json::json!({
+            "xfp": generated.master_fingerprint.to_uppercase(),
+            "p2wsh": {
+                "xpub": generated.xpub,
+                "deriv": format!("m/{}", generated.derivation_path.replace('h', "'")),
+                "_pub": generated.xpub,
+            },
+        })
+        .to_string(),
+        key_expression: expr,
         master_fingerprint: generated.master_fingerprint.clone(),
         derivation_path: generated.derivation_path.clone(),
         xpub: generated.xpub.clone(),
@@ -314,14 +341,17 @@ struct FinishResponse {
     descriptor_qr_svg: Option<String>,
 }
 
-fn descriptor_qr(descriptor: &str) -> Option<String> {
+/// Renders `data` as an inline SVG QR, or `None` if it's too long to encode. Callers always
+/// show the same payload as selectable text too, so a missing QR degrades to "type it" rather
+/// than blocking anything.
+fn qr_svg(data: &str) -> Option<String> {
     use qrcode::render::svg;
     use qrcode::{EcLevel, QrCode};
 
     // Low EC deliberately: these are long strings, the screen showing them is inches away from
     // the camera, and a failed scan is retried for free - whereas overflowing the version cap
     // means no QR at all.
-    QrCode::with_error_correction_level(descriptor.as_bytes(), EcLevel::L)
+    QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L)
         .ok()
         .map(|code| {
             code.render()
@@ -330,6 +360,18 @@ fn descriptor_qr(descriptor: &str) -> Option<String> {
                 .light_color(svg::Color("#ffffff"))
                 .build()
         })
+}
+
+/// A descriptor key expression: `[fingerprint/derivation]xpub`. This is the standard way to
+/// hand a co-signer key to another wallet - a bare xpub loses the key origin, and without it a
+/// coordinator cannot build a PSBT this service will recognise as its own.
+fn key_expression(fingerprint: &str, derivation_path: &str, xpub: &str) -> String {
+    let path = derivation_path.trim().trim_start_matches(['m', 'M']).trim_start_matches('/');
+    if path.is_empty() {
+        format!("[{}]{}", fingerprint.trim().to_lowercase(), xpub.trim())
+    } else {
+        format!("[{}/{}]{}", fingerprint.trim().to_lowercase(), path, xpub.trim())
+    }
 }
 
 /// Writes the config. This is the only handler that touches disk, and it is all-or-nothing:
@@ -420,7 +462,7 @@ async fn finish_handler(
 
     let multipath = built.multipath.to_string();
     let response = FinishResponse {
-        descriptor_qr_svg: descriptor_qr(&multipath),
+        descriptor_qr_svg: qr_svg(&multipath),
         descriptor: multipath,
         receive_descriptor: built.external.to_string(),
         change_descriptor: built.internal.to_string(),
@@ -516,6 +558,150 @@ fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     f.sync_all()
         .with_context(|| format!("flushing {} to disk", path.display()))?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct DecodeQrResponse {
+    /// Every distinct payload found in the image, in the order the decoder returned them.
+    payloads: Vec<String>,
+    /// Best-effort interpretation of the first payload as a key, so the UI can fill all three
+    /// fields from one scan instead of making the operator split it up by hand.
+    key: Option<ScannedKey>,
+}
+
+#[derive(Serialize)]
+struct ScannedKey {
+    fingerprint: Option<String>,
+    derivation_path: Option<String>,
+    xpub: String,
+}
+
+/// Decodes a QR from an uploaded image.
+///
+/// This exists because the browser can't do it here. Both `getUserMedia` (camera) and
+/// `BarcodeDetector` require a secure context, and this app is served over plain HTTP on a LAN
+/// hostname, so live camera scanning is unavailable in every mainstream browser. Photographing
+/// the QR with the phone's normal camera app and uploading the picture works regardless of
+/// browser, transport, or platform - and it's the difference between scanning a 111-character
+/// xpub and retyping it.
+async fn decode_qr_handler(body: axum::body::Bytes) -> Result<Json<DecodeQrResponse>, SetupError> {
+    // Generous but bounded: modern phone photos are a few MB, and decoding is CPU-bound on a
+    // box that may be busy.
+    const MAX_IMAGE_BYTES: usize = 12 * 1024 * 1024;
+    if body.is_empty() {
+        return Err(SetupError::bad_request("no image was uploaded"));
+    }
+    if body.len() > MAX_IMAGE_BYTES {
+        return Err(SetupError::bad_request(
+            "that image is larger than 12 MB - try a screenshot, or a lower-resolution photo",
+        ));
+    }
+
+    let payloads = tokio::task::spawn_blocking(move || decode_qr_bytes(&body))
+        .await
+        .map_err(|e| SetupError::internal(format!("decoding panicked: {e}")))?
+        .map_err(|e| SetupError::bad_request(format!("{e}")))?;
+
+    if payloads.is_empty() {
+        return Err(SetupError::bad_request(
+            "no QR code found in that image - make sure the whole code is in frame and in focus",
+        ));
+    }
+    let key = payloads.first().and_then(|p| parse_scanned_key(p));
+    Ok(Json(DecodeQrResponse { payloads, key }))
+}
+
+fn decode_qr_bytes(bytes: &[u8]) -> Result<Vec<String>> {
+    let img = image::load_from_memory(bytes)
+        .context("that file doesn't look like a PNG, JPEG or WebP image")?
+        .to_luma8();
+    let mut prepared = rqrr::PreparedImage::prepare(img);
+    let mut out = Vec::new();
+    for grid in prepared.detect_grids() {
+        if let Ok((_meta, content)) = grid.decode() {
+            if !content.is_empty() && !out.contains(&content) {
+                out.push(content);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Pulls a key out of whatever a wallet happened to put in its QR. Handles the three shapes
+/// seen in practice: a descriptor key expression with origin, a bare xpub, and a JSON export
+/// (Coldcard's shape and the variations on it). Returns `None` rather than guessing wildly -
+/// the operator can always fall back to typing, and a wrong auto-fill is worse than none.
+fn parse_scanned_key(payload: &str) -> Option<ScannedKey> {
+    let s = payload.trim();
+
+    // 1. `[fingerprint/derivation]xpub...` - possibly with a trailing `/<0;1>/*` from a full
+    //    descriptor fragment, which is not part of the account xpub.
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((origin, tail)) = rest.split_once(']') {
+            let (fp, path) = match origin.split_once('/') {
+                Some((fp, path)) => (fp, Some(path.to_string())),
+                None => (origin, None),
+            };
+            let xpub = tail.split('/').next().unwrap_or(tail).trim().to_string();
+            if !xpub.is_empty() {
+                return Some(ScannedKey {
+                    fingerprint: Some(fp.trim().to_lowercase()),
+                    derivation_path: path,
+                    xpub,
+                });
+            }
+        }
+    }
+
+    // 2. A JSON export. Look for an xpub and an origin wherever they happen to live, rather
+    //    than committing to one vendor's exact schema.
+    if s.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+            let fp = ["xfp", "master_fingerprint", "fingerprint"]
+                .iter()
+                .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+                .map(|f| f.trim().to_lowercase());
+            // Prefer the P2WSH-multisig account, which is what this wallet uses.
+            let section = ["p2wsh", "bip48_2", "p2wsh_multisig"]
+                .iter()
+                .find_map(|k| v.get(*k))
+                .unwrap_or(&v);
+            let xpub = ["xpub", "_pub", "Zpub", "zpub"]
+                .iter()
+                .find_map(|k| section.get(*k).and_then(|x| x.as_str()))?;
+            let deriv = ["deriv", "derivation", "path", "derivation_path"]
+                .iter()
+                .find_map(|k| section.get(*k).and_then(|x| x.as_str()))
+                .map(|d| {
+                    d.trim()
+                        .trim_start_matches(['m', 'M'])
+                        .trim_start_matches('/')
+                        .to_string()
+                });
+            return Some(ScannedKey {
+                fingerprint: fp,
+                derivation_path: deriv,
+                xpub: xpub.trim().to_string(),
+            });
+        }
+    }
+
+    // 3. A bare extended key, with nothing else in the payload.
+    let bare = s.split_whitespace().next().unwrap_or(s);
+    if bare.len() > 100
+        && bare.chars().all(|c| c.is_ascii_alphanumeric())
+        && ["xpub", "tpub", "ypub", "zpub", "Vpub", "Zpub", "upub", "vpub"]
+            .iter()
+            .any(|p| bare.starts_with(p))
+    {
+        return Some(ScannedKey {
+            fingerprint: None,
+            derivation_path: None,
+            xpub: bare.to_string(),
+        });
+    }
+
+    None
 }
 
 /// Shuts the setup server down so the container restarts into `cosigner serve`.

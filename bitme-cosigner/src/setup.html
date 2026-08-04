@@ -87,6 +87,11 @@
   .qr { text-align: center; margin: 18px 0; }
   .qr svg { width: 240px; height: 240px; background: #fff; padding: 10px; border-radius: 8px; }
   .hidden { display: none; }
+  .scanrow {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 12px; border: 1px dashed var(--line); border-radius: 8px; margin-bottom: 4px;
+  }
+  .scanhint { flex: 1 1 260px; color: var(--muted); font-size: 12.5px; }
   .ok { color: var(--ok); font-size: 13px; margin-top: 6px; }
   footer { color: var(--muted); font-size: 12.5px; text-align: center; margin-top: 28px; }
 </style>
@@ -214,6 +219,15 @@ function keyStep(role) {
       <h2>${copy.title}</h2>
       <p>${copy.lede}</p>
       ${copy.guide}
+      <div class="scanrow">
+        <button class="ghost" id="scan">Scan a QR photo</button>
+        <span class="scanhint">Photograph the QR your app shows, then upload it here — beats
+        retyping a 111-character xpub. Your browser's camera can't be used directly: it's
+        blocked on plain-HTTP pages like this one.</span>
+        <input type="file" id="scanfile" accept="image/*" capture="environment" hidden>
+      </div>
+      <div class="err" id="se"></div>
+      <div class="ok" id="sok" style="display:none"></div>
       <label>Master fingerprint
         <span class="hint">Exactly 8 hex characters, e.g. <code>1a2b3c4d</code>. This identifies the
         device, not the account.</span></label>
@@ -231,6 +245,46 @@ function keyStep(role) {
       </div>
     </div>`);
     c.querySelectorAll("#p").forEach(n => n.textContent = S.defaultPath);
+
+    // Scanning happens by uploading a photo rather than opening the camera: getUserMedia and
+    // BarcodeDetector both require a secure context, and this page is plain HTTP on a LAN
+    // hostname. The file input's `capture` attribute still opens the camera directly on mobile,
+    // so on a phone this is one tap, not a detour through the photo library.
+    const scanErr = c.querySelector("#se"), scanOk = c.querySelector("#sok");
+    const fileInput = c.querySelector("#scanfile");
+    c.querySelector("#scan").onclick = () => fileInput.click();
+    fileInput.onchange = async () => {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      scanErr.classList.remove("show"); scanOk.style.display = "none";
+      const btn = c.querySelector("#scan");
+      btn.disabled = true; btn.textContent = "Reading…";
+      try {
+        const r = await fetch("/api/decode-qr", { method: "POST", body: f });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+        if (!data.key) {
+          throw new Error("Read the QR, but it doesn't look like an extended key: “" +
+            (data.payloads[0] || "").slice(0, 60) + "…”");
+        }
+        if (data.key.fingerprint) c.querySelector("#fp").value = data.key.fingerprint;
+        if (data.key.derivation_path) c.querySelector("#path").value = data.key.derivation_path;
+        c.querySelector("#xpub").value = data.key.xpub;
+        const missing = [];
+        if (!data.key.fingerprint) missing.push("fingerprint");
+        if (!data.key.derivation_path) missing.push("derivation path");
+        scanOk.textContent = missing.length
+          ? "Scanned the xpub. That QR didn't carry the " + missing.join(" or ") + " — fill that in below."
+          : "Scanned. Check the values below match what your app is showing, then continue.";
+        scanOk.style.display = "block";
+      } catch (e) {
+        scanErr.textContent = e.message; scanErr.classList.add("show");
+      } finally {
+        btn.disabled = false; btn.textContent = "Scan a QR photo";
+        fileInput.value = "";
+      }
+    };
+
     c.querySelector("#b").onclick = back;
     c.querySelector("#n").onclick = async (ev) => {
       const btn = ev.target, err = c.querySelector("#e");
@@ -267,6 +321,28 @@ function serverKey() {
       <div class="kv"><span>Derivation path</span><span id="opath">${g ? esc(g.derivation_path) : ""}</span></div>
       <div class="kv"><span>Account xpub</span><span id="oxpub">${g ? esc(g.xpub) : ""}</span></div>
       <div class="ok">Key generated. It is held in memory only until you finish setup.</div>
+
+      <h3 style="font-size:15px;margin:22px 0 6px">Add this key to Bitcoin Keeper</h3>
+      <p style="margin-bottom:14px">Keeper needs this key before it can build the wallet with you.
+      Add it as a key it doesn't hold itself:</p>
+      <ol class="guide">
+        <li>In Keeper, add a key and choose <b>External Key</b> if that's offered — it's the option
+            meant for a key from another source. If your version doesn't list it, use
+            <b>Other signer</b>.</li>
+        <li>Do <b>not</b> pick <b>Server Key</b>. That's Keeper's own signer, hosted on their
+            servers — a different service from this one, and picking it would leave your Umbrel out
+            of the wallet entirely.</li>
+        <li>Scan the QR below, or paste the text.</li>
+      </ol>
+      ${g && g.key_expression_qr_svg ? `<div class="qr">${g.key_expression_qr_svg}</div>` : ""}
+      <pre id="kexpr">${g ? esc(g.key_expression) : ""}</pre>
+      <div class="actions" style="margin-top:12px">
+        <button class="ghost" id="copyk">Copy key</button>
+        <button class="ghost" id="dlk">Download as file</button>
+      </div>
+      <p style="font-size:13px;margin-top:12px">If Keeper rejects that format, the download gives
+      you the same key as a JSON file, which more apps accept for key import. This is a
+      <b>public</b> key either way — it can't spend anything on its own.</p>
     </div>
     <div class="err" id="e"></div>
     <div class="actions">
@@ -277,6 +353,27 @@ function serverKey() {
   </div>`);
   c.querySelector("#b").onclick = back;
   c.querySelector("#n").onclick = next;
+  if (g) {
+    c.querySelector("#copyk").onclick = async (ev) => {
+      try {
+        await navigator.clipboard.writeText(g.key_expression);
+        ev.target.textContent = "Copied";
+        setTimeout(() => { ev.target.textContent = "Copy key"; }, 1500);
+      } catch (_) {
+        const sel = window.getSelection(); const range = document.createRange();
+        range.selectNodeContents(c.querySelector("#kexpr")); sel.removeAllRanges(); sel.addRange(range);
+        ev.target.textContent = "Selected — press Ctrl/Cmd+C";
+      }
+    };
+    c.querySelector("#dlk").onclick = () => {
+      const blob = new Blob([g.import_json + "\n"], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "bitme-cosigner-key.json";
+      a.click();
+      URL.revokeObjectURL(a.href);
+    };
+  }
   c.querySelector("#gen").onclick = async (ev) => {
     const btn = ev.target, err = c.querySelector("#e");
     btn.disabled = true; btn.textContent = "Generating…"; err.classList.remove("show");

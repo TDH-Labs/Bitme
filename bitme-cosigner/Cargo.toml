@@ -27,6 +27,12 @@ nostr-sdk = { version = "0.44.1", features = ["nip59"] }
 # Renders the finished descriptor as a scannable QR on the setup UI's last screen, so it can
 # be carried to a phone without retyping ~300 characters. Pure Rust, no C, SVG output only.
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Decodes a QR from an uploaded photo/screenshot, server-side. The browser cannot help here:
+# getUserMedia (camera) and BarcodeDetector both require a secure context, and this app is
+# reached over plain http on a LAN hostname - so camera scanning is unavailable in practice.
+# Decoding an uploaded image works regardless of browser or transport. Both are pure Rust.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+rqrr = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 scrypt = "0.11"
 serde = { version = "1", features = ["derive"] }
