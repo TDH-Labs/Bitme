@@ -2,9 +2,9 @@
 # image to maintain), but wires bitcoind connection details from Umbrel's own `bitcoin` app
 # dependency instead of a hand-configured one - see umbrel-app.yml's `dependencies: [bitcoin]`
 # and docs/UMBREL.md for the full picture, including why key material is provided as a mounted
-# file here instead of an environment variable (Umbrel has no per-app secret-entry UI).
+# file here instead of an environment variable.
 #
-# Two Umbrel-specific gotchas below, both verified against a real device:
+# Three Umbrel-specific gotchas below, all verified against a real device:
 #
 # 1. The build context must be the ABSOLUTE ${APP_DATA_DIR}, not "." or "..". Umbrel invokes
 #    `docker compose` with several --file fragments of its own and no --project-directory, so
@@ -14,23 +14,45 @@
 #    rsyncs this whole folder to ${APP_DATA_DIR}, so the Dockerfile and the Rust project are
 #    all there at build time.
 #
-# 2. ${APP_PORT} is NOT a variable Umbrel exports to an app's own compose file - it only exists
-#    as a pass-through inside Umbrel's app_proxy fragment, which this app deliberately doesn't
-#    use (no web UI - see docs/UMBREL.md). Using it leaves the host port blank and Docker
-#    publishes on a random port instead of 8080. ${APP_PROXY_PORT} is the one Umbrel actually
-#    exports, and it's read straight from `port:` in umbrel-app.yml, so the manifest stays the
-#    single source of truth for the published port.
+# 2. This app MUST declare an `app_proxy` service, even though it once didn't need one. Umbrel
+#    starts a `tor_server` sidecar for every app unconditionally, and builds its torrc from
+#    HS_PORTS=80:app_proxy_<id>:8080. Tor resolves hostnames at CONFIG-PARSE time, so if no
+#    container answers to `app_proxy_bitme-cosigner` the sidecar dies with "Unparseable address
+#    in hidden service port configuration" and restart-loops forever. Declaring app_proxy is
+#    what makes that name resolve. umbreld supplies the image, ports and auth wiring from its
+#    own fragment (docker-compose.app_proxy.yml); an app only overrides APP_HOST/APP_PORT.
+#
+# 3. ${APP_PORT} is NOT a variable Umbrel exports to an app's own compose file - it only exists
+#    as a pass-through inside Umbrel's app_proxy fragment. Using it as a published port leaves
+#    the host side blank and Docker picks a random port. ${APP_PROXY_PORT} is the one Umbrel
+#    actually exports, and it's read straight from `port:` in umbrel-app.yml, so the manifest
+#    stays the single source of truth. Note the `app` service no longer publishes a host port
+#    at all: app_proxy is the only door, so that Umbrel's session auth can't be walked around
+#    by hitting the container's port directly.
 services:
+  app_proxy:
+    environment:
+      APP_HOST: bitme-cosigner_app_1
+      APP_PORT: 8080
+      # PROXY_AUTH_ADD is deliberately left at umbreld's default of 'true'. Unlike Immich or
+      # Vaultwarden - which set it 'false' because they ship their own login - this service has
+      # no authentication of its own (see the threat-model table in README.md: "HTTP itself has
+      # no built-in auth"). Umbrel's session auth is therefore the only thing standing between
+      # a device on your LAN and an endpoint that burns spending limits. Leave it on.
+    container_name: bitme-cosigner_app_proxy_1
   app:
     build:
       context: ${APP_DATA_DIR}
     restart: unless-stopped
     stop_grace_period: 1m
-    ports:
-      - "${APP_PROXY_PORT}:8080"
+    # Required, and must match app_proxy's APP_HOST above. Without it Compose derives the name
+    # from the project and service ("bitme-cosigner-app-1"), which app_proxy cannot resolve.
+    container_name: bitme-cosigner_app_1
     volumes:
       - ${APP_DATA_DIR}/data:/data
-      - ${APP_DATA_DIR}/config:/data/config:ro
+      # Writable, not :ro - the web setup UI writes wallet.toml and server.xprv here on first
+      # run. Nothing rewrites them afterwards; the runtime only reads.
+      - ${APP_DATA_DIR}/config:/data/config
     environment:
       COSIGNER_HTTP_PORT: "8080"
       BITCOIND_RPC_URL: "http://${APP_BITCOIN_NODE_IP}:${APP_BITCOIN_RPC_PORT}"
