@@ -315,6 +315,21 @@ struct FinishRequest {
     recovery_hold_seconds: i64,
     #[serde(default)]
     ntfy_url: Option<String>,
+    /// Alternative to ntfy. The config has always supported both; only the browser wizard was
+    /// ntfy-only, which forced anyone unwilling to use a third-party push service to give up
+    /// on the wizard entirely.
+    #[serde(default)]
+    smtp: Option<SmtpRequest>,
+}
+
+#[derive(Deserialize)]
+struct SmtpRequest {
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    from: String,
+    to: String,
 }
 
 #[derive(Deserialize)]
@@ -421,15 +436,19 @@ async fn finish_handler(
     // `WalletConfig::validate` enforces this too, but only after the whole form has been
     // filled in. Rejecting it here, with the reason, beats a late failure on a field the UI
     // could plausibly have presented as optional.
-    if req
+    let has_ntfy = req
         .ntfy_url
         .as_ref()
-        .map(|s| s.trim().is_empty())
-        .unwrap_or(true)
-    {
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_smtp = req
+        .smtp
+        .as_ref()
+        .is_some_and(|s| !s.host.trim().is_empty() && !s.to.trim().is_empty());
+    if !has_ntfy && !has_smtp {
         return Err(SetupError::bad_request(
-            "a notification URL is required - a hold window with no notification channel would \
-             wait silently and then sign, with nobody in a position to veto it",
+            "a notification channel is required - either an ntfy URL or SMTP email. A hold \
+             window with no notification channel would wait silently and then sign, with nobody \
+             in a position to veto it",
         ));
     }
     // Two distinct keys are the whole point of a multisig; identical xpubs would compile into a
@@ -549,7 +568,14 @@ fn build_answers(
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string()),
             ntfy_auth_token: None,
-            smtp: None,
+            smtp: req.smtp.as_ref().map(|s| crate::wizard::SmtpAnswer {
+                host: s.host.trim().to_string(),
+                port: s.port,
+                username: s.username.trim().to_string(),
+                password: s.password.clone(),
+                from: s.from.trim().to_string(),
+                to: s.to.trim().to_string(),
+            }),
         },
         recovery_hold_seconds: req.recovery_hold_seconds,
         recovery_destination_whitelist: None,
@@ -893,6 +919,7 @@ mod tests {
             hold_seconds: 3600,
             recovery_hold_seconds: 86400,
             ntfy_url: Some("https://ntfy.sh/bitme-test-topic".to_string()),
+            smtp: None,
         };
 
         let answers = build_answers(

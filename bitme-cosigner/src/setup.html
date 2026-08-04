@@ -92,6 +92,12 @@
     padding: 12px; border: 1px dashed var(--line); border-radius: 8px; margin-bottom: 4px;
   }
   .scanhint { flex: 1 1 260px; color: var(--muted); font-size: 12.5px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .tab {
+    flex: 1; background: transparent; color: var(--muted); border-color: var(--line);
+    font-weight: 600; padding: 8px 12px;
+  }
+  .tab.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
   .ok { color: var(--ok); font-size: 13px; margin-top: 6px; }
   footer { color: var(--muted); font-size: 12.5px; text-align: center; margin-top: 28px; }
 </style>
@@ -124,6 +130,8 @@ const S = {
   hold_seconds: 3600,
   recovery_hold_seconds: 86400,
   ntfy_url: "",
+  notify_kind: "ntfy",
+  smtp: { host: "", port: 587, username: "", password: "", from: "", to: "" },
   result: null,
 };
 
@@ -472,20 +480,67 @@ function holdStep() {
     <div class="note">The recovery path exists so a lost Satochip doesn't lock you out — but it also
     means a stolen phone plus this box could spend. <b>The recovery hold is the main thing standing
     in the way of that</b>, so keep it long enough that you would notice and veto.</div>
-    <label>Notification URL <span class="hint">Required. An
-      <a href="https://ntfy.sh" target="_blank" rel="noreferrer noopener">ntfy</a> topic URL gets a push
-      on your phone the moment a signature is requested. Pick a long, unguessable topic name —
-      anyone who knows it can read your notifications.</span></label>
-    <input class="mono" id="ntfy" placeholder="https://ntfy.sh/your-private-topic" value="${esc(S.ntfy_url)}" autocapitalize="off" spellcheck="false">
-    <div class="note">There is deliberately no way to skip this. The hold window is only
-    protective if you find out a signature was requested — without a notification channel this
-    service would wait quietly and then sign, with nobody in a position to veto.</div>
+    <h3 style="font-size:15px;margin:22px 0 6px">How you get told</h3>
+    <p style="margin-bottom:12px">Required — pick one. The hold window is only protective if you
+    find out a signature was requested.</p>
+    <div class="tabs">
+      <button type="button" class="tab ${S.notify_kind === "ntfy" ? "on" : ""}" data-k="ntfy">Push (ntfy)</button>
+      <button type="button" class="tab ${S.notify_kind === "smtp" ? "on" : ""}" data-k="smtp">Email (SMTP)</button>
+    </div>
+
+    <div id="pane-ntfy" class="${S.notify_kind === "ntfy" ? "" : "hidden"}">
+      <div class="note"><b>You do not need ntfy's hosted service.</b> ntfy is in Umbrel's own app
+      store — install it and point this at your own instance, e.g.
+      <code>http://&lt;your-umbrel-ip&gt;:13119/some-long-random-topic</code>. Nothing leaves your
+      box and there's nothing to pay.
+      <br><br>One caveat if you want alerts on an iPhone or iPad: Apple only wakes apps for pushes
+      from a publicly reachable server, so Umbrel's ntfy app uses ntfy.sh as a <i>poll prompt</i> by
+      default — it nudges your device to fetch the notification from your own instance, rather than
+      carrying its contents. Android and desktop don't need this at all.</div>
+      <label>ntfy topic URL
+        <span class="hint">The topic name is effectively a password — make it long and random.
+        Anyone who knows it can read your notifications.</span></label>
+      <input class="mono" id="ntfy" placeholder="http://10.0.0.108:13119/a-long-random-topic-name" value="${esc(S.ntfy_url)}" autocapitalize="off" spellcheck="false">
+    </div>
+
+    <div id="pane-smtp" class="${S.notify_kind === "smtp" ? "" : "hidden"}">
+      <div class="note">Email instead of push. Uses whatever SMTP server you already have — your
+      own mail server, or a provider you already trust. No new third party unless you choose one.</div>
+      <div class="row">
+        <div><label>SMTP host</label>
+          <input class="mono" id="sm_host" placeholder="smtp.example.com" value="${esc(S.smtp.host)}" autocapitalize="off" spellcheck="false"></div>
+        <div><label>Port</label>
+          <input class="mono" id="sm_port" inputmode="numeric" value="${esc(S.smtp.port)}"></div>
+      </div>
+      <div class="row">
+        <div><label>Username</label>
+          <input class="mono" id="sm_user" value="${esc(S.smtp.username)}" autocapitalize="off" spellcheck="false"></div>
+        <div><label>Password</label>
+          <input class="mono" id="sm_pass" type="password" value="${esc(S.smtp.password)}"></div>
+      </div>
+      <div class="row">
+        <div><label>From</label>
+          <input class="mono" id="sm_from" placeholder="cosigner@example.com" value="${esc(S.smtp.from)}" autocapitalize="off" spellcheck="false"></div>
+        <div><label>To</label>
+          <input class="mono" id="sm_to" placeholder="you@example.com" value="${esc(S.smtp.to)}" autocapitalize="off" spellcheck="false"></div>
+      </div>
+      <p style="font-size:12.5px;color:var(--muted);margin-top:10px">This password is stored in
+      <code>wallet.toml</code> on your Umbrel, mode 0600. Use an app-specific password if your
+      provider supports one.</p>
+    </div>
     <div class="err" id="e"></div>
     <div class="actions">
       <button class="ghost" id="b">Back</button><div class="spacer"></div>
       <button id="n">Continue</button>
     </div>
   </div>`);
+  c.querySelectorAll(".tab").forEach(t => t.onclick = () => {
+    S.notify_kind = t.dataset.k;
+    c.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x.dataset.k === S.notify_kind));
+    c.querySelector("#pane-ntfy").classList.toggle("hidden", S.notify_kind !== "ntfy");
+    c.querySelector("#pane-smtp").classList.toggle("hidden", S.notify_kind !== "smtp");
+    c.querySelector("#e").classList.remove("show");
+  });
   c.querySelector("#b").onclick = back;
   c.querySelector("#n").onclick = () => {
     const err = c.querySelector("#e");
@@ -494,16 +549,34 @@ function holdStep() {
       err.textContent = "Both holds must be whole numbers of seconds (0 or more).";
       err.classList.add("show"); return;
     }
-    const u = c.querySelector("#ntfy").value.trim();
-    if (!u) {
-      err.textContent = "A notification URL is required — the hold window only protects you if you find out a signature was requested.";
-      err.classList.add("show"); return;
+    if (S.notify_kind === "ntfy") {
+      const u = c.querySelector("#ntfy").value.trim();
+      if (!u) {
+        err.textContent = "An ntfy topic URL is required — or switch to Email above.";
+        err.classList.add("show"); return;
+      }
+      if (!/^https?:\/\//i.test(u)) {
+        err.textContent = "The ntfy URL must start with http:// or https://.";
+        err.classList.add("show"); return;
+      }
+      S.ntfy_url = u; S.smtp.host = "";
+    } else {
+      const g = (id) => c.querySelector(id).value.trim();
+      const sm = { host: g("#sm_host"), port: Number(c.querySelector("#sm_port").value),
+                   username: g("#sm_user"), password: c.querySelector("#sm_pass").value,
+                   from: g("#sm_from"), to: g("#sm_to") };
+      const missing = ["host","username","password","from","to"].filter(k => !sm[k]);
+      if (missing.length) {
+        err.textContent = "Missing SMTP " + missing.join(", ") + ".";
+        err.classList.add("show"); return;
+      }
+      if (!Number.isInteger(sm.port) || sm.port < 1 || sm.port > 65535) {
+        err.textContent = "The SMTP port must be a whole number between 1 and 65535.";
+        err.classList.add("show"); return;
+      }
+      S.smtp = sm; S.ntfy_url = "";
     }
-    if (!/^https?:\/\//i.test(u)) {
-      err.textContent = "The notification URL must start with http:// or https://.";
-      err.classList.add("show"); return;
-    }
-    S.hold_seconds = h; S.recovery_hold_seconds = r; S.ntfy_url = u;
+    S.hold_seconds = h; S.recovery_hold_seconds = r;
     next();
   };
   return c;
@@ -528,7 +601,7 @@ function review() {
     ${kv("Maximum fee", sats(S.policy.max_fee_sat) + " sats @ " + S.policy.max_fee_rate_sat_per_vb + " sat/vB")}
     ${kv("Normal hold", S.hold_seconds + "s")}
     ${kv("Recovery hold", S.recovery_hold_seconds + "s")}
-    ${kv("Notifications", S.ntfy_url || "none")}
+    ${kv("Notifications", S.notify_kind === "ntfy" ? S.ntfy_url : ("email to " + S.smtp.to))}
     <div class="err" id="e"></div>
     <div class="actions">
       <button class="ghost" id="b">Back</button><div class="spacer"></div>
@@ -547,7 +620,8 @@ function review() {
         policy: S.policy,
         hold_seconds: S.hold_seconds,
         recovery_hold_seconds: S.recovery_hold_seconds,
-        ntfy_url: S.ntfy_url || null,
+        ntfy_url: S.notify_kind === "ntfy" ? S.ntfy_url : null,
+        smtp: S.notify_kind === "smtp" ? S.smtp : null,
       });
       next();
     } catch (e) {
