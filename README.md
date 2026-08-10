@@ -436,7 +436,7 @@ notification rather than pretending the delay is a wall.
 
 ## Current status
 
-Working and tested — 155 unit tests, plus integration tests against a real regtest node:
+Working and tested — 177 unit tests, plus integration tests against a real regtest node:
 
 - Descriptor construction with machine-checked invariant proofs
 - Transaction inspection with independent on-chain verification
@@ -468,10 +468,19 @@ Working and tested — 155 unit tests, plus integration tests against a real reg
   round-trip itself is env-gated and pending confirmation against real relays from a machine
   with network access to them, same as the recovery kit's relay publishing above.
 
+- **Browser-based first-run setup** — on first launch the app serves a setup wizard on its own
+  port instead of the API, so getting configured never requires SSH or hand-written TOML. It
+  generates the SERVER key on-box from the OS CSPRNG, validates the SATOCHIP and Bitcoin Keeper
+  keys field by field, and hands back the finished descriptor as text, a QR, and a Coldcard-style
+  JSON file. Once configured, `GET /` serves the same descriptor on demand (combined, receive-only,
+  and change-only encodings, since some coordinators reject BIP389 multipath), so losing the
+  wizard's one-time final screen doesn't mean losing the descriptor.
+
 Not done yet:
 
-- **Nothing has touched real hardware.** No Satochip, no Bitcoin Keeper, no mainnet. Signet
-  first, and not yet.
+- **Installed on real Umbrel hardware, on signet, with a real Bitcoin Core app behind it** — but
+  a full signing round trip through a real Satochip and Bitcoin Keeper hasn't been independently
+  confirmed end to end yet. That's the remaining gap before mainnet is worth even considering.
 
 ---
 
