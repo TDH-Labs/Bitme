@@ -106,7 +106,7 @@ impl ServerSigningKey {
 
 /// Derives the `<chain>/<index>` child of an account-level xprv - the same unhardened path
 /// the descriptor uses for every role's public key (`<0;1>/*`). `pub(crate)` so tests can
-/// derive a matching child for a *different* role (e.g. SATOCHIP) the same way, to build a
+/// derive a matching child for a *different* role (e.g. HARDWARE) the same way, to build a
 /// fully-satisfying witness alongside the SERVER signature this module produces.
 pub(crate) fn derive_child_xpriv(
     account_xpriv: &Xpriv,
@@ -331,21 +331,21 @@ mod tests {
             .verify_ecdsa(&msg, &server_sig.signature, &role_keys.server.inner)
             .expect("server signature must verify against the real sighash");
 
-        // Complete the witness with a matching SATOCHIP signature (we hold that test key too)
+        // Complete the witness with a matching HARDWARE signature (we hold that test key too)
         // and prove the *whole* HOT-path witness is satisfiable - not just that a signature
         // was attached, but that it's the correct one for this exact descriptor and input.
         let secp = Secp256k1::new();
-        let (_, satochip_account_xprv) = test_key_spec_with_xpriv(0x01);
-        let satochip_child =
-            derive_child_xpriv(&satochip_account_xprv, &secp, Chain::External, 0).unwrap();
-        let satochip_pubkey = bitcoin::PublicKey::new(satochip_child.private_key.public_key(&secp));
+        let (_, hardware_account_xprv) = test_key_spec_with_xpriv(0x01);
+        let hardware_child =
+            derive_child_xpriv(&hardware_account_xprv, &secp, Chain::External, 0).unwrap();
+        let hardware_pubkey = bitcoin::PublicKey::new(hardware_child.private_key.public_key(&secp));
         assert_eq!(
-            satochip_pubkey, role_keys.satochip,
-            "test fixture derived the wrong satochip key"
+            hardware_pubkey, role_keys.hardware,
+            "test fixture derived the wrong hardware key"
         );
-        let satochip_raw_sig = secp.sign_ecdsa(&msg, &satochip_child.private_key);
-        let satochip_sig = bitcoin::ecdsa::Signature {
-            signature: satochip_raw_sig,
+        let hardware_raw_sig = secp.sign_ecdsa(&msg, &hardware_child.private_key);
+        let hardware_sig = bitcoin::ecdsa::Signature {
+            signature: hardware_raw_sig,
             sighash_type,
         };
 
@@ -354,19 +354,19 @@ mod tests {
         // standalone signature-verification check), so look those up by role too.
         let definite = descriptor::at_index(&wallet.external, 0).unwrap();
         let definite_keys = descriptor::definite_keys(&definite);
-        let satochip_definite_key =
-            descriptor::find_role_key(&definite_keys, &cfg.keys.satochip.xpub).unwrap();
+        let hardware_definite_key =
+            descriptor::find_role_key(&definite_keys, &cfg.keys.hardware.xpub).unwrap();
         let server_definite_key =
             descriptor::find_role_key(&definite_keys, &cfg.keys.server.xpub).unwrap();
 
         let mut sigs = HashMap::new();
-        sigs.insert(satochip_definite_key, satochip_sig);
+        sigs.insert(hardware_definite_key, hardware_sig);
         sigs.insert(server_definite_key, server_sig);
         let satisfier = (sigs, Sequence::ZERO);
 
         definite
             .get_satisfaction(satisfier)
-            .expect("satochip + server signatures must satisfy the HOT path");
+            .expect("hardware + server signatures must satisfy the HOT path");
     }
 
     #[test]

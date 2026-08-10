@@ -23,7 +23,7 @@ use miniscript::policy::{Concrete, Liftable, Semantic};
 use miniscript::Descriptor;
 
 /// A key participating in the spending policy, with a human-readable role label
-/// ("satochip", "server", "mobile", or "key1"/"key2"/"key3" if roles are unknown).
+/// ("hardware", "server", "mobile", or "key1"/"key2"/"key3" if roles are unknown).
 #[derive(Clone)]
 pub struct LabeledKey {
     pub label: String,
@@ -178,7 +178,7 @@ mod tests {
     use crate::descriptor::{at_index, build_descriptor, policy_string, BuiltDescriptor};
     use crate::test_util::{test_signature, test_signer, test_wallet_config};
 
-    /// Labels a built descriptor's keys "satochip"/"server"/"mobile" by matching them back
+    /// Labels a built descriptor's keys "hardware"/"server"/"mobile" by matching them back
     /// against the config that produced them - mirrors what the CLI does, kept independent of
     /// `main.rs` so these tests exercise `verify_invariants` the same way production code does.
     fn labeled_keys(
@@ -192,7 +192,7 @@ mod tests {
             true
         });
         let roles = [
-            ("satochip", &cfg.keys.satochip.xpub),
+            ("hardware", &cfg.keys.hardware.xpub),
             ("server", &cfg.keys.server.xpub),
             ("mobile", &cfg.keys.mobile.xpub),
         ];
@@ -234,24 +234,24 @@ mod tests {
         assert!(report.timelock_boundary_holds, "{report:?}");
         assert!(report.all_invariants_hold());
 
-        let hot = pair(&report, "satochip", "server");
+        let hot = pair(&report, "hardware", "server");
         assert!(
             hot.spends_immediately,
-            "HOT path (satochip+server) must spend immediately"
+            "HOT path (hardware+server) must spend immediately"
         );
 
         // Recovery when THIS SERVICE is gone.
-        let no_server = pair(&report, "satochip", "mobile");
+        let no_server = pair(&report, "hardware", "mobile");
         assert!(
             !no_server.spends_immediately,
-            "satochip+mobile must not bypass the policy engine by spending immediately"
+            "hardware+mobile must not bypass the policy engine by spending immediately"
         );
         assert!(
             no_server.spends_after_timelock,
-            "satochip+mobile must spend after the timelock (server-loss recovery)"
+            "hardware+mobile must spend after the timelock (server-loss recovery)"
         );
 
-        // Recovery when the SATOCHIP is gone - the property the previous descriptor lacked,
+        // Recovery when the HARDWARE is gone - the property the previous descriptor lacked,
         // and the whole reason for the redesign.
         let no_hardware = pair(&report, "server", "mobile");
         assert!(
@@ -260,7 +260,7 @@ mod tests {
         );
         assert!(
             no_hardware.spends_after_timelock,
-            "server+mobile MUST spend after the timelock: losing the SATOCHIP must be survivable"
+            "server+mobile MUST spend after the timelock: losing the HARDWARE must be survivable"
         );
 
         assert!(
@@ -289,13 +289,13 @@ mod tests {
     // template `build_descriptor` uses, so the shape under test can't drift from production. ----
 
     fn concrete_descriptor(
-        satochip: PublicKey,
+        hardware: PublicKey,
         server: PublicKey,
         mobile: PublicKey,
         timelock: u16,
     ) -> Descriptor<PublicKey> {
         let s = policy_string(
-            &satochip.to_string(),
+            &hardware.to_string(),
             &server.to_string(),
             &mobile.to_string(),
             timelock,
@@ -304,31 +304,31 @@ mod tests {
     }
 
     #[test]
-    fn hot_path_witness_constructs_with_satochip_and_server_and_no_wait() {
-        let satochip = test_signer(0x11);
+    fn hot_path_witness_constructs_with_hardware_and_server_and_no_wait() {
+        let hardware = test_signer(0x11);
         let server = test_signer(0x12);
         let mobile = test_signer(0x13);
-        let desc = concrete_descriptor(satochip.public, server.public, mobile.public, 12960);
+        let desc = concrete_descriptor(hardware.public, server.public, mobile.public, 12960);
 
         let mut sigs = HashMap::new();
-        sigs.insert(satochip.public, test_signature(&satochip.secret));
+        sigs.insert(hardware.public, test_signature(&hardware.secret));
         sigs.insert(server.public, test_signature(&server.secret));
         let satisfier = (sigs, Sequence::ZERO);
 
         desc.get_satisfaction(satisfier)
-            .expect("satochip+server should satisfy the HOT path immediately");
+            .expect("hardware+server should satisfy the HOT path immediately");
     }
 
     #[test]
-    fn recovery_path_witness_requires_satochip_and_mobile_and_the_full_timelock() {
-        let satochip = test_signer(0x21);
+    fn recovery_path_witness_requires_hardware_and_mobile_and_the_full_timelock() {
+        let hardware = test_signer(0x21);
         let server = test_signer(0x22);
         let mobile = test_signer(0x23);
         let timelock = 12960u16;
-        let desc = concrete_descriptor(satochip.public, server.public, mobile.public, timelock);
+        let desc = concrete_descriptor(hardware.public, server.public, mobile.public, timelock);
 
         let mut sigs = HashMap::new();
-        sigs.insert(satochip.public, test_signature(&satochip.secret));
+        sigs.insert(hardware.public, test_signature(&hardware.secret));
         sigs.insert(mobile.public, test_signature(&mobile.secret));
 
         let one_block_early = (sigs.clone(), Sequence::from_height(timelock - 1));
@@ -342,13 +342,13 @@ mod tests {
 
     #[test]
     fn no_single_key_witness_constructs_even_after_unlimited_time() {
-        let satochip = test_signer(0x31);
+        let hardware = test_signer(0x31);
         let server = test_signer(0x32);
         let mobile = test_signer(0x33);
-        let desc = concrete_descriptor(satochip.public, server.public, mobile.public, 12960);
+        let desc = concrete_descriptor(hardware.public, server.public, mobile.public, 12960);
         let far_future = Sequence::from_height(u16::MAX);
 
-        for signer in [&satochip, &server, &mobile] {
+        for signer in [&hardware, &server, &mobile] {
             let mut sigs = HashMap::new();
             sigs.insert(signer.public, test_signature(&signer.secret));
             desc.get_satisfaction((sigs, far_future)).expect_err(
@@ -358,14 +358,14 @@ mod tests {
     }
 
     /// The no-hardware recovery path, empirically: SERVER + MOBILE must be blocked before the
-    /// timelock and must work at it. This is what makes a destroyed SATOCHIP survivable.
+    /// timelock and must work at it. This is what makes a destroyed HARDWARE survivable.
     #[test]
     fn server_and_mobile_witness_constructs_only_after_the_timelock() {
-        let satochip = test_signer(0x41);
+        let hardware = test_signer(0x41);
         let server = test_signer(0x42);
         let mobile = test_signer(0x43);
         let timelock = 4320u16;
-        let desc = concrete_descriptor(satochip.public, server.public, mobile.public, timelock);
+        let desc = concrete_descriptor(hardware.public, server.public, mobile.public, timelock);
 
         let mut sigs = HashMap::new();
         sigs.insert(server.public, test_signature(&server.secret));
@@ -376,17 +376,17 @@ mod tests {
         desc.get_satisfaction((sigs.clone(), Sequence::from_height(timelock - 1)))
             .expect_err("server+mobile must not spend one block before the timelock");
         desc.get_satisfaction((sigs, Sequence::from_height(timelock)))
-            .expect("server+mobile must spend exactly at the timelock: lost-SATOCHIP recovery");
+            .expect("server+mobile must spend exactly at the timelock: lost-HARDWARE recovery");
     }
 
     #[test]
     fn server_alone_can_never_spend_even_with_a_forged_looking_satisfier_for_every_other_slot() {
         // Belt-and-braces: SERVER's signature present, but no signature offered for any other
         // key at all (not even an attempted/garbage one) and no elapsed time. Must still fail.
-        let satochip = test_signer(0x51);
+        let hardware = test_signer(0x51);
         let server = test_signer(0x52);
         let mobile = test_signer(0x53);
-        let desc = concrete_descriptor(satochip.public, server.public, mobile.public, 12960);
+        let desc = concrete_descriptor(hardware.public, server.public, mobile.public, 12960);
 
         let mut sigs = HashMap::new();
         sigs.insert(server.public, test_signature(&server.secret));

@@ -6,19 +6,26 @@ category: bitcoin
 version: "0.2.0"
 port: 8080
 description: >-
-  Self-hosted signing service for a 3-key miniscript wallet (a SATOCHIP smartcard, a Bitcoin
-  Keeper mobile app, and this service). It holds one key and co-signs PSBTs only when policy
+  Self-hosted signing service for a 3-key miniscript wallet (an offline hardware signer, a
+  mobile wallet app, and this service). It holds one key and co-signs PSBTs only when policy
   allows: per-transaction and rolling day/week/month spend caps, an out-of-band notification
-  plus a hold-and-veto window before every signature, and SATOCHIP-authorized runtime policy
-  changes. It can never spend alone, never initiates a transaction, and never finalizes or
-  broadcasts anything itself.
+  plus a hold-and-veto window before every signature, and hardware-key-authorized runtime
+  policy changes. It can never spend alone, never initiates a transaction, and never finalizes
+  or broadcasts anything itself.
 
 
   Opening the app the first time walks you through setup in the browser: it takes the xpubs
-  off your SATOCHIP and Bitcoin Keeper, generates its own key on the box, and hands you back a
-  descriptor to register in Keeper. After that it is an API - opening it shows a JSON health
-  check, and everything else happens over its HTTP API; see the project's README for the full
-  endpoint reference.
+  off your hardware signer and your phone wallet, generates its own key on the box, and hands
+  you back a descriptor to register in your wallet app. After that it is an API - opening it
+  shows a JSON health check, and everything else happens over its HTTP API; see the project's
+  README for the full endpoint reference.
+
+
+  IMPORTANT - check your devices first. This wallet uses a miniscript descriptor with a
+  relative timelock, not plain sortedmulti multisig, and most wallet software cannot import
+  one. A pairing that looks fine on both vendors' feature lists can leave you unable to spend.
+  Bitcoin Keeper works with Coldcard, Jade, Ledger, BitBox02 and Tapsigner; SeedSigner and
+  Satochip do not work. See "Which devices work" in the README before you fund anything.
 
 
   Start on signet, not mainnet, until you've verified your whole setup end-to-end - see

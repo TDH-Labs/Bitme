@@ -1,4 +1,5 @@
 pub mod chain;
+pub mod compat;
 pub mod config;
 pub mod descriptor;
 pub mod http;
@@ -11,6 +12,7 @@ pub mod nostr_transport;
 pub mod notify;
 pub mod policy;
 pub mod policy_auth;
+pub mod recovery_contacts;
 pub mod recovery_kit;
 pub mod setup;
 pub mod sign;

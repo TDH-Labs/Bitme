@@ -52,12 +52,27 @@ pub struct NtfyNotifier {
     cfg: NtfyConfig,
 }
 
+/// Hard ceiling on how long any single notification attempt may take.
+///
+/// **Invariant: notification must fail in bounded time, never hang.** Neither
+/// `reqwest::Client::new()` nor lettre's transport has a default timeout, so both are set
+/// explicitly. A bounded failure is recoverable - the row is marked failed, or the re-notify
+/// sweeper retries it - whereas an outstanding send leaves a queued spend in the window where
+/// nobody has been told about it (see `ledger.rs`'s `notify_delivered`). Endpoints that accept a
+/// connection and then stall are ordinary, not exotic.
+const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 impl NtfyNotifier {
     pub fn new(cfg: NtfyConfig) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            cfg,
-        }
+        let client = reqwest::Client::builder()
+            .timeout(NOTIFY_TIMEOUT)
+            .connect_timeout(NOTIFY_TIMEOUT)
+            .build()
+            // Only fails if the TLS backend can't initialise, which would break every outbound
+            // request anyway; falling back to an untimed client is strictly worse than the
+            // default one, so take the default and let the send surface the real error.
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { client, cfg }
     }
 }
 
@@ -91,9 +106,12 @@ impl SmtpNotifier {
         use lettre::transport::smtp::authentication::Credentials;
         use lettre::{AsyncSmtpTransport, Tokio1Executor};
 
+        // Bounded for the same reason as ntfy above - see `NOTIFY_TIMEOUT`. An SMTP relay that
+        // accepts the connection and then stalls must not hang the submission indefinitely.
         let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.host)
             .with_context(|| format!("configuring SMTP relay to {}", cfg.host))?
             .port(cfg.port)
+            .timeout(Some(NOTIFY_TIMEOUT))
             .credentials(Credentials::new(cfg.username.clone(), cfg.password.clone()))
             .build();
         let from = cfg

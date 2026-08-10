@@ -75,6 +75,10 @@ async fn inspect_recognizes_a_real_utxo_and_computes_fee_over_regtest() {
     let (server_key, ledger, policy_version, policy) =
         common::signing_test_fixtures(&cfg, common::permissive_policy()).await;
     let chain = std::sync::Arc::new(BitcoindRpc::new(node));
+    let auth_keys = std::sync::Arc::new(
+        cosigner::policy_auth::HardwareAuthKeys::from_config(&cfg, common::GAP_LIMIT)
+            .expect("precomputing hardware authorization keys"),
+    );
     let state = AppState {
         wallet: std::sync::Arc::new(wallet),
         cfg: std::sync::Arc::new(cfg),
@@ -86,6 +90,9 @@ async fn inspect_recognizes_a_real_utxo_and_computes_fee_over_regtest() {
             version: policy_version,
             compiled: policy,
         })),
+        auth_keys,
+        api_token: None,
+        recovery_contacts: None,
         notifier: std::sync::Arc::new(NoopNotifier),
         hold_seconds: 0,
     };
@@ -158,6 +165,10 @@ async fn inspect_rejects_an_input_not_derived_from_our_descriptor_over_regtest()
     let (server_key, ledger, policy_version, policy) =
         common::signing_test_fixtures(&cfg, common::permissive_policy()).await;
     let chain = std::sync::Arc::new(BitcoindRpc::new(node));
+    let auth_keys = std::sync::Arc::new(
+        cosigner::policy_auth::HardwareAuthKeys::from_config(&cfg, common::GAP_LIMIT)
+            .expect("precomputing hardware authorization keys"),
+    );
     let state = AppState {
         wallet: std::sync::Arc::new(wallet),
         cfg: std::sync::Arc::new(cfg),
@@ -169,6 +180,9 @@ async fn inspect_rejects_an_input_not_derived_from_our_descriptor_over_regtest()
             version: policy_version,
             compiled: policy,
         })),
+        auth_keys,
+        api_token: None,
+        recovery_contacts: None,
         notifier: std::sync::Arc::new(NoopNotifier),
         hold_seconds: 0,
     };

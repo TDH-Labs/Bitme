@@ -14,7 +14,7 @@ timelock_blocks = 4320             # ~30 days at 10 min/block. Any spend involvi
                                     # consensus rule baked into your addresses: changing it later
                                     # requires sweeping to a new descriptor. See the README.
 
-[keys.satochip]
+[keys.hardware]
 master_fingerprint = "00000000"    # 8 hex chars - e.g. Sparrow's "Master Fingerprint" field
 derivation_path = "48h/1h/0h/2h"
 xpub = "tpub..."                   # the extended PUBLIC key AT derivation_path - never a

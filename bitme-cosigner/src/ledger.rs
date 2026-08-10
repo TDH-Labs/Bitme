@@ -170,7 +170,7 @@ impl Ledger {
         .await
         .context("creating pending_signatures table")?;
 
-        // The M6 runtime-mutable, SATOCHIP-authorized policy: exactly one row (`id = 1`),
+        // The M6 runtime-mutable, HARDWARE-authorized policy: exactly one row (`id = 1`),
         // holding the currently-effective policy and a monotonic version number. A change is
         // only ever applied by `policy_auth::apply_policy_change`, which requires the request
         // to target `version + 1` - both preventing two racing changes from silently
@@ -219,6 +219,32 @@ impl Ledger {
             Err(e) => return Err(anyhow::Error::new(e).context("adding last_notified_at column")),
         }
 
+        // Whether a notification for this row was ever *confirmed delivered* - as opposed to
+        // `last_notified_at`, which records when delivery was last *attempted*.
+        //
+        // **Invariant: a spend nobody was told about is never signed.** The distinction between
+        // attempted and delivered is what enforces it. `insert_pending` has to commit the row
+        // before the notification is sent, because sending is network I/O and must not be done
+        // while holding a write transaction - so there is necessarily a window in which a
+        // committed `pending` row exists that nobody has been told about. Anything that ends the
+        // process, or leaves the send outstanding, lands in that window. `due_pending` requires
+        // this flag, so such a row is held rather than signed on schedule, and the re-notify
+        // sweeper keeps retrying until a notification actually lands.
+        //
+        // DEFAULT 1 deliberately: rows that already exist on upgrade predate the flag and were
+        // notified under the old path, so they must not be stranded unsignable. Fresh inserts
+        // bind 0 explicitly.
+        let alter_delivered = sqlx::query(
+            "ALTER TABLE pending_signatures ADD COLUMN notify_delivered INTEGER NOT NULL DEFAULT 1",
+        )
+        .execute(&self.pool)
+        .await;
+        match alter_delivered {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(anyhow::Error::new(e).context("adding notify_delivered column")),
+        }
+
         // A counter that increments on every freeze (never on unfreeze), so an unfreeze
         // authorization signed for one freeze can never lift a *later* one - see
         // `policy_auth::canonical_unfreeze_message`. Existing rows backfill to 0 via the
@@ -253,6 +279,21 @@ impl Ledger {
         Ok(())
     }
 
+    /// Drops `nostr_seen_events` rows older than `cutoff`, returning how many went.
+    ///
+    /// Replay protection only has to outlast how far back a relay will resend on a fresh
+    /// subscription; beyond that the row is dead weight. Without pruning this table grows
+    /// without bound on a box that is expected to run for years, and every row is written in
+    /// response to an inbound message - so its size is not governed by the operator.
+    pub async fn prune_nostr_seen_events(&self, cutoff: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM nostr_seen_events WHERE seen_at < ?1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .context("pruning nostr_seen_events")?;
+        Ok(result.rows_affected())
+    }
+
     /// Pending rows that are still holding (not yet due) and haven't been notified about since
     /// `now - interval`. Reminding during the window is the difference between "you had a
     /// chance to veto" and "you missed the one notification and never knew" - Bitkey pings
@@ -262,9 +303,16 @@ impl Ledger {
         now: i64,
         interval_seconds: i64,
     ) -> Result<Vec<PendingRow>> {
+        // `hold_until > now` normally stops reminders once the window closes - past that point
+        // the row is about to be signed and a reminder is pointless. The `notify_delivered = 0`
+        // arm deliberately overrides that: a row nobody was ever told about is held back from
+        // signing indefinitely, so it must keep being retried past its hold or it stalls
+        // forever with no further attempt to reach anyone.
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT txid FROM pending_signatures
-             WHERE status = ?1 AND hold_until > ?2 AND last_notified_at <= ?3",
+             WHERE status = ?1
+               AND (hold_until > ?2 OR notify_delivered = 0)
+               AND last_notified_at <= ?3",
         )
         .bind(PendingStatus::Pending.as_str())
         .bind(now)
@@ -282,13 +330,19 @@ impl Ledger {
         Ok(out)
     }
 
+    /// Records that a notification for `txid` was **confirmed delivered** - the notifier
+    /// returned success, not merely that a send was attempted. This is what releases the row to
+    /// [`Self::due_pending`], so it must only ever be called after a successful `notify()`.
     pub async fn mark_notified(&self, txid: &str, at: i64) -> Result<()> {
-        sqlx::query("UPDATE pending_signatures SET last_notified_at = ?1 WHERE txid = ?2")
-            .bind(at)
-            .bind(txid)
-            .execute(&self.pool)
-            .await
-            .context("updating last_notified_at")?;
+        sqlx::query(
+            "UPDATE pending_signatures SET last_notified_at = ?1, notify_delivered = 1
+             WHERE txid = ?2",
+        )
+        .bind(at)
+        .bind(txid)
+        .execute(&self.pool)
+        .await
+        .context("updating last_notified_at")?;
         Ok(())
     }
 
@@ -412,15 +466,39 @@ impl Ledger {
     /// background sweeper should attempt to process next. A plain pool read: each row gets
     /// re-checked for its current status inside its own transaction when actually processed,
     /// so a stale read here (e.g. a veto racing in after this query) is always caught later.
+    /// Rows whose hold has elapsed **and** whose notification was confirmed delivered.
+    ///
+    /// The `notify_delivered` clause is a safety interlock, not an optimisation: a hold window
+    /// nobody was told about provides no opportunity to veto, so signing on its expiry would be
+    /// signing unsupervised. Undelivered rows stay `pending` indefinitely and are retried by
+    /// [`Self::pending_needing_renotify`]; [`Self::due_pending_undelivered`] surfaces them so
+    /// they can be alarmed on rather than silently stalling.
     pub async fn due_pending(&self, now: i64) -> Result<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT txid FROM pending_signatures WHERE status = ?1 AND hold_until <= ?2",
+            "SELECT txid FROM pending_signatures
+             WHERE status = ?1 AND hold_until <= ?2 AND notify_delivered = 1",
         )
         .bind(PendingStatus::Pending.as_str())
         .bind(now)
         .fetch_all(&self.pool)
         .await
         .context("querying due pending signatures")?;
+        Ok(rows.into_iter().map(|(txid,)| txid).collect())
+    }
+
+    /// Rows that are past their hold but held back because no notification was ever confirmed
+    /// delivered. Failing closed like this is correct but must not be silent - these are spends
+    /// the operator asked for that are not progressing.
+    pub async fn due_pending_undelivered(&self, now: i64) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT txid FROM pending_signatures
+             WHERE status = ?1 AND hold_until <= ?2 AND notify_delivered = 0",
+        )
+        .bind(PendingStatus::Pending.as_str())
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .context("querying undelivered due pending signatures")?;
         Ok(rows.into_iter().map(|(txid,)| txid).collect())
     }
 
@@ -448,6 +526,28 @@ impl Ledger {
         let row = ltx.get_pending(txid).await?;
         ltx.rollback().await?;
         Ok(row)
+    }
+
+    /// Brings a still-`pending` row's hold forward to `now`, so the next sweep picks it up.
+    /// Returns `false` if the row is missing or no longer pending.
+    ///
+    /// This is the *entire* effect a recovery-contact quorum is allowed to have - see
+    /// `recovery_contacts.rs`. It touches only `hold_until`: the row keeps its status, its PSBT,
+    /// its recorded amounts and its delivery flag, and `sign::process_due_pending_row`
+    /// re-evaluates policy from scratch when it fires regardless of how it became due. A quorum
+    /// therefore cannot raise a cap, reach a forbidden destination, or resurrect a vetoed spend -
+    /// it can only stop this service waiting.
+    pub async fn release_hold(&self, txid: &str, now: i64) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE pending_signatures SET hold_until = ?1 WHERE txid = ?2 AND status = ?3",
+        )
+        .bind(now)
+        .bind(txid)
+        .bind(PendingStatus::Pending.as_str())
+        .execute(&self.pool)
+        .await
+        .context("releasing a pending hold")?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Sums `spend_amount_sat` over the trailing day/week/month windows ending at `now`.
@@ -577,10 +677,14 @@ impl LedgerTx {
         hold_until: i64,
     ) -> Result<()> {
         sqlx::query(
+            // `last_notified_at` starts at 0, not `created_at`: nothing has been delivered yet,
+            // and seeding it to "now" made the re-notify sweeper treat a never-delivered row as
+            // freshly notified and skip it for a full interval. `notify_delivered` starts at 0
+            // so the row cannot be signed until a notification actually lands.
             "INSERT INTO pending_signatures
                 (txid, psbt_base64, spend_amount_sat, fee_sat, created_at, hold_until, status,
-                 last_notified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?5)",
+                 last_notified_at, notify_delivered)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0)",
         )
         .bind(txid)
         .bind(psbt_base64)
@@ -926,9 +1030,83 @@ mod tests {
         assert_eq!(row.hold_until, 800);
         assert!(ledger.get_pending("never-seen").await.unwrap().is_none());
 
+        // A freshly inserted row is not yet due at any time: no notification has been confirmed
+        // delivered for it. Marking delivery is what releases it.
+        assert!(ledger.due_pending(801).await.unwrap().is_empty());
+        ledger.mark_notified("tx-a", 500).await.unwrap();
+
         assert!(ledger.due_pending(799).await.unwrap().is_empty());
         assert_eq!(ledger.due_pending(800).await.unwrap(), vec!["tx-a"]);
         assert_eq!(ledger.due_pending(801).await.unwrap(), vec!["tx-a"]);
+    }
+
+    /// The interlock behind the notify-then-hold guarantee: a spend whose notification never
+    /// landed must never be signed, no matter how long its hold has been over.
+    ///
+    /// `insert_pending` commits before the notification is sent, so a hung notifier or a restart
+    /// in that window leaves a committed `pending` row nobody was told about. Without this,
+    /// `due_pending` handed it to the sweeper on schedule and notify-then-hold silently became
+    /// just-hold.
+    #[tokio::test]
+    async fn a_spend_nobody_was_notified_about_is_never_due_but_is_reported_as_stalled() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        let mut ltx = ledger.begin().await.unwrap();
+        ltx.insert_pending("tx-silent", "cHNidA==", 1_000, 100, 500, 800)
+            .await
+            .unwrap();
+        ltx.commit().await.unwrap();
+
+        // Long past the hold, and still not signable.
+        assert!(
+            ledger.due_pending(999_999).await.unwrap().is_empty(),
+            "an un-notified spend must never become due"
+        );
+        assert_eq!(
+            ledger.due_pending_undelivered(999_999).await.unwrap(),
+            vec!["tx-silent"],
+            "...but it must be visible as stalled, not silently stuck"
+        );
+
+        // It also keeps being offered for re-notification past its hold, so delivery is retried
+        // rather than abandoned.
+        let retry = ledger
+            .pending_needing_renotify(999_999, 3_600)
+            .await
+            .unwrap();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].txid, "tx-silent");
+
+        // Once a notification actually lands, it becomes due normally.
+        ledger.mark_notified("tx-silent", 999_999).await.unwrap();
+        assert_eq!(
+            ledger.due_pending(999_999).await.unwrap(),
+            vec!["tx-silent"]
+        );
+        assert!(ledger
+            .due_pending_undelivered(999_999)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Rows written before `notify_delivered` existed were notified under the old code path, so
+    /// the column defaults to 1 for them. Defaulting to 0 would strand every in-flight spend on
+    /// upgrade as permanently unsignable.
+    #[tokio::test]
+    async fn rows_predating_the_delivery_flag_are_grandfathered_as_delivered() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        // Simulate a pre-migration row by inserting without the new column.
+        sqlx::query(
+            "INSERT INTO pending_signatures
+                (txid, psbt_base64, spend_amount_sat, fee_sat, created_at, hold_until, status,
+                 last_notified_at)
+             VALUES ('tx-legacy', 'cHNidA==', 1000, 100, 500, 800, 'pending', 500)",
+        )
+        .execute(&ledger.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(ledger.due_pending(800).await.unwrap(), vec!["tx-legacy"]);
     }
 
     #[tokio::test]

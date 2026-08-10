@@ -1,0 +1,126 @@
+# Device and coordinator compatibility data. See docs/COMPATIBILITY.md for the model.
+#
+# TREAT EVERY ROW AS UNVERIFIED UNTIL IT SAYS verified = "signet-tested". Nothing here has been
+# run end to end against real hardware by this project. The `verified` field is not decoration -
+# it is the difference between "the vendor says so" and "we watched it work", and the wizard
+# surfaces that difference to the operator.
+#
+# This file is compiled into the binary AND readable from the config directory. Drop your own
+# copy at config/compatibility.toml to correct or extend it without waiting for a release -
+# firmware moves faster than this project does, and a stale matrix that blocks a combination
+# which has started working is worse than no matrix at all.
+
+schema_version = 1
+revision = "2026-08-10"
+
+# --- hardware signers ---------------------------------------------------------------------------
+#
+# signs_miniscript / signs_older describe whether the DEVICE can produce a signature for this
+# wallet's script. For devices that sign whatever hash they are handed, both are true - the real
+# constraint is almost always the coordinator, not the device.
+#
+# signs_message is a SEPARATE axis: POST /policy and POST /unfreeze need a Bitcoin signed message.
+# A device can pass every spending check and still leave you changing spending limits from a shell.
+
+[[hardware]]
+id = "coldcard"
+label = "Coldcard (Mk4 / Q)"
+signs_miniscript = true
+signs_older = true
+signs_message = true
+verified = "vendor-docs"
+notes = "Block-based older() accepted in the range 1-65535, which covers any timelock this wallet can be configured with."
+
+[[hardware]]
+id = "jade"
+label = "Blockstream Jade"
+signs_miniscript = true
+signs_older = true
+signs_message = true
+verified = "vendor-docs"
+
+[[hardware]]
+id = "ledger"
+label = "Ledger"
+signs_miniscript = true
+signs_older = true
+signs_message = true
+verified = "vendor-docs"
+
+[[hardware]]
+id = "bitbox02"
+label = "BitBox02"
+signs_miniscript = true
+signs_older = true
+signs_message = true
+verified = "release-notes"
+
+[[hardware]]
+id = "tapsigner"
+label = "Tapsigner"
+signs_miniscript = true
+signs_older = true
+# Not confirmed either way. Left true so this device is not wrongly excluded from spending; the
+# unverified provenance is what carries the doubt to the operator.
+signs_message = true
+verified = "release-notes"
+notes = "Card/NFC form factor, and on Bitcoin Keeper's miniscript signer list - the closest swap for a Satochip if you want to keep Keeper."
+
+[[hardware]]
+id = "satochip"
+label = "Satochip"
+signs_miniscript = true
+signs_older = true
+signs_message = true
+verified = "unverified"
+notes = "Signing is not the constraint - the applet signs hashes and the script is the coordinator's problem. The problem is that no listed coordinator both registers a miniscript descriptor and drives this card."
+
+[[hardware]]
+id = "seedsigner"
+label = "SeedSigner"
+signs_miniscript = false
+signs_older = false
+signs_message = true
+verified = "issue-tracker"
+notes = "sortedmulti multisig only. Cannot sign for a thresh/older descriptor."
+
+# --- coordinators -------------------------------------------------------------------------------
+#
+# registers_miniscript is the field that eliminates most software. `drives` is NOT transitive with
+# it: being able to import a descriptor says nothing about which devices an app can talk to.
+
+[[coordinator]]
+id = "bitcoin-keeper"
+label = "Bitcoin Keeper"
+registers_miniscript = true
+holds_mobile_key = true
+drives = ["coldcard", "jade", "ledger", "bitbox02", "tapsigner"]
+verified = "release-notes"
+notes = "Miniscript vault signer list as of v2.0.1. Satochip is not on it."
+
+[[coordinator]]
+id = "sparrow"
+label = "Sparrow"
+registers_miniscript = false
+holds_mobile_key = false
+drives = ["coldcard", "jade", "ledger", "bitbox02", "satochip", "seedsigner"]
+verified = "issue-tracker"
+notes = "Drives the widest range of devices by far, but does not implement miniscript descriptors - sparrowwallet/sparrow#1700 is open. That combination is why a Satochip cannot currently be used with this wallet."
+
+[[coordinator]]
+id = "nunchuk"
+label = "Nunchuk"
+registers_miniscript = true
+holds_mobile_key = true
+drives = ["coldcard", "jade", "ledger", "bitbox02", "tapsigner"]
+verified = "unverified"
+notes = "Announced miniscript support. The device list here is assumed rather than confirmed - verify on signet before relying on it."
+
+[[coordinator]]
+id = "bitcoin-core"
+label = "Bitcoin Core (CLI)"
+registers_miniscript = true
+holds_mobile_key = false
+drives = []
+verified = "vendor-docs"
+notes = "importdescriptors handles miniscript, but Core drives no hardware on its own - it needs HWI, which is a power-user path rather than a product."

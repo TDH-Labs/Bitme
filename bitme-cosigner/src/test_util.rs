@@ -48,7 +48,7 @@ pub fn test_wallet_config(timelock_blocks: u16) -> WalletConfig {
         i_understand_this_is_mainnet: false,
         timelock_blocks,
         keys: KeysConfig {
-            satochip: test_key_spec(0x01),
+            hardware: test_key_spec(0x01),
             mobile: test_key_spec(0x02),
             server: test_key_spec(0x03),
         },
@@ -59,6 +59,7 @@ pub fn test_wallet_config(timelock_blocks: u16) -> WalletConfig {
         notify: None,
         recovery: None,
         nostr_transport: None,
+        recovery_contacts: None,
     }
 }
 

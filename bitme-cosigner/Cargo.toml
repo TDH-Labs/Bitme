@@ -11,6 +11,19 @@ path = "src/lib.rs"
 name = "cosigner"
 path = "src/main.rs"
 
+# Password hashing is deliberately expensive, and an unoptimised build makes it expensive by
+# roughly two orders of magnitude more than intended - enough that the recovery-kit tests
+# dominate the entire suite's runtime. Optimising just these crates keeps `cargo test` and
+# `cargo run` usable without building the whole tree in release mode.
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+
 [dependencies]
 age = { version = "0.12.1", features = ["armor"] }
 anyhow = "1"

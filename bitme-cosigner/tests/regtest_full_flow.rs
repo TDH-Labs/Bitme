@@ -1,7 +1,7 @@
 //! The live end-to-end flow against a *real* `bitcoind` regtest node: fund a UTXO, submit a
 //! PSBT through the real HTTP router, let it queue, sweep it once its hold elapses, and prove
 //! the resulting witness is genuinely satisfiable - not just that an HTTP call returned 200.
-//! Also covers `POST /veto/{id}` blocking a live spend, and a SATOCHIP-authorized `POST
+//! Also covers `POST /veto/{id}` blocking a live spend, and a HARDWARE-authorized `POST
 //! /policy` change actually being enforced by a subsequent `/sign_psbt` call.
 //!
 //! This exists specifically to close the two gaps a prior verification pass left open ("needs
@@ -50,13 +50,13 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-/// Attaches a real SATOCHIP partial signature to `psbt`'s single input, computed the same way
+/// Attaches a real HARDWARE partial signature to `psbt`'s single input, computed the same way
 /// `signing::sign_hot_inputs` computes SERVER's - independent proof that this input's sighash
 /// is something a real key can sign over correctly, not just something cosigner claims.
-fn attach_satochip_signature(
+fn attach_hardware_signature(
     psbt: &mut bitcoin::psbt::Psbt,
     wallet: &BuiltDescriptor,
-    satochip_account_xprv: &Xpriv,
+    hardware_account_xprv: &Xpriv,
     index: u32,
 ) {
     let secp = Secp256k1::new();
@@ -64,14 +64,14 @@ fn attach_satochip_signature(
     let witness_script = definite.explicit_script().unwrap();
     psbt.inputs[0].witness_script = Some(witness_script);
 
-    let satochip_child = common::derive_child_xpriv(satochip_account_xprv, 0, index);
-    let satochip_pubkey = bitcoin::PublicKey::new(satochip_child.private_key.public_key(&secp));
+    let hardware_child = common::derive_child_xpriv(hardware_account_xprv, 0, index);
+    let hardware_pubkey = bitcoin::PublicKey::new(hardware_child.private_key.public_key(&secp));
 
     let mut cache = SighashCache::new(&psbt.unsigned_tx);
     let (msg, sighash_type) = psbt.sighash_ecdsa(0, &mut cache).unwrap();
-    let raw_sig = secp.sign_ecdsa(&msg, &satochip_child.private_key);
+    let raw_sig = secp.sign_ecdsa(&msg, &hardware_child.private_key);
     psbt.inputs[0].partial_sigs.insert(
-        satochip_pubkey,
+        hardware_pubkey,
         bitcoin::ecdsa::Signature {
             signature: raw_sig,
             sighash_type,
@@ -79,7 +79,7 @@ fn attach_satochip_signature(
     );
 }
 
-/// Proves the fully-signed PSBT (SATOCHIP + SERVER partial sigs) actually satisfies the HOT
+/// Proves the fully-signed PSBT (HARDWARE + SERVER partial sigs) actually satisfies the HOT
 /// branch of the real miniscript - the strongest live proof available short of broadcasting:
 /// not "the API returned 200", but "this witness is genuinely valid for this descriptor".
 fn assert_hot_witness_is_satisfiable(
@@ -90,33 +90,33 @@ fn assert_hot_witness_is_satisfiable(
 ) {
     let definite = descriptor::at_index(&wallet.external, index).unwrap();
     let keys = descriptor::definite_keys(&definite);
-    let satochip_key = descriptor::find_role_key(&keys, &cfg.keys.satochip.xpub).unwrap();
+    let hardware_key = descriptor::find_role_key(&keys, &cfg.keys.hardware.xpub).unwrap();
     let server_key = descriptor::find_role_key(&keys, &cfg.keys.server.xpub).unwrap();
 
-    let satochip_pk = descriptor::role_keys_at(wallet, cfg, Chain::External, index)
+    let hardware_pk = descriptor::role_keys_at(wallet, cfg, Chain::External, index)
         .unwrap()
-        .satochip;
+        .hardware;
     let server_pk = descriptor::role_keys_at(wallet, cfg, Chain::External, index)
         .unwrap()
         .server;
 
-    let satochip_sig = *signed_psbt.inputs[0]
+    let hardware_sig = *signed_psbt.inputs[0]
         .partial_sigs
-        .get(&satochip_pk)
-        .expect("satochip signature must be present");
+        .get(&hardware_pk)
+        .expect("hardware signature must be present");
     let server_sig = *signed_psbt.inputs[0]
         .partial_sigs
         .get(&server_pk)
         .expect("server signature must be present - cosigner did not sign this input");
 
     let mut sigs = HashMap::new();
-    sigs.insert(satochip_key, satochip_sig);
+    sigs.insert(hardware_key, hardware_sig);
     sigs.insert(server_key, server_sig);
     let satisfier = (sigs, Sequence::ZERO);
 
     definite
         .get_satisfaction(satisfier)
-        .expect("satochip + server signatures must satisfy the HOT path for real");
+        .expect("hardware + server signatures must satisfy the HOT path for real");
 }
 
 async fn build_state(
@@ -140,6 +140,12 @@ async fn build_state(
             version: policy_version,
             compiled: policy,
         })),
+        auth_keys: Arc::new(
+            cosigner::policy_auth::HardwareAuthKeys::from_config(cfg, common::GAP_LIMIT)
+                .expect("precomputing hardware authorization keys"),
+        ),
+        api_token: None,
+        recovery_contacts: None,
         notifier: Arc::new(NoopNotifier),
         hold_seconds,
     };
@@ -180,7 +186,7 @@ async fn full_hot_spend_is_queued_held_and_then_signed_with_a_real_satisfiable_w
 
     let cfg = common::regtest_wallet_config();
     let wallet = descriptor::build_descriptor(&cfg).unwrap();
-    let (_, satochip_xprv) = common::key_spec_with_xpriv(common::SATOCHIP_SEED, common::KEY_PATH);
+    let (_, hardware_xprv) = common::key_spec_with_xpriv(common::HARDWARE_SEED, common::KEY_PATH);
 
     let node_wallet = common::node_wallet_client(&node, "cosigner-full-flow-hot");
     common::fund_node_wallet(&node, &node_wallet);
@@ -200,7 +206,7 @@ async fn full_hot_spend_is_queued_held_and_then_signed_with_a_real_satisfiable_w
         Amount::from_sat(199_000),
         Sequence::ENABLE_RBF_NO_LOCKTIME,
     );
-    attach_satochip_signature(&mut psbt, &wallet, &satochip_xprv, 0);
+    attach_hardware_signature(&mut psbt, &wallet, &hardware_xprv, 0);
 
     let submitted_at = now_unix();
     let (state, chain, _) =
@@ -376,7 +382,7 @@ async fn veto_blocks_a_live_spend_before_it_can_be_swept() {
 }
 
 #[tokio::test]
-async fn satochip_authorized_policy_change_is_enforced_by_a_live_spend() {
+async fn hardware_authorized_policy_change_is_enforced_by_a_live_spend() {
     let Some(node) = common::regtest_client() else {
         eprintln!("COSIGNER_REGTEST_RPC_URL not set - skipping regtest integration test");
         return;
@@ -384,7 +390,7 @@ async fn satochip_authorized_policy_change_is_enforced_by_a_live_spend() {
 
     let cfg = common::regtest_wallet_config();
     let wallet = descriptor::build_descriptor(&cfg).unwrap();
-    let (_, satochip_xprv) = common::key_spec_with_xpriv(common::SATOCHIP_SEED, common::KEY_PATH);
+    let (_, hardware_xprv) = common::key_spec_with_xpriv(common::HARDWARE_SEED, common::KEY_PATH);
 
     let node_wallet = common::node_wallet_client(&node, "cosigner-full-flow-policy");
     common::fund_node_wallet(&node, &node_wallet);
@@ -430,7 +436,7 @@ async fn satochip_authorized_policy_change_is_enforced_by_a_live_spend() {
     );
     assert_eq!(body["error"], "policy_denied");
 
-    // Authorize a higher cap, signed by SATOCHIP over the exact canonical text the server will
+    // Authorize a higher cap, signed by HARDWARE over the exact canonical text the server will
     // recompute and verify against - the real live path, not a unit test mock.
     let raised_cap_policy = PolicyConfig {
         max_tx_sat: 1_000_000,
@@ -442,7 +448,7 @@ async fn satochip_authorized_policy_change_is_enforced_by_a_live_spend() {
     let secp = Secp256k1::new();
     let sig = secp.sign_ecdsa_recoverable(
         &bitcoin::secp256k1::Message::from_digest(msg_hash.to_byte_array()),
-        &satochip_xprv.private_key,
+        &hardware_xprv.private_key,
     );
     let signature_base64 = bitcoin::sign_message::MessageSignature::new(sig, true).to_base64();
 

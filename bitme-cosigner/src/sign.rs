@@ -47,7 +47,7 @@ use crate::signing::{self, ServerSigningKey, SigningError};
 #[derive(Debug, Error)]
 pub enum SignPsbtError {
     #[error(
-        "PSBT does not use the HOT spending path (SATOCHIP+SERVER, immediately) - this \
+        "PSBT does not use the HOT spending path (HARDWARE+SERVER, immediately) - this \
          service only ever countersigns that path"
     )]
     NotHotPath,
@@ -158,6 +158,16 @@ pub async fn sign_psbt(
     if report.spending_path != SpendingPath::Hot {
         return Err(SignPsbtError::NotHotPath);
     }
+    // Freeze is checked here as well as in `submit_for_signing`. This path is not currently
+    // reachable from HTTP - `/sign_psbt` queues via `submit_for_signing` instead - but it is a
+    // public entry point that signs, and an entry point that signs without consulting the
+    // kill-switch is a loaded gun waiting for someone to wire it up.
+    if ledger.is_frozen().await? {
+        return Err(SignPsbtError::Internal(anyhow::anyhow!(
+            "co-signing is frozen; unfreeze with a hardware-signed POST /unfreeze or the \
+             `cosigner unfreeze` CLI"
+        )));
+    }
 
     let mut ltx = ledger.begin().await?;
     match decide_and_sign(
@@ -191,9 +201,9 @@ pub async fn sign_psbt(
 #[derive(Debug, Error)]
 pub enum SubmitError {
     #[error(
-        "PSBT does not use a spending path this service co-signs. It signs SATOCHIP+SERVER, \
+        "PSBT does not use a spending path this service co-signs. It signs HARDWARE+SERVER, \
          and (unless disabled) MOBILE+SERVER recovery spends; it cannot help with \
-         SATOCHIP+MOBILE, which doesn't need it"
+         HARDWARE+MOBILE, which doesn't need it"
     )]
     NotHotPath,
     #[error(
@@ -249,7 +259,7 @@ pub async fn submit_for_signing(
     // everything" control, so it must not be reachable-around by any path below.
     if ledger.is_frozen().await? {
         return Err(SubmitError::Frozen(
-            "co-signing is frozen; unfreeze with a SATOCHIP-signed POST /unfreeze or the \
+            "co-signing is frozen; unfreeze with a HARDWARE-signed POST /unfreeze or the \
              `cosigner unfreeze` CLI"
                 .to_string(),
         ));
@@ -371,6 +381,13 @@ pub async fn submit_for_signing(
         ltx.commit().await?;
         return Err(SubmitError::NotifyFailed(e.to_string()));
     }
+    // Delivery confirmed - only now is the row eligible to be signed when its hold elapses.
+    // The row was inserted with `notify_delivered = 0` and `due_pending` filters on it, so
+    // everything between the commit above and this line is a window in which the spend simply
+    // cannot be signed: a crash, a restart, or a notifier that hangs past its timeout all leave
+    // it held rather than silently signed with nobody informed. The re-notify sweeper retries
+    // until one lands.
+    ledger.mark_notified(&txid, now).await?;
 
     Ok(SubmitOutcome::Queued { txid, hold_until })
 }
@@ -626,7 +643,7 @@ mod tests {
     /// (funded into `chain` first), sending `amount_sat - fee_sat` to a distinct foreign
     /// destination. `Sequence::ENABLE_RBF_NO_LOCKTIME` doesn't satisfy any relative timelock,
     /// so this classifies as HOT regardless of which (if any) signatures are attached - no
-    /// need to fake a SATOCHIP signature just to exercise the policy/ledger orchestration.
+    /// need to fake a HARDWARE signature just to exercise the policy/ledger orchestration.
     pub(super) fn hot_psbt(
         chain: &MockChainSource,
         wallet: &BuiltDescriptor,
@@ -1036,6 +1053,92 @@ mod tests {
         pub(super) fn chain_as_dyn(&self) -> Arc<dyn ChainSource> {
             self.chain.clone()
         }
+    }
+
+    /// The crash window, end to end: `insert_pending` commits before the notification is sent,
+    /// so a process that dies (or a notifier that hangs past its timeout) in between leaves a
+    /// committed `pending` row that nobody was ever told about. The sweeper must not sign it.
+    ///
+    /// Simulated here by inserting the row exactly as `submit_for_signing` does and then simply
+    /// never notifying - which is precisely what the process would have left behind.
+    #[tokio::test]
+    async fn a_spend_queued_but_never_notified_is_never_swept() {
+        let f = queue_fixture("COSIGNER_TEST_NEVER_NOTIFIED", u64::MAX, u64::MAX).await;
+        let psbt = hot_psbt(&f.chain, &f.wallet, 0x5A, 0, 100_000, 10_000);
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+
+        let mut ltx = f.ledger.begin().await.unwrap();
+        ltx.insert_pending(&txid, &psbt.to_string(), 90_000, 10_000, 1_000, 2_000)
+            .await
+            .unwrap();
+        ltx.commit().await.unwrap();
+
+        // Hold long since elapsed.
+        let results = sweep_due(
+            &f.ledger,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.policy,
+            &f.cfg.recovery_config(),
+            &f.chain_as_dyn(),
+            50,
+            999_999,
+        )
+        .await;
+        assert!(
+            results.is_empty(),
+            "a spend nobody was notified about must not be signed: {results:?}"
+        );
+
+        let row = f.ledger.get_pending(&txid).await.unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            PendingStatus::Pending,
+            "it stays pending - held, not failed, so delivery can still be retried"
+        );
+        assert_eq!(
+            f.ledger.due_pending_undelivered(999_999).await.unwrap(),
+            vec![txid],
+            "and it is visible as stalled rather than silently stuck"
+        );
+    }
+
+    /// The corresponding success path: a normal submission confirms delivery, which is what
+    /// makes the row eligible for the sweeper at all.
+    #[tokio::test]
+    async fn a_successfully_notified_spend_becomes_due() {
+        let f = queue_fixture("COSIGNER_TEST_NOTIFIED_DUE", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+        let psbt = hot_psbt(&f.chain, &f.wallet, 0x5B, 0, 100_000, 10_000);
+        let report = inspect::inspect(&psbt, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+
+        let outcome = submit_for_signing(
+            psbt,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &f.cfg.recovery_config(),
+            &notifier,
+            600,
+            1_000,
+        )
+        .await
+        .unwrap();
+        let SubmitOutcome::Queued { txid, .. } = outcome else {
+            panic!("expected a queued outcome, got {outcome:?}");
+        };
+
+        assert_eq!(f.ledger.due_pending(1_601).await.unwrap(), vec![txid]);
+        assert!(f
+            .ledger
+            .due_pending_undelivered(1_601)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1723,7 +1826,7 @@ mod recovery_and_freeze_tests {
         assert!(matches!(err, SubmitError::RecoveryDisabled), "got {err:?}");
     }
 
-    /// The point of the whole descriptor change: with the SATOCHIP gone, MOBILE + SERVER must
+    /// The point of the whole descriptor change: with the HARDWARE gone, MOBILE + SERVER must
     /// actually get co-signed - and it must ignore the ordinary per-tx cap, because sweeping
     /// the balance is the entire purpose.
     #[tokio::test]
