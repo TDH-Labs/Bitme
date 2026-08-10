@@ -1,7 +1,7 @@
 # Setup wizard screenshots
 
-What the first-run wizard actually looks like, captured by driving it end to end in a headless
-Chromium against a throwaway container — not mockups, and not hand-assembled.
+What the first-run wizard actually looks like, captured against a throwaway container running the
+real thing — not mockups.
 
 | | |
 |---|---|
@@ -33,7 +33,17 @@ that come off your own devices. See [`../KEY-GENERATION.md`](../KEY-GENERATION.m
 
 ## Regenerating these
 
-The capture script drives every step, asserts the inline validation actually fires, and checks
-the QR and descriptor render — so it doubles as a smoke test of the wizard, not just a
-screenshot tool. Point a throwaway container at a regtest node and run it against the wizard's
-port; see the wizard section of [`../UMBREL.md`](../UMBREL.md).
+⚠️ **There is no capture script in this repo.** An earlier version of this file described one as
+though there were; there never has been. Regenerating these means doing it by hand: point a
+container at a regtest node, walk the wizard, and screenshot each step.
+
+What *does* exist is
+[`bitme-cosigner/tests/wizard_smoke.mjs`](../../bitme-cosigner/tests/wizard_smoke.mjs), which
+drives the whole wizard under jsdom with the API stubbed and asserts behaviour — the
+compatibility gate blocking and releasing, validation firing, and the submitted config matching
+what was entered. It runs in CI, and covers what the missing script was claimed to cover, minus
+the images:
+
+```sh
+cd bitme-cosigner && npm install --no-save jsdom && node --test tests/wizard_smoke.mjs
+```
