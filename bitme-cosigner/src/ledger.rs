@@ -46,6 +46,9 @@ pub enum PendingStatus {
     /// The hold elapsed but signing/inspection failed for a reason other than policy (e.g.
     /// the UTXO it spent is gone) - never signed, nothing recorded.
     Failed,
+    /// A later submission spent one of the same inputs, so this one can never confirm - a
+    /// fee bump, typically. Never signed, nothing recorded. See `sign::supersede_conflicts`.
+    Superseded,
 }
 
 impl PendingStatus {
@@ -56,6 +59,7 @@ impl PendingStatus {
             PendingStatus::Signed => "signed",
             PendingStatus::Denied => "denied",
             PendingStatus::Failed => "failed",
+            PendingStatus::Superseded => "superseded",
         }
     }
 
@@ -66,6 +70,7 @@ impl PendingStatus {
             "signed" => Ok(PendingStatus::Signed),
             "denied" => Ok(PendingStatus::Denied),
             "failed" => Ok(PendingStatus::Failed),
+            "superseded" => Ok(PendingStatus::Superseded),
             other => anyhow::bail!("unrecognized pending_signatures.status value {other:?}"),
         }
     }
@@ -526,6 +531,45 @@ impl Ledger {
         let row = ltx.get_pending(txid).await?;
         ltx.rollback().await?;
         Ok(row)
+    }
+
+    /// Every row still `pending`, for conflict detection. Small by construction - rows leave
+    /// `pending` as soon as they resolve - so returning them all is cheaper than any index.
+    pub async fn all_pending(&self) -> Result<Vec<PendingRow>> {
+        let txids: Vec<(String,)> =
+            sqlx::query_as("SELECT txid FROM pending_signatures WHERE status = ?1")
+                .bind(PendingStatus::Pending.as_str())
+                .fetch_all(&self.pool)
+                .await
+                .context("querying pending rows")?;
+
+        let mut out = Vec::with_capacity(txids.len());
+        for (txid,) in txids {
+            if let Some(row) = self.get_pending(&txid).await? {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Marks a still-`pending` row superseded by `by_txid`. Returns `false` if it had already
+    /// resolved, which is the race a concurrent sweep would produce.
+    ///
+    /// Only ever applied to rows that were never signed, so nothing is un-recorded: a superseded
+    /// row contributed nothing to the rolling totals and continues to contribute nothing.
+    pub async fn mark_superseded(&self, txid: &str, by_txid: &str) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE pending_signatures SET status = ?1, message = ?2
+             WHERE txid = ?3 AND status = ?4",
+        )
+        .bind(PendingStatus::Superseded.as_str())
+        .bind(format!("superseded by {by_txid}"))
+        .bind(txid)
+        .bind(PendingStatus::Pending.as_str())
+        .execute(&self.pool)
+        .await
+        .context("marking a pending row superseded")?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Brings a still-`pending` row's hold forward to `now`, so the next sweep picks it up.

@@ -137,6 +137,9 @@ const S = {
   hold_seconds: 3600,
   recovery_hold_seconds: 86400,
   recovery_whitelist: [],
+  nostr_on: false,
+  nostr_relays: [],
+  nostr_npubs: [],
   ntfy_url: "",
   notify_kind: "ntfy",
   smtp: { host: "", port: 587, username: "", password: "", from: "", to: "" },
@@ -643,6 +646,34 @@ function holdStep() {
     <div class="note">You can change this later, but only with a signature from your hardware key —
     which is exactly the point. Setting it now, while you have the device in hand, is much easier
     than setting it during an emergency.</div>
+
+    <details style="margin-top:22px" ${S.nostr_on ? "open" : ""}>
+      <summary style="cursor:pointer;font-size:14px">Reach this service from outside your network <span class="hint">optional</span></summary>
+      <p style="margin:10px 0 12px">By default this service is only reachable on your own network.
+      To use it from elsewhere you would normally open a port, which means exposing it to the
+      internet.</p>
+      <p style="margin-bottom:12px">The alternative is Nostr: this box gets its own identity and
+      connects <b>outward</b> to relays, so there is no port to open and nothing to scan. Only the
+      devices you list can send it anything, and each message is cryptographically proven to come
+      from one of them — stronger than the shared API token, and revocable per device.</p>
+      <label><input type="checkbox" id="nostron" style="width:auto" ${S.nostr_on ? "checked" : ""}>
+        Enable the Nostr transport</label>
+      <div id="nostrfields" class="${S.nostr_on ? "" : "hidden"}">
+        <label>Relays <span class="hint">One per line. Use at least three — a single relay is a new single point of failure.</span></label>
+        <textarea class="mono" id="nrelays" rows="3" spellcheck="false"
+          placeholder="wss://relay.damus.io">${(S.nostr_relays || []).join("\n")}</textarea>
+        <label>Allowed npubs <span class="hint">One per line — one per device you want to allow.</span></label>
+        <textarea class="mono" id="nnpubs" rows="3" spellcheck="false"
+          placeholder="npub1…">${(S.nostr_npubs || []).join("\n")}</textarea>
+        <div class="note"><b>This box generates its own Nostr key.</b> It is a machine credential,
+        like an SSH host key — not your personal Nostr account, and you should not paste one here.
+        Giving a server that holds a signing key your social identity would mean a compromise of
+        one is a compromise of both, and would tie this wallet's activity to a public identity.
+        You will see its npub at the end; the secret stays on the box.
+        <br><br>Relays can see <i>that</i> two identities exchanged an encrypted message and when,
+        though not what it said.</div>
+      </div>
+    </details>
     <h3 style="font-size:15px;margin:22px 0 6px">How you get told</h3>
     <p style="margin-bottom:12px">Required — pick one. The hold window is only protective if you
     find out a signature was requested.</p>
@@ -697,6 +728,9 @@ function holdStep() {
       <button id="n">Continue</button>
     </div>
   </div>`);
+  c.querySelector("#nostron").onchange = (ev) => {
+    c.querySelector("#nostrfields").classList.toggle("hidden", !ev.target.checked);
+  };
   c.querySelectorAll(".tab").forEach(t => t.onclick = () => {
     S.notify_kind = t.dataset.k;
     c.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x.dataset.k === S.notify_kind));
@@ -742,6 +776,16 @@ function holdStep() {
     S.hold_seconds = h; S.recovery_hold_seconds = r;
     S.recovery_whitelist = c.querySelector("#rwl").value
       .split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
+    const lines = (id) => c.querySelector(id).value
+      .split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
+    S.nostr_on = c.querySelector("#nostron").checked;
+    S.nostr_relays = lines("#nrelays");
+    S.nostr_npubs = lines("#nnpubs");
+    if (S.nostr_on && (!S.nostr_relays.length || !S.nostr_npubs.length)) {
+      err.textContent = "The Nostr transport needs at least one relay and at least one npub. " +
+        "An empty allowlist accepts requests from nobody.";
+      err.classList.add("show"); return;
+    }
     next();
   };
   return c;
@@ -769,6 +813,8 @@ function review() {
     ${kv("Maximum fee", sats(S.policy.max_fee_sat) + " sats @ " + S.policy.max_fee_rate_sat_per_vb + " sat/vB")}
     ${kv("Normal hold", S.hold_seconds + "s")}
     ${kv("Recovery hold", S.recovery_hold_seconds + "s")}
+    ${kv("Nostr transport", S.nostr_on ? (S.nostr_relays.length + " relay(s), "
+        + S.nostr_npubs.length + " allowed device(s)") : "off — HTTP only")}
     ${kv("Escape address", (S.recovery_whitelist && S.recovery_whitelist.length)
         ? S.recovery_whitelist.join(", ")
         : "not set — recovery spends may pay anywhere")}
@@ -787,12 +833,14 @@ function review() {
       S.result = await api("/api/finish", {
         timelock_blocks: S.timelock,
         hardware: S.hardware,
+        server_fingerprint: S.server.master_fingerprint,
         mobile: S.mobile,
         policy: S.policy,
         hold_seconds: S.hold_seconds,
         recovery_hold_seconds: S.recovery_hold_seconds,
         recovery_destination_whitelist: S.recovery_whitelist && S.recovery_whitelist.length
           ? S.recovery_whitelist : null,
+        nostr: S.nostr_on ? { relays: S.nostr_relays, allowed_npubs: S.nostr_npubs } : null,
         ntfy_url: S.notify_kind === "ntfy" ? S.ntfy_url : null,
         smtp: S.notify_kind === "smtp" ? S.smtp : null,
       });

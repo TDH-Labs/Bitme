@@ -84,7 +84,13 @@ fi
     fi
     echo ""
     echo "[server]"
-    printf 'bind_addr = "0.0.0.0:%s"\n' "${COSIGNER_HTTP_PORT:-8080}"
+    # Defaults to all interfaces, which is what Umbrel needs: the container is reached by
+    # app_proxy over the Docker network, and binding to loopback would make it unreachable.
+    # Overridable because "all interfaces" is the wrong answer anywhere the container shares a
+    # network namespace with something else - a host-networked deployment, or an overlay like
+    # WireGuard or Yggdrasil where you want this service on that interface and nothing else.
+    printf 'bind_addr = "%s"\n' \
+        "${COSIGNER_BIND_ADDR:-0.0.0.0:${COSIGNER_HTTP_PORT:-8080}}"
     printf 'gap_limit = %s\n' "${COSIGNER_GAP_LIMIT:-1000}"
     printf 'ledger_db_path = "%s"\n' "$DATA_DIR/ledger.sqlite3"
     # Written by the setup wizard. Emitted unconditionally: if the file is absent (an install

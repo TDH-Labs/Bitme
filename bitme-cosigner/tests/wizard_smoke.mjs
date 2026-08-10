@@ -134,6 +134,7 @@ function makeFetch(calls) {
           descriptor: "wsh(thresh(2,...))", receive_descriptor: "wsh(...)", change_descriptor: "wsh(...)",
           first_address: "tb1qexample", server_fingerprint: "56c4fac3", config_path: "/data/config/wallet.toml",
           api_token: "deadbeef".repeat(8),
+          nostr_npub: body && body.nostr ? "npub1service" : undefined,
           descriptor_qr_svg: "<svg/>", receive_qr_svg: "<svg/>", change_qr_svg: "<svg/>",
         });
       default:
@@ -261,6 +262,54 @@ test("a full run posts everything the operator entered", async () => {
   assert.match(text(doc), /wsh\(thresh/, "the descriptor must be shown");
   assert.match(text(doc), /tb1qexample/, "the first address must be shown for cross-checking");
   assert.match(text(doc), /deadbeef/, "the API token must be shown once");
+  window.close();
+});
+
+test("the Nostr transport is off unless asked for, and validated when it is", async () => {
+  const { window, doc, calls } = await boot();
+  await click(window, $(doc, "#n"));
+  await click(window, $(doc, "#n"));
+  await setValue(window, doc.getElementById("fp"), "4ba43603");
+  await setValue(window, doc.getElementById("xpub"), TPUB_A);
+  await click(window, $(doc, "#n"));
+  await setValue(window, doc.getElementById("fp"), "8dfc9b34");
+  await setValue(window, doc.getElementById("xpub"), TPUB_B);
+  await click(window, $(doc, "#n"));
+  await click(window, doc.getElementById("gen"));
+  await click(window, doc.getElementById("n"));
+  await click(window, doc.getElementById("n"));
+
+  // Hidden until enabled, so it cannot be filled in by accident.
+  assert.ok(doc.getElementById("nostrfields").classList.contains("hidden"));
+  await setValue(window, doc.getElementById("ntfy"), "https://ntfy.sh/test-topic");
+
+  const nostrOn = doc.getElementById("nostron");
+  nostrOn.checked = true;
+  await setValue(window, nostrOn, "on");
+  assert.equal(doc.getElementById("nostrfields").classList.contains("hidden"), false,
+    "ticking the box must reveal the fields");
+
+  // Enabled with an empty allowlist must not advance: an allowlist nobody is on accepts
+  // requests from nobody, which is a slower way of writing "disabled".
+  await setValue(window, doc.getElementById("nrelays"), "wss://relay.damus.io");
+  await click(window, doc.getElementById("n"));
+  assert.match(text(doc), /at least one relay and at least one npub/,
+    "an empty npub allowlist must be refused, not silently accepted");
+
+  await setValue(window, doc.getElementById("nnpubs"), "npub1phone\nnpub1laptop\n");
+  await click(window, doc.getElementById("n"));
+  assert.match(text(doc), /Review/);
+  assert.match(text(doc), /2 allowed device/, "the review must say what was configured");
+  await click(window, doc.getElementById("n"));
+
+  const finish = calls.find((c) => c.path === "/api/finish");
+  assert.deepEqual(finish.body.nostr, {
+    relays: ["wss://relay.damus.io"],
+    allowed_npubs: ["npub1phone", "npub1laptop"],
+  });
+  // The wizard must never send a secret key - the box generates its own.
+  assert.equal(JSON.stringify(finish.body).includes("nsec"), false,
+    "no nsec may ever be sent from the browser");
   window.close();
 });
 
