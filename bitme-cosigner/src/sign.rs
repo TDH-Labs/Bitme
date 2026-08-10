@@ -221,6 +221,8 @@ pub enum SubmitError {
     PreviouslyDenied(String),
     #[error("this exact transaction previously failed to sign: {0}")]
     PreviouslyFailed(String),
+    #[error("this transaction was replaced by a later one spending the same input ({0}) - submit the replacement instead")]
+    Superseded(String),
     #[error("failed to deliver the out-of-band notification - refusing to queue this spend: {0}")]
     NotifyFailed(String),
     #[error(transparent)]
@@ -328,6 +330,11 @@ pub async fn submit_for_signing(
             PendingStatus::Failed => Err(SubmitError::PreviouslyFailed(
                 row.message.unwrap_or_default(),
             )),
+            // Resubmitting a transaction that a later one already replaced. Not an error worth
+            // dressing up: the newer spend is the live one.
+            PendingStatus::Superseded => {
+                Err(SubmitError::Superseded(row.message.unwrap_or_default()))
+            }
             PendingStatus::Signed => Err(SubmitError::Internal(anyhow::anyhow!(
                 "pending row for {txid} is signed but the ledger has no matching record"
             ))),
@@ -352,6 +359,26 @@ pub async fn submit_for_signing(
     ltx.insert_pending(&txid, &psbt_base64, spend_sat, fee_sat, now, hold_until)
         .await?;
     ltx.commit().await?;
+
+    // A fee bump spends the same inputs as the transaction it replaces, so at most one of them
+    // can ever confirm. Leaving the older one queued would sign both, each consuming the rolling
+    // budget - so the operator's cap would be charged twice for one payment, and the second
+    // signature would be for a transaction that can never confirm anyway.
+    //
+    // Only ever applied to rows that are still `pending`, i.e. never signed. Those contributed
+    // nothing to the rolling totals in the first place (the ledger is written at signing time),
+    // so superseding one un-records nothing and cannot be used to reclaim budget. A conflict
+    // with an *already-signed* spend is deliberately left alone and merely reported - this
+    // service cannot know whether that one was broadcast or confirmed, and quietly refunding its
+    // budget on the strength of a conflicting submission would be exactly the wrong guess.
+    let superseded = supersede_conflicting_pending(ledger, &psbt, &txid).await?;
+    if !superseded.is_empty() {
+        tracing::info!(
+            txid = %txid,
+            replaced = ?superseded,
+            "this spend replaces earlier queued one(s) sharing an input - they will not be signed"
+        );
+    }
 
     // Notification happens outside the transaction (it's network I/O) - see the module doc on
     // why failure here must roll the queue entry to a terminal `failed` state rather than
@@ -390,6 +417,45 @@ pub async fn submit_for_signing(
     ledger.mark_notified(&txid, now).await?;
 
     Ok(SubmitOutcome::Queued { txid, hold_until })
+}
+
+/// Marks every still-pending row that shares an input with `psbt` as superseded by `txid`.
+///
+/// Two transactions spending the same outpoint are mutually exclusive on-chain: at most one can
+/// confirm. That is what a fee bump is, and it is also what a corrected or re-targeted spend is.
+/// Returns the txids that were superseded, for logging.
+async fn supersede_conflicting_pending(
+    ledger: &Ledger,
+    psbt: &Psbt,
+    txid: &str,
+) -> Result<Vec<String>> {
+    let mine: std::collections::HashSet<bitcoin::OutPoint> = psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|i| i.previous_output)
+        .collect();
+
+    let mut superseded = Vec::new();
+    for row in ledger.all_pending().await? {
+        if row.txid == txid {
+            continue;
+        }
+        // A stored PSBT that no longer parses is not a reason to fail a fresh submission; skip
+        // it and let the sweeper deal with it on its own terms.
+        let Ok(other) = Psbt::from_str(&row.psbt_base64) else {
+            continue;
+        };
+        let conflicts = other
+            .unsigned_tx
+            .input
+            .iter()
+            .any(|i| mine.contains(&i.previous_output));
+        if conflicts && ledger.mark_superseded(&row.txid, txid).await? {
+            superseded.push(row.txid);
+        }
+    }
+    Ok(superseded)
 }
 
 #[derive(Debug)]
@@ -1139,6 +1205,162 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// A fee bump spends the same input as the transaction it replaces, so at most one can ever
+    /// confirm. Signing both would charge the operator's rolling cap twice for one payment, and
+    /// the second signature would be for something that can never confirm.
+    #[tokio::test]
+    async fn a_fee_bump_supersedes_the_spend_it_replaces_and_is_charged_once() {
+        let f = queue_fixture("COSIGNER_TEST_FEE_BUMP", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+
+        // Original: 100_000 in, 10_000 fee, so 90_000 to the destination.
+        let original = hot_psbt(&f.chain, &f.wallet, 0x91, 0, 100_000, 10_000);
+        let original_txid = original.unsigned_tx.compute_txid().to_string();
+        let report = inspect::inspect(&original, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        submit_for_signing(
+            original,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &f.cfg.recovery_config(),
+            &notifier,
+            600,
+            1_000,
+        )
+        .await
+        .unwrap();
+
+        // The bump: same input, larger fee, so a different txid but a conflicting spend.
+        let mut bumped = hot_psbt(&f.chain, &f.wallet, 0x91, 0, 100_000, 25_000);
+        // `hot_psbt` funds a fresh outpoint per txid byte; reuse the original's input so this is
+        // genuinely a replacement rather than an unrelated spend.
+        bumped.unsigned_tx.output[0].value = bitcoin::Amount::from_sat(75_000);
+        let bumped_txid = bumped.unsigned_tx.compute_txid().to_string();
+        assert_ne!(bumped_txid, original_txid);
+
+        let report = inspect::inspect(&bumped, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        submit_for_signing(
+            bumped,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &f.cfg.recovery_config(),
+            &notifier,
+            600,
+            1_100,
+        )
+        .await
+        .unwrap();
+
+        let old = f.ledger.get_pending(&original_txid).await.unwrap().unwrap();
+        assert_eq!(
+            old.status,
+            PendingStatus::Superseded,
+            "the replaced spend must not stay queued for signing"
+        );
+        assert_eq!(
+            f.ledger.due_pending(999_999).await.unwrap(),
+            vec![bumped_txid],
+            "only the replacement should ever be signed"
+        );
+
+        // Sweep, and confirm the rolling total reflects one payment rather than two.
+        sweep_due(
+            &f.ledger,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.policy,
+            &f.cfg.recovery_config(),
+            &f.chain_as_dyn(),
+            50,
+            999_999,
+        )
+        .await;
+        let totals = f.ledger.rolling_totals(999_999).await.unwrap();
+        assert_eq!(
+            totals.day_sat, 75_000,
+            "the cap must be charged once, for the transaction that can actually confirm"
+        );
+    }
+
+    /// Superseding only ever touches rows that were never signed, so it cannot be used to
+    /// reclaim budget that has already been spent.
+    #[tokio::test]
+    async fn superseding_cannot_refund_an_already_signed_spend() {
+        let f = queue_fixture("COSIGNER_TEST_NO_REFUND", u64::MAX, u64::MAX).await;
+        let notifier = RecordingNotifier::new();
+
+        let first = hot_psbt(&f.chain, &f.wallet, 0x92, 0, 100_000, 10_000);
+        let report = inspect::inspect(&first, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        submit_for_signing(
+            first,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &f.cfg.recovery_config(),
+            &notifier,
+            0,
+            1_000,
+        )
+        .await
+        .unwrap();
+        sweep_due(
+            &f.ledger,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.policy,
+            &f.cfg.recovery_config(),
+            &f.chain_as_dyn(),
+            50,
+            2_000,
+        )
+        .await;
+        let after_first = f.ledger.rolling_totals(2_000).await.unwrap();
+        assert_eq!(
+            after_first.day_sat, 90_000,
+            "the first spend was signed and charged"
+        );
+
+        // A conflicting submission arrives afterwards. The signed spend may already be on-chain,
+        // so its budget must stay spent.
+        let mut conflicting = hot_psbt(&f.chain, &f.wallet, 0x92, 0, 100_000, 25_000);
+        conflicting.unsigned_tx.output[0].value = bitcoin::Amount::from_sat(75_000);
+        let report =
+            inspect::inspect(&conflicting, &f.wallet, &f.cfg, f.chain.as_ref(), 50).unwrap();
+        submit_for_signing(
+            conflicting,
+            report,
+            &f.wallet,
+            &f.cfg,
+            &f.server_key,
+            &f.ledger,
+            &f.policy,
+            &f.cfg.recovery_config(),
+            &notifier,
+            600,
+            2_100,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            f.ledger.rolling_totals(2_100).await.unwrap().day_sat,
+            90_000,
+            "a conflicting submission must not un-charge a spend that was already signed"
+        );
     }
 
     #[tokio::test]

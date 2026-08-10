@@ -572,7 +572,7 @@ notification rather than pretending the delay is a wall.
 
 ## Current status
 
-Working and tested — 216 unit tests, plus integration tests against a real regtest node:
+Working and tested — 219 unit tests, plus integration tests against a real regtest node:
 
 - Descriptor construction with machine-checked invariant proofs
 - Transaction inspection with independent on-chain verification
@@ -589,6 +589,9 @@ Working and tested — 216 unit tests, plus integration tests against a real reg
   see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)
 - **Recovery contacts** (`[recovery_contacts]`) — a k-of-n quorum of people you name can release a
   queued spend's remaining hold, and can do nothing else
+- **Fee-bump handling** — a replacement spending the same input supersedes the spend it replaces,
+  so one payment is charged against your caps once rather than twice
+- **Nostr transport setup in the browser**, with the service's own identity generated on the box
 - **Repeat notifications** during a hold, so one missed message doesn't cost you the veto window
 - **API token** on `/inspect` and `/sign_psbt`, generated at setup. The stop-things-happening
   endpoints stay open on purpose — see [HTTP API](#http-api)

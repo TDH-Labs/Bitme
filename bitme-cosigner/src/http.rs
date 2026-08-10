@@ -363,6 +363,7 @@ fn pending_status_str(status: PendingStatus) -> &'static str {
         PendingStatus::Signed => "signed",
         PendingStatus::Denied => "denied",
         PendingStatus::Failed => "failed",
+        PendingStatus::Superseded => "superseded",
     }
 }
 
@@ -421,7 +422,8 @@ impl From<SubmitError> for ApiError {
             SubmitError::Frozen(_) => StatusCode::SERVICE_UNAVAILABLE,
             SubmitError::Vetoed
             | SubmitError::PreviouslyDenied(_)
-            | SubmitError::PreviouslyFailed(_) => StatusCode::CONFLICT,
+            | SubmitError::PreviouslyFailed(_)
+            | SubmitError::Superseded(_) => StatusCode::CONFLICT,
             SubmitError::NotifyFailed(_) => StatusCode::BAD_GATEWAY,
             SubmitError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -433,6 +435,7 @@ impl From<SubmitError> for ApiError {
             SubmitError::Vetoed => "vetoed",
             SubmitError::PreviouslyDenied(_) => "previously_denied",
             SubmitError::PreviouslyFailed(_) => "previously_failed",
+            SubmitError::Superseded(_) => "superseded",
             SubmitError::NotifyFailed(_) => "notify_failed",
             SubmitError::Internal(_) => "internal",
         };
@@ -561,6 +564,9 @@ async fn get_sign_psbt_handler(
         PendingStatus::Vetoed => StatusCode::CONFLICT,
         PendingStatus::Denied => StatusCode::UNPROCESSABLE_ENTITY,
         PendingStatus::Failed => StatusCode::INTERNAL_SERVER_ERROR,
+        // Replaced by a later submission spending the same input. 409 for the same reason a
+        // veto is: the caller asked about something that will never proceed.
+        PendingStatus::Superseded => StatusCode::CONFLICT,
     };
     Ok((
         http_status,

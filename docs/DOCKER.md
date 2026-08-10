@@ -34,6 +34,12 @@ Edit `.env`:
 - `COSIGNER_SERVER_XPRV` - your SERVER xprv from above. This file is gitignored; never commit it.
 - Leave `BITCOIND_RPC_URL`/`USER`/`PASSWORD` as-is if you're using the bundled signet node below;
   otherwise point them at your own node.
+- `COSIGNER_BIND_ADDR` - optional, defaults to `0.0.0.0:8080`. All interfaces is right when the
+  container has its own network namespace and is reached through a proxy, which is the normal
+  Docker and Umbrel case. Set it explicitly if this container shares a namespace with anything
+  else, or if you want the service on one specific interface and nowhere else - a WireGuard or
+  Yggdrasil address, say. Binding narrowly is a perimeter, not authentication: see the API token
+  in the README either way.
 
 ## 2. Start (with a bundled local signet node, for testing)
 
