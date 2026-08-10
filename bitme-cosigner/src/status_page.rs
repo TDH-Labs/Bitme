@@ -74,8 +74,7 @@ pub fn render(wallet: &BuiltDescriptor, cfg: &WalletConfig, policy_version: u64)
                 r#"<div class="pane{}" id="p-{}">{}<pre>{}</pre></div>"#,
                 if i == 0 { "" } else { " hidden" },
                 e.id,
-                e.qr
-                    .as_deref()
+                e.qr.as_deref()
                     .map(|q| format!(r#"<div class="qr">{q}</div>"#))
                     .unwrap_or_default(),
                 esc(&e.text)

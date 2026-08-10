@@ -304,7 +304,10 @@ pub(crate) fn validate_derivation_path(v: &str) -> Result<(), String> {
 /// Checks the xpub parses, is on the right network, and has the same depth as `path` - the
 /// exact same checks `KeySpec::validate` runs later, surfaced here so a mismatch is caught
 /// immediately instead of at the very end of the wizard.
-pub(crate) fn validate_xpub_for(network: ChainNetwork, path: &str) -> impl Fn(&str) -> Result<(), String> {
+pub(crate) fn validate_xpub_for(
+    network: ChainNetwork,
+    path: &str,
+) -> impl Fn(&str) -> Result<(), String> {
     let path = path.to_string();
     move |v: &str| {
         let xpub: Xpub = v

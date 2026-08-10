@@ -283,7 +283,9 @@ async fn server_key_handler(
 
 fn generate_server_key(network: ChainNetwork, path_str: &str) -> Result<GeneratedServerKey> {
     let secp = Secp256k1::new();
-    let path: DerivationPath = path_str.parse().context("parsing the default derivation path")?;
+    let path: DerivationPath = path_str
+        .parse()
+        .context("parsing the default derivation path")?;
 
     let mut seed = Zeroizing::new([0u8; 32]);
     bitcoin::secp256k1::rand::rngs::OsRng.fill_bytes(seed.as_mut());
@@ -442,10 +444,7 @@ async fn finish_handler(
     // `WalletConfig::validate` enforces this too, but only after the whole form has been
     // filled in. Rejecting it here, with the reason, beats a late failure on a field the UI
     // could plausibly have presented as optional.
-    let has_ntfy = req
-        .ntfy_url
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty());
+    let has_ntfy = req.ntfy_url.as_ref().is_some_and(|s| !s.trim().is_empty());
     let has_smtp = req
         .smtp
         .as_ref()
@@ -481,8 +480,9 @@ async fn finish_handler(
     cfg.validate()
         .map_err(|e| SetupError::bad_request(format!("{e}")))?;
 
-    let built = descriptor::build_descriptor(&cfg)
-        .map_err(|e| SetupError::bad_request(format!("these keys don't form a valid wallet: {e}")))?;
+    let built = descriptor::build_descriptor(&cfg).map_err(|e| {
+        SetupError::bad_request(format!("these keys don't form a valid wallet: {e}"))
+    })?;
     // Receive index 0, from the external chain - the address the UI tells the operator to
     // cross-check against what Bitcoin Keeper shows after importing the descriptor. A mismatch
     // there is the cheapest possible way to catch a mistyped xpub before any coins move.
@@ -742,9 +742,11 @@ fn parse_scanned_key(payload: &str) -> Option<ScannedKey> {
     let bare = s.split_whitespace().next().unwrap_or(s);
     if bare.len() > 100
         && bare.chars().all(|c| c.is_ascii_alphanumeric())
-        && ["xpub", "tpub", "ypub", "zpub", "Vpub", "Zpub", "upub", "vpub"]
-            .iter()
-            .any(|p| bare.starts_with(p))
+        && [
+            "xpub", "tpub", "ypub", "zpub", "Vpub", "Zpub", "upub", "vpub",
+        ]
+        .iter()
+        .any(|p| bare.starts_with(p))
     {
         return Some(ScannedKey {
             fingerprint: None,
@@ -795,10 +797,22 @@ mod tests {
 
     #[test]
     fn default_path_uses_the_registered_coin_type_per_network() {
-        assert_eq!(default_derivation_path(ChainNetwork::Mainnet), "48h/0h/0h/2h");
-        assert_eq!(default_derivation_path(ChainNetwork::Signet), "48h/1h/0h/2h");
-        assert_eq!(default_derivation_path(ChainNetwork::Regtest), "48h/1h/0h/2h");
-        assert_eq!(default_derivation_path(ChainNetwork::Testnet), "48h/1h/0h/2h");
+        assert_eq!(
+            default_derivation_path(ChainNetwork::Mainnet),
+            "48h/0h/0h/2h"
+        );
+        assert_eq!(
+            default_derivation_path(ChainNetwork::Signet),
+            "48h/1h/0h/2h"
+        );
+        assert_eq!(
+            default_derivation_path(ChainNetwork::Regtest),
+            "48h/1h/0h/2h"
+        );
+        assert_eq!(
+            default_derivation_path(ChainNetwork::Testnet),
+            "48h/1h/0h/2h"
+        );
     }
 
     #[test]
@@ -828,7 +842,10 @@ mod tests {
     fn key_expression_notation_matches_the_descriptor() {
         let expr = key_expression("AB12CD34", "48h/1h/0h/2h", "tpubEXAMPLE");
         assert_eq!(expr, "[ab12cd34/48'/1'/0'/2']tpubEXAMPLE");
-        assert!(!expr.contains('h'), "hardened marker must be an apostrophe: {expr}");
+        assert!(
+            !expr.contains('h'),
+            "hardened marker must be an apostrophe: {expr}"
+        );
 
         // Already-canonical input is left alone, and `m/` prefixes are stripped.
         assert_eq!(
