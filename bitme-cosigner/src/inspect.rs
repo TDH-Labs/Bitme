@@ -53,15 +53,15 @@ pub enum OutputKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpendingPath {
     /// Every input's nSequence is too low to satisfy `older(N)`, so the only combination that
-    /// can possibly spend it is SATOCHIP + SERVER. This is the only path this service
+    /// can possibly spend it is HARDWARE + SERVER. This is the only path this service
     /// currently co-signs.
     Hot,
     /// Every input's nSequence satisfies `older(N)` and a MOBILE signature is already present,
-    /// so this is one of the two recovery combinations - either SATOCHIP + MOBILE (this
-    /// service isn't needed at all) or MOBILE + SERVER (the lost-SATOCHIP path).
+    /// so this is one of the two recovery combinations - either HARDWARE + MOBILE (this
+    /// service isn't needed at all) or MOBILE + SERVER (the lost-HARDWARE path).
     ///
     /// This service refuses to co-sign these today: it fails closed. Co-signing the
-    /// MOBILE + SERVER combination is what makes a destroyed SATOCHIP survivable, and it needs
+    /// MOBILE + SERVER combination is what makes a destroyed HARDWARE survivable, and it needs
     /// its own policy (a full-balance sweep is the legitimate use, so the ordinary per-tx caps
     /// are the wrong gate) - see the README's roadmap.
     Recovery,
@@ -254,7 +254,7 @@ fn classify_input_path(
     if !older_satisfied {
         // `older(N)` guards the whole MOBILE branch, and it's a consensus-level constraint on
         // this input's nSequence: if it isn't met, no witness using MOBILE can ever be valid,
-        // regardless of what gets signed. That leaves SATOCHIP + SERVER as the only possible
+        // regardless of what gets signed. That leaves HARDWARE + SERVER as the only possible
         // combination, so this is unambiguously HOT.
         return InputPath::Hot;
     }
@@ -443,7 +443,7 @@ mod tests {
         let role_keys = role_keys_at(&f.wallet, &f.cfg, Chain::External, 0).unwrap();
         psbt.inputs[0]
             .partial_sigs
-            .insert(role_keys.satochip, any_sig());
+            .insert(role_keys.hardware, any_sig());
 
         let report = inspect(&psbt, &f.wallet, &f.cfg, &f.chain, 50).unwrap();
         assert_eq!(report.inputs.len(), 1);
@@ -479,7 +479,7 @@ mod tests {
         let role_keys = role_keys_at(&f.wallet, &f.cfg, Chain::External, 0).unwrap();
         psbt.inputs[0]
             .partial_sigs
-            .insert(role_keys.satochip, any_sig());
+            .insert(role_keys.hardware, any_sig());
         psbt.inputs[0]
             .partial_sigs
             .insert(role_keys.server, any_sig());
@@ -508,7 +508,7 @@ mod tests {
         let role_keys = role_keys_at(&f.wallet, &f.cfg, Chain::External, 2).unwrap();
         psbt.inputs[0]
             .partial_sigs
-            .insert(role_keys.satochip, any_sig());
+            .insert(role_keys.hardware, any_sig());
         psbt.inputs[0]
             .partial_sigs
             .insert(role_keys.mobile, any_sig());
@@ -539,7 +539,7 @@ mod tests {
         let role_keys = role_keys_at(&f.wallet, &f.cfg, Chain::External, 0).unwrap();
         psbt.inputs[0]
             .partial_sigs
-            .insert(role_keys.satochip, any_sig());
+            .insert(role_keys.hardware, any_sig());
         psbt.inputs[0]
             .partial_sigs
             .insert(role_keys.mobile, any_sig());
@@ -549,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_when_only_satochip_has_signed_and_sequence_allows_either_path() {
+    fn ambiguous_when_only_hardware_has_signed_and_sequence_allows_either_path() {
         let f = fixture(12960);
         let outpoint = OutPoint::new(fake_txid(5), 0);
         let our_txout = f.own_utxo(Chain::External, 0, outpoint, 100_000, 6);
@@ -568,7 +568,7 @@ mod tests {
         let role_keys = role_keys_at(&f.wallet, &f.cfg, Chain::External, 0).unwrap();
         psbt.inputs[0]
             .partial_sigs
-            .insert(role_keys.satochip, any_sig());
+            .insert(role_keys.hardware, any_sig());
 
         let report = inspect(&psbt, &f.wallet, &f.cfg, &f.chain, 50).unwrap();
         assert_eq!(report.spending_path, SpendingPath::Ambiguous);
@@ -717,7 +717,7 @@ mod tests {
         psbt.outputs[0].bip32_derivation.insert(
             role_keys_at(&f.wallet, &f.cfg, Chain::External, 0)
                 .unwrap()
-                .satochip
+                .hardware
                 .inner,
             dummy_key_source(),
         );

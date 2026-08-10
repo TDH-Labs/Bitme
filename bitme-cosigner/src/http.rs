@@ -23,6 +23,7 @@ use crate::ledger::{Ledger, PendingStatus};
 use crate::notify::Notifier;
 use crate::policy::{CompiledPolicy, PolicyConfig};
 use crate::policy_auth::{self, PolicyAuthError};
+use crate::recovery_contacts;
 use crate::sign::{self, LedgerOutcome, SignPsbtError, SubmitError, SubmitOutcome};
 use crate::signing::{ServerSigningKey, SigningError};
 
@@ -47,6 +48,16 @@ pub struct AppState {
     pub ledger: Arc<Ledger>,
     /// Only used by `/sign_psbt` and `/policy`.
     pub policy: Arc<RwLock<PolicyHandle>>,
+    /// The hardware key's authorized signing keys, derived once at startup. Used by
+    /// `POST /policy` and `POST /unfreeze` - see `policy_auth::HardwareAuthKeys` for why this is
+    /// precomputed rather than derived per request.
+    pub auth_keys: Arc<policy_auth::HardwareAuthKeys>,
+    /// Bearer token required by `/inspect` and `/sign_psbt`, if one is configured. `None`
+    /// disables the check entirely - see `config::ServerConfig::api_token_file`.
+    pub api_token: Option<Arc<str>>,
+    /// Recovery contacts and the quorum size, if configured. `None` means social recovery is off
+    /// and `POST /recovery/approve/{id}` refuses everything.
+    pub recovery_contacts: Option<Arc<(std::collections::HashSet<nostr_sdk::PublicKey>, usize)>>,
     /// Only used by `/sign_psbt`.
     pub notifier: Arc<dyn Notifier>,
     /// Only used by `/sign_psbt`. How long an approved spend is held (and vetoable) before the
@@ -54,20 +65,76 @@ pub struct AppState {
     pub hold_seconds: i64,
 }
 
+/// Rejects a request to a token-protected route unless it carries the configured bearer token.
+///
+/// Only ever applied to `/inspect` and `/sign_psbt` - see [`crate::config::ServerConfig`] for why
+/// the stop-things-happening endpoints are deliberately left open. Comparison is
+/// constant-time-ish by construction: tokens are compared as whole byte slices via `ct_eq`-style
+/// folding rather than `==` short-circuiting on the first differing byte.
+async fn require_token(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(expected) = state.api_token.as_deref() else {
+        return next.run(request).await;
+    };
+
+    let presented = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        next.run(request).await
+    } else {
+        ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            error: "unauthorized",
+            message: "this endpoint requires an Authorization: Bearer <token> header".to_string(),
+        }
+        .into_response()
+    }
+}
+
+/// Length-independent equality. Not a defence against a serious timing attack over a LAN - the
+/// noise floor is far above the signal - but comparing secrets with `==` is the kind of thing
+/// that is free to get right and awkward to explain later.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 pub fn router(state: AppState) -> Router {
+    // Split deliberately. The endpoints that *consume* something - budget, notifications,
+    // unbounded per-input chain work - sit behind the token. The endpoints that only ever *stop*
+    // something happening stay open, because the worst they can do is deny service and they have
+    // to work from whatever device is to hand during an emergency.
+    let guarded = Router::new()
+        .route("/inspect", post(inspect_handler))
+        .route("/sign_psbt", post(sign_psbt_handler))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_token,
+        ));
+
     Router::new()
         // `/` had no route at all, so opening the app from Umbrel's dashboard after setup
         // returned a bare 404. It also gives the wallet descriptor a permanent home: the setup
         // wizard showed it once and then vanished on the first restart.
         .route("/", get(status_page_handler))
         .route("/health", get(health_handler))
-        .route("/inspect", post(inspect_handler))
-        .route("/sign_psbt", post(sign_psbt_handler))
         .route("/sign_psbt/{id}", get(get_sign_psbt_handler))
         .route("/veto/{id}", post(veto_handler))
         .route("/policy", get(get_policy_handler).post(post_policy_handler))
         .route("/freeze", get(get_freeze_handler).post(post_freeze_handler))
         .route("/unfreeze", post(post_unfreeze_handler))
+        .route("/recovery/approve/{id}", post(recovery_approve_handler))
+        .merge(guarded)
         .with_state(state)
 }
 
@@ -613,13 +680,13 @@ async fn get_policy_handler(State(state): State<AppState>) -> Json<PolicyRespons
 struct PolicyChangeRequestJson {
     policy: PolicyConfig,
     version: u64,
-    /// Base64-encoded standard Bitcoin signed message, produced by SATOCHIP, over the exact
+    /// Base64-encoded standard Bitcoin signed message, produced by HARDWARE, over the exact
     /// text `policy_auth::canonical_message(version, &policy)` renders - see that function's
     /// docs for the format a human needs to actually sign.
     signature: String,
 }
 
-/// Applies a SATOCHIP-authorized policy change - see `policy_auth.rs`. On success, hot-swaps
+/// Applies a HARDWARE-authorized policy change - see `policy_auth.rs`. On success, hot-swaps
 /// the policy every other handler reads, with no restart required.
 async fn post_policy_handler(
     State(state): State<AppState>,
@@ -628,7 +695,7 @@ async fn post_policy_handler(
     let outcome = policy_auth::apply_policy_change(
         &state.ledger,
         &state.cfg,
-        state.gap_limit,
+        &state.auth_keys,
         policy_auth::PolicyChangeRequest {
             policy: req.policy,
             version: req.version,
@@ -722,6 +789,7 @@ mod tests {
             .await
             .unwrap();
 
+        let auth_keys = policy_auth::HardwareAuthKeys::from_config(&cfg, 50).unwrap();
         let state = AppState {
             wallet: Arc::new(wallet),
             cfg: Arc::new(cfg),
@@ -733,6 +801,9 @@ mod tests {
                 version: seeded.version,
                 compiled: policy,
             })),
+            auth_keys: Arc::new(auth_keys),
+            api_token: None,
+            recovery_contacts: None,
             notifier: Arc::new(RecordingNotifier::new()),
             hold_seconds,
         };
@@ -804,6 +875,277 @@ mod tests {
             serde_json::from_slice(&bytes).unwrap()
         };
         (status, json)
+    }
+
+    /// As `call`, but presenting a bearer token.
+    async fn call_with_token(
+        app: Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        token: &str,
+    ) -> (StatusCode, Value) {
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+        let body = match body {
+            Some(b) => {
+                builder = builder.header("content-type", "application/json");
+                axum::body::Body::from(b.to_string())
+            }
+            None => axum::body::Body::empty(),
+        };
+        let response = app.oneshot(builder.body(body).unwrap()).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, json)
+    }
+
+    /// The token gates what *consumes* something - rolling budget, notifications, unbounded
+    /// per-input chain work - and deliberately does not gate what only ever *stops* things
+    /// happening.
+    #[tokio::test]
+    async fn the_token_guards_submission_but_never_the_panic_buttons() {
+        let (mut state, chain) = test_state(1_000_000).await;
+        state.api_token = Some(Arc::from("s3cret-token"));
+        let psbt = hot_psbt(&chain, &state.wallet, 0x71);
+        let body = serde_json::json!({ "psbt": psbt.to_string() });
+
+        for uri in ["/sign_psbt", "/inspect"] {
+            let (status, json) = call(router(state.clone()), "POST", uri, Some(body.clone())).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{uri} must require a token"
+            );
+            assert_eq!(json["error"], "unauthorized");
+        }
+
+        let (status, _) = call_with_token(
+            router(state.clone()),
+            "POST",
+            "/sign_psbt",
+            Some(body.clone()),
+            "not-the-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "a wrong token is refused");
+
+        let (status, json) = call_with_token(
+            router(state.clone()),
+            "POST",
+            "/sign_psbt",
+            Some(body),
+            "s3cret-token",
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "got: {json}");
+
+        // Unguarded on purpose: these must work in a hurry, from whatever device is to hand, and
+        // the worst an unauthenticated caller achieves with them is denial of service.
+        let (status, _) = call(router(state.clone()), "POST", "/freeze", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(router(state.clone()), "GET", "/health", None).await;
+        assert_eq!(status, StatusCode::OK);
+        // 404 (unknown id), not 401 - proof it was never behind the token.
+        let (status, _) = call(router(state), "POST", "/veto/never-seen", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A quorum releases the hold, and *only* the hold. Everything else about the row is
+    /// untouched, and policy is still re-evaluated when it fires - which is the entire security
+    /// argument for letting other people influence this service at all.
+    #[tokio::test]
+    async fn a_recovery_quorum_releases_the_hold_and_nothing_else() {
+        use nostr_sdk::prelude::*;
+
+        let (mut state, chain) = test_state(1_000_000).await;
+        let (a, b, stranger) = (Keys::generate(), Keys::generate(), Keys::generate());
+        state.recovery_contacts = Some(Arc::new((
+            [a.public_key(), b.public_key()].into_iter().collect(),
+            2,
+        )));
+
+        let psbt = hot_psbt(&chain, &state.wallet, 0x81);
+        let (status, body) = call(
+            router(state.clone()),
+            "POST",
+            "/sign_psbt",
+            Some(serde_json::json!({ "psbt": psbt.to_string() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "got: {body}");
+        let id = body["id"].as_str().unwrap().to_string();
+
+        let before = state.ledger.get_pending(&id).await.unwrap().unwrap();
+        assert!(state
+            .ledger
+            .due_pending(now_unix())
+            .await
+            .unwrap()
+            .is_empty());
+
+        let sign = |k: &Keys, msg: &str| {
+            EventBuilder::text_note(msg)
+                .sign_with_keys(k)
+                .unwrap()
+                .as_json()
+        };
+        let msg = recovery_contacts::canonical_approval_message(&id);
+
+        // One contact is not a quorum.
+        let (status, _) = call(
+            router(state.clone()),
+            "POST",
+            &format!("/recovery/approve/{id}"),
+            Some(serde_json::json!({ "approvals": [sign(&a, &msg)] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Neither is one contact plus somebody who isn't on the list.
+        let (status, _) = call(
+            router(state.clone()),
+            "POST",
+            &format!("/recovery/approve/{id}"),
+            Some(serde_json::json!({ "approvals": [sign(&a, &msg), sign(&stranger, &msg)] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            state
+                .ledger
+                .due_pending(now_unix())
+                .await
+                .unwrap()
+                .is_empty(),
+            "a failed quorum must not have moved anything"
+        );
+
+        // Two distinct contacts is.
+        let (status, body) = call(
+            router(state.clone()),
+            "POST",
+            &format!("/recovery/approve/{id}"),
+            Some(serde_json::json!({ "approvals": [sign(&a, &msg), sign(&b, &msg)] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "got: {body}");
+        assert_eq!(body["approvals"], 2);
+        assert_eq!(body["released"], true);
+
+        let after = state.ledger.get_pending(&id).await.unwrap().unwrap();
+        assert_eq!(
+            state.ledger.due_pending(now_unix()).await.unwrap(),
+            vec![id.clone()],
+            "the spend is now due"
+        );
+
+        // ...and that is genuinely all that changed. If a quorum could alter any of these, it
+        // would be able to influence what gets signed rather than merely when.
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.psbt_base64, before.psbt_base64);
+        assert_eq!(after.spend_amount_sat, before.spend_amount_sat);
+        assert_eq!(after.fee_sat, before.fee_sat);
+        assert!(after.hold_until < before.hold_until);
+    }
+
+    /// A quorum cannot resurrect a spend the owner already vetoed. The veto is the owner's
+    /// override and must outrank anybody else's opinion.
+    #[tokio::test]
+    async fn a_quorum_cannot_revive_a_vetoed_spend() {
+        use nostr_sdk::prelude::*;
+
+        let (mut state, chain) = test_state(1_000_000).await;
+        let (a, b) = (Keys::generate(), Keys::generate());
+        state.recovery_contacts = Some(Arc::new((
+            [a.public_key(), b.public_key()].into_iter().collect(),
+            2,
+        )));
+
+        let psbt = hot_psbt(&chain, &state.wallet, 0x82);
+        let (_, body) = call(
+            router(state.clone()),
+            "POST",
+            "/sign_psbt",
+            Some(serde_json::json!({ "psbt": psbt.to_string() })),
+        )
+        .await;
+        let id = body["id"].as_str().unwrap().to_string();
+
+        let (status, _) = call(router(state.clone()), "POST", &format!("/veto/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let msg = recovery_contacts::canonical_approval_message(&id);
+        let sign = |k: &Keys| {
+            EventBuilder::text_note(msg.clone())
+                .sign_with_keys(k)
+                .unwrap()
+                .as_json()
+        };
+        let (status, json) = call(
+            router(state.clone()),
+            "POST",
+            &format!("/recovery/approve/{id}"),
+            Some(serde_json::json!({ "approvals": [sign(&a), sign(&b)] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "got: {json}");
+        assert!(state
+            .ledger
+            .due_pending(now_unix())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Social recovery off is the default, and off must mean refused rather than ignored.
+    #[tokio::test]
+    async fn recovery_approval_is_refused_when_no_contacts_are_configured() {
+        let (state, chain) = test_state(1_000_000).await;
+        assert!(state.recovery_contacts.is_none());
+        let psbt = hot_psbt(&chain, &state.wallet, 0x83);
+        let (_, body) = call(
+            router(state.clone()),
+            "POST",
+            "/sign_psbt",
+            Some(serde_json::json!({ "psbt": psbt.to_string() })),
+        )
+        .await;
+        let id = body["id"].as_str().unwrap().to_string();
+
+        let (status, _) = call(
+            router(state),
+            "POST",
+            &format!("/recovery/approve/{id}"),
+            Some(serde_json::json!({ "approvals": [] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// With no token configured the API behaves exactly as before - an existing install must not
+    /// stop answering its own coordinator on upgrade.
+    #[tokio::test]
+    async fn no_configured_token_means_no_authentication() {
+        let (state, chain) = test_state(1_000_000).await;
+        assert!(state.api_token.is_none());
+        let psbt = hot_psbt(&chain, &state.wallet, 0x72);
+
+        let (status, _) = call(
+            router(state),
+            "POST",
+            "/sign_psbt",
+            Some(serde_json::json!({ "psbt": psbt.to_string() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
@@ -927,14 +1269,14 @@ mod tests {
 
     // ---- M6: GET/POST /policy ----
 
-    fn sign_satochip_message(message: &str) -> String {
+    fn sign_hardware_message(message: &str) -> String {
         use bitcoin::secp256k1::{Message, Secp256k1};
 
-        let (_, satochip_xprv) = test_key_spec_with_xpriv(0x01);
+        let (_, hardware_xprv) = test_key_spec_with_xpriv(0x01);
         let secp = Secp256k1::new();
         let msg_hash = bitcoin::sign_message::signed_msg_hash(message);
         let msg = Message::from_digest(msg_hash.to_byte_array());
-        let sig = secp.sign_ecdsa_recoverable(&msg, &satochip_xprv.private_key);
+        let sig = secp.sign_ecdsa_recoverable(&msg, &hardware_xprv.private_key);
         bitcoin::sign_message::MessageSignature::new(sig, true).to_base64()
     }
 
@@ -958,7 +1300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_policy_with_a_valid_satochip_signature_hot_swaps_the_running_policy() {
+    async fn post_policy_with_a_valid_hardware_signature_hot_swaps_the_running_policy() {
         let (state, chain) = test_state(1_000_000).await;
 
         let new_policy = serde_json::json!({
@@ -974,7 +1316,7 @@ mod tests {
             2,
             &serde_json::from_value(new_policy.clone()).unwrap(),
         );
-        let signature = sign_satochip_message(&message);
+        let signature = sign_hardware_message(&message);
 
         let (status, body) = call(
             router(state.clone()),
@@ -1010,7 +1352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_policy_rejects_a_signature_from_a_non_satochip_key() {
+    async fn post_policy_rejects_a_signature_from_a_non_hardware_key() {
         let (state, _chain) = test_state(1_000_000).await;
 
         let new_policy = serde_json::json!({
@@ -1022,7 +1364,7 @@ mod tests {
             "max_fee_rate_sat_per_vb": f64::MAX,
             "destination_whitelist": null,
         });
-        // Signed with SERVER's own key instead of SATOCHIP's.
+        // Signed with SERVER's own key instead of HARDWARE's.
         let message = crate::policy_auth::canonical_message(
             2,
             &serde_json::from_value(new_policy.clone()).unwrap(),
@@ -1068,7 +1410,7 @@ mod tests {
             99,
             &serde_json::from_value(new_policy.clone()).unwrap(),
         );
-        let signature = sign_satochip_message(&message);
+        let signature = sign_hardware_message(&message);
 
         let (status, body) = call(
             router(state),
@@ -1111,10 +1453,10 @@ async fn get_freeze_handler(
 /// Halts all co-signing until explicitly unfrozen. **Deliberately unauthenticated.**
 ///
 /// This is the "my phone was just stolen" button, and it needs to work from whatever device is
-/// to hand, in a hurry, possibly without your Satochip. Freezing is fail-safe: the worst an
+/// to hand, in a hurry, possibly without your hardware key. Freezing is fail-safe: the worst an
 /// attacker achieves by calling it is denial of service, which is strictly better than the
 /// theft it exists to prevent. *Unfreezing* is the privileged direction, and that one requires
-/// a SATOCHIP signature - see [`post_unfreeze_handler`].
+/// a HARDWARE signature - see [`post_unfreeze_handler`].
 ///
 /// A freeze survives restarts (it's a ledger row), so "turn it off and on again" will not
 /// silently disarm it.
@@ -1136,14 +1478,14 @@ async fn post_freeze_handler(
     }))
 }
 
-/// Resumes co-signing. Requires a SATOCHIP-signed message over the exact text
+/// Resumes co-signing. Requires a HARDWARE-signed message over the exact text
 /// `policy_auth::canonical_unfreeze_message(generation)`, where `generation` is the *current
 /// freeze generation* (see `GET /freeze`) - which both proves hardware possession and stops an
 /// old unfreeze authorization from being replayed to lift a later, unrelated freeze. Generation,
 /// not policy version: freezing and policy changes are unrelated events, and binding to the
 /// latter would let one captured signature re-unfreeze indefinitely.
 ///
-/// If you've lost the SATOCHIP itself, use the `cosigner unfreeze` CLI on the server instead:
+/// If you've lost the HARDWARE itself, use the `cosigner unfreeze` CLI on the server instead:
 /// requiring the hardware here would make a freeze unrecoverable in exactly the scenario the
 /// recovery path exists for.
 async fn post_unfreeze_handler(
@@ -1151,19 +1493,14 @@ async fn post_unfreeze_handler(
     Json(req): Json<UnfreezeRequest>,
 ) -> Result<Json<FreezeResponse>, ApiError> {
     let generation = state.ledger.freeze_generation().await.map_err(internal)?;
-    policy_auth::verify_unfreeze_authorization(
-        &state.cfg,
-        state.gap_limit,
-        generation,
-        &req.signature,
-    )
-    .map_err(ApiError::from)?;
+    policy_auth::verify_unfreeze_authorization(&state.auth_keys, generation, &req.signature)
+        .map_err(ApiError::from)?;
     state
         .ledger
         .set_frozen(false, now_unix(), None)
         .await
         .map_err(internal)?;
-    tracing::warn!(generation, "co-signing UNFROZEN by SATOCHIP authorization");
+    tracing::warn!(generation, "co-signing UNFROZEN by HARDWARE authorization");
     Ok(Json(FreezeResponse {
         frozen: false,
         generation,
@@ -1173,6 +1510,97 @@ async fn post_unfreeze_handler(
 #[derive(Debug, Deserialize)]
 struct UnfreezeRequest {
     signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryApprovalRequest {
+    /// Signed Nostr events, one per contact, each with
+    /// `recovery_contacts::canonical_approval_message(txid)` as its content.
+    approvals: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecoveryApprovalResponse {
+    id: String,
+    approvals: usize,
+    threshold: usize,
+    released: bool,
+}
+
+/// Releases a queued spend's remaining hold on the say-so of a quorum of recovery contacts.
+///
+/// **Deliberately the only thing a quorum can do.** It brings `hold_until` forward and nothing
+/// else: the spend was already approved by policy when it was queued, policy is re-evaluated from
+/// scratch when it actually fires, and every consensus rule is untouched. A quorum cannot create
+/// a spend, raise a cap, redirect a destination or revive a vetoed row - see
+/// `recovery_contacts.rs` for why that boundary is the whole design.
+///
+/// Unauthenticated in the bearer-token sense, like `/veto` and `/freeze`: the signatures *are*
+/// the authentication, and requiring the API token as well would mean a contact helping you
+/// recover needed a secret from the box you have lost access to.
+async fn recovery_approve_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RecoveryApprovalRequest>,
+) -> Result<Json<RecoveryApprovalResponse>, ApiError> {
+    let Some(contacts) = state.recovery_contacts.as_ref() else {
+        return Err(ApiError {
+            status: StatusCode::NOT_IMPLEMENTED,
+            error: "recovery_contacts_not_configured",
+            message: "no recovery contacts are configured on this service".to_string(),
+        });
+    };
+    let (allowed, threshold) = (&contacts.0, contacts.1);
+
+    // Refuse before counting votes if there is nothing to release: a quorum spent on a spend that
+    // is already signed, vetoed or gone tells the contacts something useful.
+    match state.ledger.get_pending(&id).await.map_err(internal)? {
+        Some(row) if row.status == PendingStatus::Pending => {}
+        _ => {
+            return Err(ApiError {
+                status: StatusCode::NOT_FOUND,
+                error: "not_pending",
+                message: format!("no spend with id {id} is currently pending"),
+            })
+        }
+    }
+
+    let voters = recovery_contacts::count_distinct_approvals(&id, &req.approvals, allowed)
+        .map_err(|e| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            error: "invalid_approval",
+            message: e.to_string(),
+        })?;
+
+    if voters.len() < threshold {
+        return Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            error: "short_of_quorum",
+            message: format!(
+                "only {} of {threshold} required contacts have approved",
+                voters.len()
+            ),
+        });
+    }
+
+    let released = state
+        .ledger
+        .release_hold(&id, now_unix())
+        .await
+        .map_err(internal)?;
+    tracing::warn!(
+        txid = %id,
+        approvals = voters.len(),
+        threshold,
+        "hold RELEASED early by recovery-contact quorum"
+    );
+
+    Ok(Json(RecoveryApprovalResponse {
+        id,
+        approvals: voters.len(),
+        threshold,
+        released,
+    }))
 }
 
 fn internal(e: anyhow::Error) -> ApiError {

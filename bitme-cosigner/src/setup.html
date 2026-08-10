@@ -47,7 +47,7 @@
   ol.guide b { color: var(--ink); font-weight: 600; }
   label { display: block; font-weight: 600; font-size: 13px; margin: 14px 0 5px; }
   label .hint { display: block; font-weight: 400; color: var(--muted); font-size: 12.5px; margin-top: 2px; }
-  input, textarea {
+  input, textarea, select {
     width: 100%; padding: 9px 11px; border-radius: 8px; border: 1px solid var(--line);
     background: var(--bg); color: var(--ink); font-size: 14px; font-family: inherit;
   }
@@ -122,20 +122,28 @@ const S = {
   network: null,
   defaultPath: "48h/1h/0h/2h",
   timelock: 12960,
-  satochip: null,
+  hardware: null,
   mobile: null,
   server: null,
+  matrix: null,
+  coordinator: null,
+  hardware_id: null,
+  options: [],
+  resolution: null,
+  /// True only when the operator explicitly ticked past a known-incompatible pairing.
+  compat_ack: false,
   policy: { max_tx_sat: 500000, max_daily_sat: 1000000, max_weekly_sat: 3000000,
             max_monthly_sat: 10000000, max_fee_sat: 50000, max_fee_rate_sat_per_vb: 100 },
   hold_seconds: 3600,
   recovery_hold_seconds: 86400,
+  recovery_whitelist: [],
   ntfy_url: "",
   notify_kind: "ntfy",
   smtp: { host: "", port: 587, username: "", password: "", from: "", to: "" },
   result: null,
 };
 
-const STEPS = [welcome, keyStep("satochip"), keyStep("mobile"), serverKey, limits, holdStep, review, done];
+const STEPS = [welcome, devices, keyStep("hardware"), keyStep("mobile"), serverKey, limits, holdStep, review, done];
 
 const el = (h) => { const d = document.createElement("div"); d.innerHTML = h.trim(); return d.firstElementChild; };
 const esc = (s) => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
@@ -171,14 +179,15 @@ const back = () => go(S.step - 1);
 function welcome() {
   const mainnetWarning = S.network === "mainnet" ? `
     <div class="note"><b>This is mainnet.</b> The limits you set here govern real money.
-    Every one of them can be tightened later, but only with a signature from your Satochip.</div>` : "";
+    Every one of them can be tightened later, but only with a signature from your hardware key.</div>` : "";
   const c = el(`<div class="card">
     <h2>Before you start</h2>
     <p>This wallet needs three keys. You will set up two of them yourself; this box generates the third.</p>
     <ol class="guide">
-      <li><b>Your Satochip card</b> — set up with its own PIN in the Satochip app. You will need its
-          master fingerprint and account xpub.</li>
-      <li><b>Bitcoin Keeper</b> on your phone — this is the app that coordinates the wallet and builds
+      <li><b>An offline hardware signer</b> — a card, a USB device, an airgapped one. You will need
+          its master fingerprint and account xpub. Which devices work is a narrower question than
+          it looks, and the next step checks it.</li>
+      <li><b>A wallet app on your phone or desktop</b> — this coordinates the wallet and builds
           transactions. You will need a key from it, and at the end you will register the finished
           wallet back into it.</li>
       <li><b>This server</b> — generates its own key in the next few minutes. It never leaves this box.</li>
@@ -193,13 +202,134 @@ function welcome() {
   return c;
 }
 
-// --- steps 1 & 2: the two external keys ---------------------------------------------------------
+// --- step 1: which devices ----------------------------------------------------------------------
+// Coordinator first, then hardware: the coordinator is the constraining choice, because
+// "will this app import a thresh/older descriptor" eliminates far more software than any
+// property of the signing device does. Every device is always listed - never filtered - with
+// its verdict inline, so an unusable pairing teaches the constraint instead of just vanishing.
+function devices() {
+  const c = el(`<div class="card">
+    <h2>Which devices are you using?</h2>
+    <p>This wallet uses a miniscript descriptor with a timelock. It is a perfectly standard
+    Bitcoin output, but it is <b>not</b> the plain multisig most wallet software means when it
+    says "multisig" — and software that can track it is a shorter list than you would expect.
+    Getting this wrong is the most likely way to end up with a wallet you cannot spend from.</p>
+
+    <label>Your wallet app <span class="hint">Tracks the wallet and builds transactions.</span></label>
+    <select id="coord"></select>
+
+    <label style="margin-top:18px">Your hardware signer</label>
+    <div id="hwlist"></div>
+
+    <div id="verdict"></div>
+    <div class="err" id="e"></div>
+    <div class="actions">
+      <button class="ghost" id="b">Back</button><div class="spacer"></div>
+      <button id="n" disabled>Continue</button>
+    </div>
+  </div>`);
+
+  const coordSel = c.querySelector("#coord");
+  const list = c.querySelector("#hwlist");
+  const verdictBox = c.querySelector("#verdict");
+  const nextBtn = c.querySelector("#n");
+  const err = c.querySelector("#e");
+
+  const BADGE = {
+    ok: ["✓", "var(--ok)", "Works"],
+    "needs-another-app": ["!", "var(--accent)", "Needs a second app"],
+    blocked: ["✕", "var(--danger)", "Will not work"],
+  };
+
+  coordSel.innerHTML = S.matrix.coordinator
+    .map(x => `<option value="${esc(x.id)}"${x.id === S.coordinator ? " selected" : ""}>${esc(x.label)}</option>`)
+    .join("");
+
+  async function refresh() {
+    S.coordinator = coordSel.value;
+    nextBtn.disabled = true;
+    verdictBox.innerHTML = "";
+    err.classList.remove("show");
+    try {
+      const r = await api("/api/compat/resolve", {
+        hardware: S.hardware_id || S.matrix.hardware[0].id,
+        coordinator: S.coordinator,
+      });
+      S.options = r.options;
+      if (!S.hardware_id || !r.options.some(o => o.id === S.hardware_id)) {
+        S.hardware_id = r.options[0].id;
+      }
+      list.innerHTML = r.options.map(o => {
+        const [mark, colour, word] = BADGE[o.verdict] || BADGE.blocked;
+        return `<label class="scanrow" style="cursor:pointer;align-items:flex-start">
+          <input type="radio" name="hw" value="${esc(o.id)}" style="width:auto;margin-top:3px"
+                 ${o.id === S.hardware_id ? "checked" : ""}>
+          <div class="scanhint" style="flex:1 1 100%">
+            <b style="color:var(--ink)">${esc(o.label)}</b>
+            <span style="color:${colour};font-weight:600"> ${mark} ${esc(word)}</span>
+            ${o.notes ? `<br>${esc(o.notes)}` : ""}
+          </div>
+        </label>`;
+      }).join("");
+      list.querySelectorAll('input[name="hw"]').forEach(el2 => {
+        el2.onchange = () => { S.hardware_id = el2.value; showVerdict(); };
+      });
+      await showVerdict();
+    } catch (e) {
+      err.textContent = e.message; err.classList.add("show");
+    }
+  }
+
+  async function showVerdict() {
+    nextBtn.disabled = true;
+    const r = await api("/api/compat/resolve", {
+      hardware: S.hardware_id,
+      coordinator: S.coordinator,
+    });
+    S.resolution = r.resolution;
+    const rows = r.resolution.paths.map(p => {
+      const [mark, colour] = BADGE[p.verdict] || BADGE.blocked;
+      return `<div class="kv"><span>${esc(p.label)}</span>
+        <span style="color:${colour};font-weight:600">${mark}</span></div>`;
+    }).join("");
+
+    if (!r.acknowledgement) {
+      verdictBox.innerHTML = `<div class="note" style="border-left-color:var(--ok)">
+        <b>These work together.</b></div>${rows}`;
+      nextBtn.disabled = false;
+      S.compat_ack = false;
+      return;
+    }
+    const blocked = r.resolution.overall === "blocked";
+    verdictBox.innerHTML = `${rows}
+      <div class="note" style="border-left-color:${blocked ? "var(--danger)" : "var(--accent)"}">
+        <b>${blocked ? "This combination will not work." : "This works, but not on its own."}</b>
+        <br><br><span style="white-space:pre-wrap">${esc(r.acknowledgement)}</span>
+      </div>
+      <label class="scanrow" style="cursor:pointer">
+        <input type="checkbox" id="ack" style="width:auto">
+        <span class="scanhint" style="color:var(--ink)">I understand, and want to continue anyway.</span>
+      </label>`;
+    verdictBox.querySelector("#ack").onchange = (ev) => {
+      nextBtn.disabled = !ev.target.checked;
+      S.compat_ack = ev.target.checked;
+    };
+  }
+
+  coordSel.onchange = refresh;
+  c.querySelector("#b").onclick = back;
+  nextBtn.onclick = next;
+  refresh();
+  return c;
+}
+
+// --- steps 2 & 3: the two external keys ---------------------------------------------------------
 const KEY_COPY = {
-  satochip: {
-    title: "Your Satochip key",
-    lede: "Read these three values off the Satochip app and paste them here.",
+  hardware: {
+    title: "Your hardware key",
+    lede: "Export the account details from your signing device and paste them here.",
     guide: `<ol class="guide">
-      <li>Open the <b>Satochip</b> app and unlock the card with its PIN.</li>
+      <li>Unlock your signing device and open its export / multisig menu.</li>
       <li>Choose to export a <b>multisig / P2WSH account</b> at derivation path
           <code id="p"></code>.</li>
       <li>It will show a <b>master fingerprint</b> (8 hex characters) and an
@@ -352,6 +482,24 @@ function serverKey() {
       you the same key as a JSON file, which more apps accept for key import. This is a
       <b>public</b> key either way — it can't spend anything on its own.</p>
     </div>
+    <details style="margin-top:18px" ${g && g.mixed_user_entropy ? "open" : ""}>
+      <summary style="cursor:pointer;font-size:14px">Add your own entropy <span class="hint">optional</span></summary>
+      <p style="margin:10px 0 12px">This key is generated from the operating system's random
+      number generator (<code>getrandom</code>, the kernel CSPRNG). That is the right source, and
+      for almost everyone it is enough.</p>
+      <p style="margin-bottom:12px">If you would rather not have to take that on trust, add
+      randomness you produced yourself — dice rolls, coin flips, cards. It is <b>mixed with</b> the
+      OS output, never used instead of it, so this cannot make the key weaker no matter what you
+      type. What it buys you: if the random number generator on this box were ever broken or
+      tampered with, a key generated this way would <b>still</b> be unguessable, because an
+      attacker would also have to guess what you rolled.</p>
+      <textarea class="mono" id="uent" rows="3" spellcheck="false"
+        placeholder="e.g. 50 dice rolls: 4 2 6 1 3 5 5 2 …">${S.user_entropy || ""}</textarea>
+      <div class="note">At least 30 characters if you use it. Don't reuse this anywhere, and you
+      don't need to keep it — it isn't a backup, and it can't reconstruct the key on its own.</div>
+    </details>
+    ${g ? `<div class="note" style="margin-top:12px">Entropy source:
+      <b>${g.mixed_user_entropy ? "OS CSPRNG + your own randomness" : "OS CSPRNG only"}</b></div>` : ""}
     <div class="err" id="e"></div>
     <div class="actions">
       <button class="ghost" id="b">Back</button><div class="spacer"></div>
@@ -386,7 +534,9 @@ function serverKey() {
     const btn = ev.target, err = c.querySelector("#e");
     btn.disabled = true; btn.textContent = "Generating…"; err.classList.remove("show");
     try {
-      S.server = await api("/api/server-key", {});
+      const extra = (c.querySelector("#uent").value || "").trim();
+      S.user_entropy = extra;
+      S.server = await api("/api/server-key", extra ? { user_entropy: extra } : {});
       render();
     } catch (e) {
       err.textContent = e.message; err.classList.add("show");
@@ -418,7 +568,7 @@ function limits() {
     <label>Maximum fee rate <span class="hint">sat/vByte.</span></label>
     <input class="mono" id="rate" inputmode="decimal" value="${S.policy.max_fee_rate_sat_per_vb}">
     <div class="note">These seed the policy once. After that the live policy lives in this app's
-    database and can only be changed with a <b>Satochip signature</b> — not by editing a file, and
+    database and can only be changed with a <b>hardware-key signature</b> — not by editing a file, and
     not by anyone who merely gets into this box.</div>
     <div class="err" id="e"></div>
     <div class="actions">
@@ -477,9 +627,22 @@ function holdStep() {
         <input class="mono" id="rhold" inputmode="numeric" value="${S.recovery_hold_seconds}">
       </div>
     </div>
-    <div class="note">The recovery path exists so a lost Satochip doesn't lock you out — but it also
-    means a stolen phone plus this box could spend. <b>The recovery hold is the main thing standing
-    in the way of that</b>, so keep it long enough that you would notice and veto.</div>
+    <div class="note">The recovery path exists so a lost hardware key doesn't lock you out — but it
+    also means a stolen phone plus this box could spend. The recovery timelock is <b>relative</b>:
+    coins that have already been sitting longer than it satisfy it <i>now</i>, so for a mature
+    wallet it is not a waiting period at all. <b>The recovery hold and the escape address below are
+    what actually stand in the way</b>, so keep the hold long enough that you would notice and veto.</div>
+
+    <h3 style="font-size:15px;margin:22px 0 6px">Escape address <span class="hint">Optional, strongly recommended</span></h3>
+    <p style="margin-bottom:12px">If you set this, a recovery spend can <b>only</b> pay these
+    addresses — so a stolen phone cannot redirect your coins somewhere else, even if it gets past
+    the hold and the notification. Put an address from a wallet you control and can still reach if
+    both this box and your phone are gone. One per line. Leave blank to allow any destination.</p>
+    <textarea class="mono" id="rwl" rows="3" spellcheck="false"
+      placeholder="a receive address from a backup wallet you control">${(S.recovery_whitelist || []).join("\n")}</textarea>
+    <div class="note">You can change this later, but only with a signature from your hardware key —
+    which is exactly the point. Setting it now, while you have the device in hand, is much easier
+    than setting it during an emergency.</div>
     <h3 style="font-size:15px;margin:22px 0 6px">How you get told</h3>
     <p style="margin-bottom:12px">Required — pick one. The hold window is only protective if you
     find out a signature was requested.</p>
@@ -577,6 +740,8 @@ function holdStep() {
       S.smtp = sm; S.ntfy_url = "";
     }
     S.hold_seconds = h; S.recovery_hold_seconds = r;
+    S.recovery_whitelist = c.querySelector("#rwl").value
+      .split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
     next();
   };
   return c;
@@ -590,7 +755,10 @@ function review() {
     <p>Nothing has been written yet. Creating the wallet writes two files into this app's data
     directory and cannot be undone from here.</p>
     ${kv("Network", S.network)}
-    ${kv("Satochip", S.satochip.fingerprint + " @ " + S.satochip.derivation_path)}
+    ${kv("Devices", (S.options.find(o => o.id === S.hardware_id) || {}).label + " + "
+        + (S.matrix.coordinator.find(x => x.id === S.coordinator) || {}).label
+        + (S.compat_ack ? " (known limitations accepted)" : ""))}
+    ${kv("Hardware key", S.hardware.fingerprint + " @ " + S.hardware.derivation_path)}
     ${kv("Bitcoin Keeper", S.mobile.fingerprint + " @ " + S.mobile.derivation_path)}
     ${kv("This server", S.server.master_fingerprint + " @ " + S.server.derivation_path)}
     ${kv("Recovery timelock", S.timelock + " blocks (~" + Math.round(S.timelock / 144) + " days)")}
@@ -601,6 +769,9 @@ function review() {
     ${kv("Maximum fee", sats(S.policy.max_fee_sat) + " sats @ " + S.policy.max_fee_rate_sat_per_vb + " sat/vB")}
     ${kv("Normal hold", S.hold_seconds + "s")}
     ${kv("Recovery hold", S.recovery_hold_seconds + "s")}
+    ${kv("Escape address", (S.recovery_whitelist && S.recovery_whitelist.length)
+        ? S.recovery_whitelist.join(", ")
+        : "not set — recovery spends may pay anywhere")}
     ${kv("Notifications", S.notify_kind === "ntfy" ? S.ntfy_url : ("email to " + S.smtp.to))}
     <div class="err" id="e"></div>
     <div class="actions">
@@ -615,11 +786,13 @@ function review() {
     try {
       S.result = await api("/api/finish", {
         timelock_blocks: S.timelock,
-        satochip: S.satochip,
+        hardware: S.hardware,
         mobile: S.mobile,
         policy: S.policy,
         hold_seconds: S.hold_seconds,
         recovery_hold_seconds: S.recovery_hold_seconds,
+        recovery_destination_whitelist: S.recovery_whitelist && S.recovery_whitelist.length
+          ? S.recovery_whitelist : null,
         ntfy_url: S.notify_kind === "ntfy" ? S.ntfy_url : null,
         smtp: S.notify_kind === "smtp" ? S.smtp : null,
       });
@@ -662,6 +835,22 @@ function done() {
       <button class="ghost" id="copy">Copy descriptor</button>
       <button class="ghost" id="dl">Download as file</button>
     </div>
+
+    <h3 style="font-size:15px;margin:26px 0 6px">API token</h3>
+    <p style="margin-bottom:10px">Whatever submits transactions to this service needs this token.
+    Send it as an <code>Authorization: Bearer &lt;token&gt;</code> header on
+    <code>/inspect</code> and <code>/sign_psbt</code>.</p>
+    <pre id="tok">${esc(r.api_token)}</pre>
+    <div class="actions" style="margin-top:12px">
+      <button class="ghost" id="copytok">Copy token</button>
+    </div>
+    <div class="note">Without it, anything that can reach this port could submit spends and use up
+    your daily limit. It can't move coins — that still needs two keys — but it can stop you from
+    spending when you need to.
+    <br><br><b>Freezing and vetoing deliberately do not need it.</b> Those only ever stop a
+    signature happening, and they have to work from whatever device you have to hand.
+    <br><br>The token is stored on this box at <code>config/api.token</code>, so you can read it
+    back later. Delete that file to turn authentication off.</div>
     <div class="note"><b>Keep a copy of this descriptor somewhere safe.</b> Your keys alone cannot
     rebuild the wallet without it. It contains no private keys — it is safe to store as plain text.</div>
     <div class="err" id="e"></div>
@@ -688,6 +877,17 @@ function done() {
       // Clipboard needs a secure context; over plain LAN http it may be unavailable.
       const sel = window.getSelection(); const range = document.createRange();
       range.selectNodeContents(c.querySelector("#desc")); sel.removeAllRanges(); sel.addRange(range);
+      ev.target.textContent = "Selected — press Ctrl/Cmd+C";
+    }
+  };
+  c.querySelector("#copytok").onclick = async (ev) => {
+    try {
+      await navigator.clipboard.writeText(r.api_token);
+      ev.target.textContent = "Copied";
+      setTimeout(() => { ev.target.textContent = "Copy token"; }, 1500);
+    } catch (_) {
+      const sel = window.getSelection(); const range = document.createRange();
+      range.selectNodeContents(c.querySelector("#tok")); sel.removeAllRanges(); sel.addRange(range);
       ev.target.textContent = "Selected — press Ctrl/Cmd+C";
     }
   };
@@ -726,6 +926,8 @@ function done() {
     S.network = st.network;
     S.defaultPath = st.default_derivation_path;
     S.timelock = st.default_timelock_blocks;
+    S.matrix = await api("/api/compat");
+    S.coordinator = S.matrix.coordinator[0].id;
     const badge = document.getElementById("net");
     badge.textContent = st.network;
     if (st.network === "mainnet") badge.classList.add("mainnet");

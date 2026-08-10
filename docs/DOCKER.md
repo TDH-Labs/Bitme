@@ -75,7 +75,7 @@ cp config/wallet.toml.example config/wallet.toml
 $EDITOR config/wallet.toml
 ```
 
-Fill in real values for `[keys.satochip]`, `[keys.mobile]`, `[keys.server]` (see "What you need
+Fill in real values for `[keys.hardware]`, `[keys.mobile]`, `[keys.server]` (see "What you need
 first" above), and adjust `[policy]`/`[notify]` to taste. Leave `network = "signet"` and don't
 touch `[bitcoind]`/`[server]` - they don't belong in this file (see the comments in the file
 itself for why). `config/wallet.toml` is gitignored - it will hold your real xpubs, never commit

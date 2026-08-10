@@ -87,6 +87,10 @@ fi
     printf 'bind_addr = "0.0.0.0:%s"\n' "${COSIGNER_HTTP_PORT:-8080}"
     printf 'gap_limit = %s\n' "${COSIGNER_GAP_LIMIT:-1000}"
     printf 'ledger_db_path = "%s"\n' "$DATA_DIR/ledger.sqlite3"
+    # Written by the setup wizard. Emitted unconditionally: if the file is absent (an install
+    # that predates it) the service logs a warning and runs unauthenticated, exactly as before,
+    # rather than refusing to start. Delete the file to turn authentication off.
+    printf 'api_token_file = "%s"\n' "$CONFIG_DIR/api.token"
 } >"$GENERATED_CONFIG"
 
 exec cosigner serve --config "$GENERATED_CONFIG" "$@"

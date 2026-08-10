@@ -1,9 +1,9 @@
 //! Builds an unsigned sweep PSBT moving a set of UTXOs from an OLD descriptor to a destination
-//! address - the mechanism for replacing a lost/destroyed SATOCHIP, phone, or server without
+//! address - the mechanism for replacing a lost/destroyed HARDWARE, phone, or server without
 //! the old device ever needing to work again.
 //!
 //! Scope is deliberately narrow: this only *builds* the unsigned PSBT. Signing still goes
-//! through the normal channels - SATOCHIP/MOBILE sign with their own app, and the OLD wallet's
+//! through the normal channels - HARDWARE/MOBILE sign with their own app, and the OLD wallet's
 //! own `cosigner serve` still does the SERVER co-sign via its ordinary `/sign_psbt` endpoint,
 //! subject to the same policy/hold/notify flow as any other spend (a RECOVERY-path sweep goes
 //! through `evaluate_recovery_policy`, same as it would if the PSBT had been built any other
@@ -28,11 +28,11 @@ use crate::descriptor::{self, BuiltDescriptor, Chain};
 /// once whoever's signing decides which two keys they actually have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepPath {
-    /// SATOCHIP + SERVER, no timelock needed - a proactive migration (e.g. rotating the SERVER
-    /// or MOBILE key) where the SATOCHIP is fine and available.
+    /// HARDWARE + SERVER, no timelock needed - a proactive migration (e.g. rotating the SERVER
+    /// or MOBILE key) where the HARDWARE is fine and available.
     Hot,
-    /// SATOCHIP + MOBILE, or MOBILE + SERVER, only valid once `old_timelock_blocks` deep - use
-    /// this when the SATOCHIP is the device being replaced.
+    /// HARDWARE + MOBILE, or MOBILE + SERVER, only valid once `old_timelock_blocks` deep - use
+    /// this when the HARDWARE is the device being replaced.
     Recovery,
 }
 

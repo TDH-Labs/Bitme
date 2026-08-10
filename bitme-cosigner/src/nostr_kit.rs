@@ -25,7 +25,29 @@ use nostr_sdk::prelude::*;
 /// Domain-separation label for deriving the Nostr identity from the recovery kit passphrase.
 /// Fixed forever: changing it (or the scrypt params below) changes which identity a given
 /// passphrase derives, silently breaking anyone's ability to re-locate an existing backup.
-const NOSTR_IDENTITY_DOMAIN: &[u8] = b"bitme-cosigner/recovery-kit/nostr-identity/v1";
+const NOSTR_IDENTITY_DOMAIN: &[u8] = b"bitme-cosigner/recovery-kit/nostr-identity/v2";
+
+/// The v1 domain, kept only so [`fetch`] can still find a backup published before the work
+/// factor was raised. Never published under again.
+const NOSTR_IDENTITY_DOMAIN_V1: &[u8] = b"bitme-cosigner/recovery-kit/nostr-identity/v1";
+
+/// scrypt cost for the identity derivation, as `N = 2^LOG_N`. **Must stay equal to
+/// `recovery_kit::BACKUP_LOG_N`** - see the note there.
+///
+/// One passphrase protects two things that are both published to public relays: the encrypted
+/// blob, and the npub it is published under. Whichever is cheaper to grind sets the real
+/// strength of the pair, so they are pinned to the same known cost rather than one being fixed
+/// and the other adaptive. `age::scrypt::Recipient::new` auto-tunes to roughly one second on the
+/// encrypting machine, which lands near this value on current hardware; both sides are pinned
+/// here so the relationship is explicit instead of hardware-dependent.
+///
+/// Fixed rather than auto-tuned because the same passphrase must re-derive the same identity on
+/// any machine, and there is no header here to record a chosen parameter in.
+///
+/// 18 and not higher because scrypt's memory cost is `128 * r * N`: at r=8 this is 256 MiB per
+/// derivation. 20 would be 1 GiB, which is not a reasonable thing to demand of a home server
+/// running a dozen other containers, and would be liable to OOM inside a memory-capped one.
+pub(crate) const IDENTITY_LOG_N: u8 = 18;
 
 /// The `d` tag identifying this service's recovery kit event, so it doesn't collide with any
 /// other NIP-78 application data the same derived identity might otherwise ever publish.
@@ -44,15 +66,14 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// derivation from a leaked pubkey is not meaningfully easier than brute-forcing the passphrase
 /// against the age-encrypted blob itself.
 fn derive_nostr_keys(passphrase: &str) -> Result<Keys> {
-    let params = scrypt::Params::new(15, 8, 1, 32).context("invalid scrypt params")?;
+    derive_nostr_keys_with(passphrase, NOSTR_IDENTITY_DOMAIN, IDENTITY_LOG_N)
+}
+
+fn derive_nostr_keys_with(passphrase: &str, domain: &[u8], log_n: u8) -> Result<Keys> {
+    let params = scrypt::Params::new(log_n, 8, 1, 32).context("invalid scrypt params")?;
     let mut output = [0u8; 32];
-    scrypt::scrypt(
-        passphrase.as_bytes(),
-        NOSTR_IDENTITY_DOMAIN,
-        &params,
-        &mut output,
-    )
-    .map_err(|e| anyhow::anyhow!("scrypt key derivation failed: {e}"))?;
+    scrypt::scrypt(passphrase.as_bytes(), domain, &params, &mut output)
+        .map_err(|e| anyhow::anyhow!("scrypt key derivation failed: {e}"))?;
     let secret_key = SecretKey::from_slice(&output).context(
         "derived bytes are not a valid secp256k1 secret key (astronomically unlikely - \
                    scrypt output is effectively uniform)",
@@ -124,7 +145,14 @@ pub async fn fetch(passphrase: &str, relay_urls: &[String]) -> Result<Option<Str
     if relay_urls.is_empty() {
         bail!("at least one relay URL is required");
     }
+    // Both identities are queried: v2 is what anything published now uses, v1 finds a backup
+    // made before the work factor was raised. Losing access to an existing backup because a
+    // security fix silently moved the identity would be a far worse bug than the one being
+    // fixed, so the old identity stays readable indefinitely - it is only never written to.
     let keys = derive_nostr_keys(passphrase)?;
+    let legacy_keys =
+        derive_nostr_keys_with(passphrase, NOSTR_IDENTITY_DOMAIN_V1, 15).context("v1 identity")?;
+
     let client = Client::default();
     for url in relay_urls {
         client
@@ -135,10 +163,9 @@ pub async fn fetch(passphrase: &str, relay_urls: &[String]) -> Result<Option<Str
     client.connect().await;
 
     let filter = Filter::new()
-        .author(keys.public_key())
+        .authors([keys.public_key(), legacy_keys.public_key()])
         .kind(Kind::ApplicationSpecificData)
-        .identifier(RECOVERY_KIT_D_TAG)
-        .limit(1);
+        .identifier(RECOVERY_KIT_D_TAG);
     let result = client.fetch_events(filter, FETCH_TIMEOUT).await;
     client.disconnect().await;
 

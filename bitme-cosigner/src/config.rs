@@ -98,7 +98,16 @@ impl KeySpec {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct KeysConfig {
-    pub satochip: KeySpec,
+    /// The offline signing device. Named for the *role*, not a product: this was `hardware`
+    /// until it became clear the wallet has to work with whatever device a coordinator can
+    /// actually drive (see docs/COMPATIBILITY.md), and naming a role after one vendor's card
+    /// implied a support promise that was never true.
+    ///
+    /// `satochip` is still accepted so existing `wallet.toml` files keep working - the alias is
+    /// permanent, not a migration window. A config that says `satochip` is not wrong, just old,
+    /// and rewriting a working wallet's config file to chase a rename would be a poor trade.
+    #[serde(alias = "satochip")]
+    pub hardware: KeySpec,
     pub mobile: KeySpec,
     pub server: KeySpec,
 }
@@ -109,7 +118,7 @@ pub struct WalletConfig {
     /// Refuses to build/run against mainnet unless explicitly set. See hard rules in README.
     #[serde(default)]
     pub i_understand_this_is_mainnet: bool,
-    /// Relative timelock (in blocks) for the RECOVERY path (SATOCHIP + MOBILE). Default 12960 (~90 days).
+    /// Relative timelock (in blocks) for the RECOVERY path (HARDWARE + MOBILE). Default 12960 (~90 days).
     pub timelock_blocks: u16,
     pub keys: KeysConfig,
     /// Only required by `cosigner serve`; the descriptor CLI doesn't need a node.
@@ -127,11 +136,16 @@ pub struct WalletConfig {
     /// and it only actually gets signed once `hold_seconds` has passed with no veto.
     pub notify: Option<NotifyConfig>,
     /// Governs whether this service will co-sign the MOBILE + SERVER recovery path (the one
-    /// that exists for a lost/destroyed SATOCHIP). Absent means the defaults below.
+    /// that exists for a lost/destroyed HARDWARE). Absent means the defaults below.
     pub recovery: Option<RecoveryConfig>,
     /// Optional alternate front door for the same HTTP API, over Nostr NIP-17 private messages
     /// instead of an open port. Absent means only HTTP is served.
     pub nostr_transport: Option<NostrTransportConfig>,
+    /// Optional social recovery: people you trust who can, by quorum, release a queued spend's
+    /// remaining hold. Absent means off, and off is the default - a quorum nobody configured must
+    /// never be able to do anything. See `recovery_contacts.rs` for what a quorum can and (much
+    /// more importantly) cannot do.
+    pub recovery_contacts: Option<crate::recovery_contacts::RecoveryContactsConfig>,
 }
 
 /// Config for `nostr_transport.rs` - an outbound-only Nostr identity for this service that
@@ -214,11 +228,11 @@ impl NostrTransportConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecoveryConfig {
     /// Whether to co-sign MOBILE + SERVER at all. Default `true` - if this were off by
-    /// default, the lost-SATOCHIP recovery path would be broken by default, which defeats the
+    /// default, the lost-HARDWARE recovery path would be broken by default, which defeats the
     /// point of having it.
     ///
-    /// Deliberately a plain config value rather than something gated behind a SATOCHIP-signed
-    /// policy change: needing the SATOCHIP to enable the recover-from-a-lost-SATOCHIP path
+    /// Deliberately a plain config value rather than something gated behind a HARDWARE-signed
+    /// policy change: needing the HARDWARE to enable the recover-from-a-lost-HARDWARE path
     /// would be circular. Editing it requires access to this server, which you have and a
     /// phone thief does not.
     #[serde(default = "default_true")]
@@ -423,6 +437,20 @@ pub struct ServerConfig {
     /// `/sign_psbt`; `/inspect` alone doesn't touch it.
     #[serde(default)]
     pub ledger_db_path: Option<String>,
+    /// Path to a file containing a bearer token (and nothing else). When present, `POST /inspect`
+    /// and `POST /sign_psbt` require `Authorization: Bearer <token>`.
+    ///
+    /// **Deliberately not applied to `/freeze` or `/veto/{id}`.** Those two only ever *stop*
+    /// things happening, so the worst an unauthenticated caller achieves with them is denial of
+    /// service - which is strictly better than the theft they exist to prevent, and they need to
+    /// work from whatever device is to hand in a hurry. Authentication belongs on the endpoints
+    /// that *consume* something: `/sign_psbt` spends rolling budget and fires notifications,
+    /// `/inspect` does unbounded per-input chain work.
+    ///
+    /// Absent means no authentication, which is the pre-existing behaviour: an existing install
+    /// must not stop answering its own coordinator on upgrade.
+    #[serde(default)]
+    pub api_token_file: Option<String>,
 }
 
 fn default_gap_limit() -> u32 {
@@ -450,12 +478,12 @@ impl WalletConfig {
             bail!("timelock_blocks must be non-zero (BIP68 relative locktimes start at 1 block)");
         }
 
-        self.keys.satochip.validate("satochip", self.network)?;
+        self.keys.hardware.validate("hardware", self.network)?;
         self.keys.mobile.validate("mobile", self.network)?;
         self.keys.server.validate("server", self.network)?;
 
         let fingerprints: HashSet<String> = [
-            self.keys.satochip.master_fingerprint.trim().to_lowercase(),
+            self.keys.hardware.master_fingerprint.trim().to_lowercase(),
             self.keys.mobile.master_fingerprint.trim().to_lowercase(),
             self.keys.server.master_fingerprint.trim().to_lowercase(),
         ]
@@ -463,13 +491,13 @@ impl WalletConfig {
         .collect();
         if fingerprints.len() != 3 {
             bail!(
-                "keys.satochip, keys.mobile and keys.server must have distinct master_fingerprint values \
-                 (SATOCHIP, MOBILE and SERVER must be three different keys)"
+                "keys.hardware, keys.mobile and keys.server must have distinct master_fingerprint values \
+                 (HARDWARE, MOBILE and SERVER must be three different keys)"
             );
         }
 
         let xpubs: HashSet<String> = [
-            self.keys.satochip.xpub.trim().to_string(),
+            self.keys.hardware.xpub.trim().to_string(),
             self.keys.mobile.xpub.trim().to_string(),
             self.keys.server.xpub.trim().to_string(),
         ]
@@ -477,8 +505,8 @@ impl WalletConfig {
         .collect();
         if xpubs.len() != 3 {
             bail!(
-                "keys.satochip, keys.mobile and keys.server must have distinct xpub values \
-                 (SATOCHIP, MOBILE and SERVER must be three different keys)"
+                "keys.hardware, keys.mobile and keys.server must have distinct xpub values \
+                 (HARDWARE, MOBILE and SERVER must be three different keys)"
             );
         }
 
@@ -504,6 +532,10 @@ impl WalletConfig {
 
         if let Some(nostr_transport) = &self.nostr_transport {
             nostr_transport.validate().context("[nostr_transport]")?;
+        }
+
+        if let Some(contacts) = &self.recovery_contacts {
+            contacts.validate().context("[recovery_contacts]")?;
         }
 
         Ok(())
@@ -657,6 +689,64 @@ mod tests {
         assert!(err.contains("notify"), "got: {err}");
     }
 
+    /// `keys.satochip` must keep parsing forever. Someone's wallet.toml on a running box says
+    /// `satochip`, their coins are behind the descriptor it describes, and a rename in this repo
+    /// is not a reason for their service to stop starting.
+    #[test]
+    fn the_legacy_satochip_key_name_still_parses() {
+        let cfg = test_wallet_config(12960);
+        let toml_text = format!(
+            r#"
+network = "signet"
+timelock_blocks = 12960
+
+[keys.satochip]
+master_fingerprint = "{}"
+derivation_path = "{}"
+xpub = "{}"
+
+[keys.mobile]
+master_fingerprint = "{}"
+derivation_path = "{}"
+xpub = "{}"
+
+[keys.server]
+master_fingerprint = "{}"
+derivation_path = "{}"
+xpub = "{}"
+"#,
+            cfg.keys.hardware.master_fingerprint,
+            cfg.keys.hardware.derivation_path,
+            cfg.keys.hardware.xpub,
+            cfg.keys.mobile.master_fingerprint,
+            cfg.keys.mobile.derivation_path,
+            cfg.keys.mobile.xpub,
+            cfg.keys.server.master_fingerprint,
+            cfg.keys.server.derivation_path,
+            cfg.keys.server.xpub,
+        );
+
+        let parsed: WalletConfig = toml::from_str(&toml_text).expect("legacy name must parse");
+        parsed.validate().expect("and must validate");
+        assert_eq!(parsed.keys.hardware.xpub, cfg.keys.hardware.xpub);
+
+        // And the new spelling produces an identical config, so the two are interchangeable
+        // rather than merely both-accepted.
+        let new_text = toml_text.replace("[keys.satochip]", "[keys.hardware]");
+        let new_parsed: WalletConfig = toml::from_str(&new_text).expect("new name must parse");
+        assert_eq!(
+            crate::descriptor::build_descriptor(&parsed)
+                .unwrap()
+                .multipath
+                .to_string(),
+            crate::descriptor::build_descriptor(&new_parsed)
+                .unwrap()
+                .multipath
+                .to_string(),
+            "both spellings must produce the same wallet"
+        );
+    }
+
     #[test]
     fn rejects_zero_timelock() {
         let cfg = test_wallet_config(0);
@@ -667,28 +757,28 @@ mod tests {
     #[test]
     fn rejects_duplicate_fingerprint() {
         let mut cfg = test_wallet_config(12960);
-        cfg.keys.server.master_fingerprint = cfg.keys.satochip.master_fingerprint.clone();
+        cfg.keys.server.master_fingerprint = cfg.keys.hardware.master_fingerprint.clone();
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn rejects_duplicate_xpub() {
         let mut cfg = test_wallet_config(12960);
-        cfg.keys.server.xpub = cfg.keys.satochip.xpub.clone();
+        cfg.keys.server.xpub = cfg.keys.hardware.xpub.clone();
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn rejects_malformed_fingerprint() {
         let mut cfg = test_wallet_config(12960);
-        cfg.keys.satochip.master_fingerprint = "not-hex!".to_string();
+        cfg.keys.hardware.master_fingerprint = "not-hex!".to_string();
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn rejects_short_fingerprint() {
         let mut cfg = test_wallet_config(12960);
-        cfg.keys.satochip.master_fingerprint = "abcd".to_string();
+        cfg.keys.hardware.master_fingerprint = "abcd".to_string();
         assert!(cfg.validate().is_err());
     }
 
@@ -696,7 +786,7 @@ mod tests {
     fn rejects_xpub_depth_path_mismatch() {
         let mut cfg = test_wallet_config(12960);
         // The fixture's xpub is at depth 4 (48h/1h/0h/2h); claim a 3-step path instead.
-        cfg.keys.satochip.derivation_path = "48h/1h/0h".to_string();
+        cfg.keys.hardware.derivation_path = "48h/1h/0h".to_string();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("depth"), "got: {err}");
     }
@@ -704,14 +794,14 @@ mod tests {
     #[test]
     fn rejects_garbage_xpub() {
         let mut cfg = test_wallet_config(12960);
-        cfg.keys.satochip.xpub = "not-an-xpub".to_string();
+        cfg.keys.hardware.xpub = "not-an-xpub".to_string();
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn rejects_garbage_derivation_path() {
         let mut cfg = test_wallet_config(12960);
-        cfg.keys.satochip.derivation_path = "not-a-path".to_string();
+        cfg.keys.hardware.derivation_path = "not-a-path".to_string();
         assert!(cfg.validate().is_err());
     }
 
@@ -728,7 +818,7 @@ mod tests {
             network = "regtest"
             timelock_blocks = 6
 
-            [keys.satochip]
+            [keys.hardware]
             master_fingerprint = "aabbccdd"
             derivation_path = "48h/1h/0h/2h"
             xpub = "not-checked-until-parse"

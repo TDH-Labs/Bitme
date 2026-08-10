@@ -79,7 +79,19 @@ fn read_nsec(cfg: &NostrTransportConfig) -> Result<SecretKey> {
 /// upward - every failure mode (bad JSON, unsupported method, a handler error) becomes a
 /// structured `OutboundEnvelope` reply instead, since the only way the sender finds out what
 /// went wrong is this reply.
-async fn dispatch(router: axum::Router, env: InboundEnvelope) -> OutboundEnvelope {
+/// `api_token`, if the deployment has one, is attached to the synthetic request.
+///
+/// That is not a bypass. The token exists to answer "is this caller allowed to consume budget",
+/// and on this transport that question was already answered - and answered more strongly - by
+/// NIP-59 unwrapping plus the npub allowlist, both of which have happened before anything reaches
+/// here. Requiring the token as well would mean shipping it to every device *in addition* to
+/// their npub being allowlisted, for no additional guarantee. Attaching it here keeps one router
+/// with one set of rules rather than forking the route table per transport.
+async fn dispatch(
+    router: axum::Router,
+    api_token: Option<&str>,
+    env: InboundEnvelope,
+) -> OutboundEnvelope {
     let method = match env.method.to_uppercase().as_str() {
         "GET" => axum::http::Method::GET,
         "POST" => axum::http::Method::POST,
@@ -110,6 +122,9 @@ async fn dispatch(router: axum::Router, env: InboundEnvelope) -> OutboundEnvelop
     let mut builder = Request::builder().method(method).uri(&env.path);
     if env.body.is_some() {
         builder = builder.header("content-type", "application/json");
+    }
+    if let Some(token) = api_token {
+        builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
     }
     let request = match builder.body(Body::from(body_bytes)) {
         Ok(r) => r,
@@ -149,6 +164,7 @@ async fn handle_gift_wrap(
     router: &axum::Router,
     allowed: &HashSet<PublicKey>,
     ledger: &Ledger,
+    api_token: Option<&str>,
     event: Event,
 ) -> Result<()> {
     // Relays don't guarantee at-most-once delivery, and - critically - every process restart
@@ -158,6 +174,7 @@ async fn handle_gift_wrap(
     // restart, with no attacker involved at all. Dedup on the outer gift-wrap event's own ID,
     // before unwrapping - cheaper, and the ID is stable/known before any decryption happens.
     let event_id = event.id.to_hex();
+    // Cheap read first: a genuine replay exits here without decrypting anything.
     if ledger
         .has_seen_nostr_event(&event_id)
         .await
@@ -165,19 +182,20 @@ async fn handle_gift_wrap(
     {
         return Ok(());
     }
-    // Marked *before* dispatching, not after: a crash mid-dispatch must not risk replaying the
-    // same request on the next restart. If the sender never got a reply, that's on them to
-    // resend as a new event (new ID) - normal request/response retry, not a replay concern.
-    ledger
-        .mark_nostr_event_seen(&event_id, now_unix())
-        .await
-        .context("recording nostr_seen_events")?;
 
     let unwrapped = client
         .unwrap_gift_wrap(&event)
         .await
         .context("unwrapping gift wrap")?;
 
+    // **Invariant: nothing durable is written for a sender who is not on the allowlist.**
+    //
+    // This service's npub is public, so anyone at all can address a gift wrap to it, and the
+    // volume of inbound messages is therefore not something the operator controls. Persisting one
+    // row per message would make an unbounded table out of that, and each write takes the ledger's
+    // single connection - the same one `POST /veto/{id}` needs. Rejecting first costs an unwrap
+    // for a non-contact but leaves no trace and takes no write lock. Keep this check above the
+    // write.
     if !allowed.contains(&unwrapped.sender) {
         tracing::warn!(
             sender = %unwrapped.sender.to_bech32().unwrap_or_default(),
@@ -185,6 +203,14 @@ async fn handle_gift_wrap(
         );
         return Ok(());
     }
+
+    // Marked *before* dispatching, not after: a crash mid-dispatch must not risk replaying the
+    // same request on the next restart. If the sender never got a reply, that's on them to
+    // resend as a new event (new ID) - normal request/response retry, not a replay concern.
+    ledger
+        .mark_nostr_event_seen(&event_id, now_unix())
+        .await
+        .context("recording nostr_seen_events")?;
 
     let env: InboundEnvelope = match serde_json::from_str(&unwrapped.rumor.content) {
         Ok(e) => e,
@@ -205,7 +231,7 @@ async fn handle_gift_wrap(
         }
     };
 
-    let reply = dispatch(router.clone(), env).await;
+    let reply = dispatch(router.clone(), api_token, env).await;
     let reply_json = serde_json::to_string(&reply).context("serializing reply")?;
     client
         .send_private_msg(unwrapped.sender, reply_json, [])
@@ -240,6 +266,7 @@ pub async fn run(cfg: &NostrTransportConfig, state: AppState) -> Result<()> {
         .await
         .context("subscribing to gift wraps")?;
 
+    let api_token = state.api_token.clone();
     let router = http::router(state);
 
     tracing::info!(
@@ -255,11 +282,19 @@ pub async fn run(cfg: &NostrTransportConfig, state: AppState) -> Result<()> {
             let router = router.clone();
             let allowed = allowed.clone();
             let ledger = ledger.clone();
+            let api_token = api_token.clone();
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::GiftWrap {
-                        if let Err(e) =
-                            handle_gift_wrap(&client, &router, &allowed, &ledger, *event).await
+                        if let Err(e) = handle_gift_wrap(
+                            &client,
+                            &router,
+                            &allowed,
+                            &ledger,
+                            api_token.as_deref(),
+                            *event,
+                        )
+                        .await
                         {
                             tracing::warn!(error = %e, "failed to handle an inbound nostr message");
                         }
@@ -336,6 +371,7 @@ mod tests {
             .await
             .unwrap();
 
+        let auth_keys = crate::policy_auth::HardwareAuthKeys::from_config(&cfg, 50).unwrap();
         let state = AppState {
             wallet: Arc::new(wallet.clone()),
             cfg: Arc::new(cfg),
@@ -347,6 +383,9 @@ mod tests {
                 version: seeded.version,
                 compiled: policy,
             })),
+            auth_keys: Arc::new(auth_keys),
+            api_token: None,
+            recovery_contacts: None,
             notifier: Arc::new(RecordingNotifier::new()),
             hold_seconds: 0,
         };
@@ -363,6 +402,7 @@ mod tests {
         let router = http::router(state);
         let reply = dispatch(
             router,
+            None,
             InboundEnvelope {
                 method: "GET".to_string(),
                 path: "/health".to_string(),
@@ -411,6 +451,7 @@ mod tests {
         let router = http::router(state);
         let reply = dispatch(
             router,
+            None,
             InboundEnvelope {
                 method: "POST".to_string(),
                 path: "/inspect".to_string(),
@@ -429,6 +470,7 @@ mod tests {
         let router = http::router(state);
         let reply = dispatch(
             router,
+            None,
             InboundEnvelope {
                 method: "DELETE".to_string(),
                 path: "/health".to_string(),
@@ -446,6 +488,7 @@ mod tests {
         let router = http::router(state);
         let reply = dispatch(
             router,
+            None,
             InboundEnvelope {
                 method: "GET".to_string(),
                 path: "/not-a-real-endpoint".to_string(),
@@ -467,6 +510,21 @@ mod tests {
             .unwrap()
     }
 
+    /// A genuine NIP-59 gift wrap from `sender` to `receiver`, carrying `envelope` as its rumor.
+    /// Needed for any test that has to get past `unwrap_gift_wrap` - which is now everything
+    /// that touches the allowlist or the replay table, since authorization happens before
+    /// anything durable is written.
+    async fn real_gift_wrap(sender: &Keys, receiver: &Keys, envelope: &InboundEnvelope) -> Event {
+        let rumor = EventBuilder::private_msg_rumor(
+            receiver.public_key(),
+            serde_json::to_string(envelope).unwrap(),
+        )
+        .build(sender.public_key());
+        EventBuilder::gift_wrap(sender, &receiver.public_key(), rumor, [])
+            .await
+            .expect("building a real gift wrap")
+    }
+
     #[tokio::test]
     async fn handle_gift_wrap_skips_an_event_already_marked_seen() {
         let (state, _chain, _wallet) = test_state().await;
@@ -485,34 +543,42 @@ mod tests {
 
         // If the dedup check didn't short-circuit, this would fail downstream (bad unwrap, then
         // a reply attempt with no relay configured) instead of returning Ok(()) immediately.
-        let result = handle_gift_wrap(&client, &router, &allowed, &ledger, event).await;
+        let result = handle_gift_wrap(&client, &router, &allowed, &ledger, None, event).await;
         assert!(
             result.is_ok(),
             "an already-seen event must be skipped cleanly: {result:?}"
         );
     }
 
+    /// An authorized request is recorded in the replay table *before* it is dispatched, so a
+    /// crash between the two cannot cause it to run twice on the next restart.
     #[tokio::test]
-    async fn handle_gift_wrap_processes_a_new_event_and_marks_it_seen_even_on_failure() {
+    async fn an_allowlisted_event_is_marked_seen_before_dispatch() {
         let (state, _chain, _wallet) = test_state().await;
         let ledger = state.ledger.clone();
         let router = http::router(state);
-        let allowed: HashSet<PublicKey> = HashSet::new();
 
         let service_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let allowed: HashSet<PublicKey> = [sender_keys.public_key()].into_iter().collect();
         let client = Client::new(service_keys.clone());
-        let event = fake_gift_wrap_event(&service_keys);
-        let event_id = event.id.to_hex();
 
+        let envelope = InboundEnvelope {
+            method: "GET".to_string(),
+            path: "/health".to_string(),
+            body: None,
+        };
+        let event = real_gift_wrap(&sender_keys, &service_keys, &envelope).await;
+        let event_id = event.id.to_hex();
         assert!(!ledger.has_seen_nostr_event(&event_id).await.unwrap());
 
-        // Expected to fail downstream (the content isn't a real seal) - the point here is that
-        // it got PAST the dedup check to fail there at all, and that marking-seen happens
-        // regardless of that later failure (a crash/error after marking must not cause endless
-        // reprocessing on retry either).
-        let result = handle_gift_wrap(&client, &router, &allowed, &ledger, event).await;
-        assert!(result.is_err());
-        assert!(ledger.has_seen_nostr_event(&event_id).await.unwrap());
+        // Dispatch succeeds but the *reply* fails - no relays are configured on this client - so
+        // this returns Err. That's the point: the marking must already have happened by then.
+        let _ = handle_gift_wrap(&client, &router, &allowed, &ledger, None, event).await;
+        assert!(
+            ledger.has_seen_nostr_event(&event_id).await.unwrap(),
+            "an authorized event must be recorded before dispatch, so a crash can't replay it"
+        );
     }
 
     #[tokio::test]
@@ -522,23 +588,83 @@ mod tests {
         let (state, _chain, _wallet) = test_state().await;
         let ledger = state.ledger.clone();
         let router = http::router(state);
-        let allowed: HashSet<PublicKey> = HashSet::new();
 
         let service_keys = Keys::generate();
+        let sender_keys = Keys::generate();
+        let allowed: HashSet<PublicKey> = [sender_keys.public_key()].into_iter().collect();
         let client = Client::new(service_keys.clone());
-        let event = fake_gift_wrap_event(&service_keys);
 
-        let first = handle_gift_wrap(&client, &router, &allowed, &ledger, event.clone()).await;
-        assert!(
-            first.is_err(),
-            "first delivery attempts real processing and fails downstream"
-        );
+        let envelope = InboundEnvelope {
+            method: "GET".to_string(),
+            path: "/health".to_string(),
+            body: None,
+        };
+        let event = real_gift_wrap(&sender_keys, &service_keys, &envelope).await;
 
-        let second = handle_gift_wrap(&client, &router, &allowed, &ledger, event).await;
+        // First delivery gets all the way to the reply, which fails (no relays on this client).
+        let _ = handle_gift_wrap(&client, &router, &allowed, &ledger, None, event.clone()).await;
+
+        let second = handle_gift_wrap(&client, &router, &allowed, &ledger, None, event).await;
         assert!(
             second.is_ok(),
             "redelivery of the exact same event must be a clean no-op, not reprocessed: {second:?}"
         );
+    }
+
+    /// A message from an npub that isn't on the allowlist must leave **no durable trace**.
+    ///
+    /// This service's npub is public, so the volume of inbound messages is not something the
+    /// operator controls. Persisting one row per message would make `nostr_seen_events` unbounded
+    /// and would take a write lock on the ledger's single connection each time - the same
+    /// connection `POST /veto/{id}` needs.
+    #[tokio::test]
+    async fn an_unauthorized_sender_is_never_recorded() {
+        let (state, _chain, _wallet) = test_state().await;
+        let ledger = state.ledger.clone();
+        let router = http::router(state);
+
+        let service_keys = Keys::generate();
+        let stranger_keys = Keys::generate();
+        // Allowlist contains somebody else entirely.
+        let allowed: HashSet<PublicKey> = [Keys::generate().public_key()].into_iter().collect();
+        let client = Client::new(service_keys.clone());
+
+        let envelope = InboundEnvelope {
+            method: "POST".to_string(),
+            path: "/freeze".to_string(),
+            body: None,
+        };
+        let event = real_gift_wrap(&stranger_keys, &service_keys, &envelope).await;
+        let event_id = event.id.to_hex();
+
+        let result = handle_gift_wrap(&client, &router, &allowed, &ledger, None, event).await;
+        assert!(result.is_ok(), "rejection is a clean no-op, not an error");
+        assert!(
+            !ledger.has_seen_nostr_event(&event_id).await.unwrap(),
+            "a non-contact's message must not be persisted - that would make this table's size \
+             depend on inbound volume rather than on anything the operator controls"
+        );
+    }
+
+    /// Replay records don't accumulate forever: anything older than the retention window is
+    /// dropped, which is what keeps the table bounded now that it is no longer written for
+    /// unauthorized senders.
+    #[tokio::test]
+    async fn expired_replay_records_are_pruned() {
+        let ledger = Ledger::connect_in_memory().await.unwrap();
+        ledger
+            .mark_nostr_event_seen("old-event", 1_000)
+            .await
+            .unwrap();
+        ledger
+            .mark_nostr_event_seen("recent-event", 9_000)
+            .await
+            .unwrap();
+
+        let pruned = ledger.prune_nostr_seen_events(5_000).await.unwrap();
+        assert_eq!(pruned, 1);
+        assert!(!ledger.has_seen_nostr_event("old-event").await.unwrap());
+        assert!(ledger.has_seen_nostr_event("recent-event").await.unwrap());
     }
 
     #[test]

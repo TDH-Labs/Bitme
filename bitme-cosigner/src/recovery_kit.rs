@@ -1,8 +1,8 @@
 //! Encrypted, off-machine backup of everything needed to reconstruct this service's config and
 //! SERVER signing capability after losing the machine that held `wallet.toml` - even though the
-//! SATOCHIP, MOBILE, and SERVER keys themselves are all still intact and unaffected.
+//! HARDWARE, MOBILE, and SERVER keys themselves are all still intact and unaffected.
 //!
-//! This is deliberately narrow: it backs up the *box*, not the keys. SATOCHIP and MOBILE already
+//! This is deliberately narrow: it backs up the *box*, not the keys. HARDWARE and MOBILE already
 //! have their own seed-backup procedures (the hardware wallet's own recovery phrase, the phone
 //! wallet's own recovery phrase) - this module has nothing to add there and doesn't touch them.
 //! What it backs up is the one thing that has no other backup path by default: the SERVER
@@ -20,6 +20,19 @@ use std::path::Path;
 use age::secrecy::SecretString;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+/// scrypt work factor for the backup ciphertext, as `N = 2^BACKUP_LOG_N`.
+///
+/// Pinned rather than left to `age`'s auto-tuning, and deliberately equal to
+/// [`crate::nostr_kit::IDENTITY_LOG_N`]. The two protect the *same secret*: this passphrase
+/// encrypts the blob, and the same passphrase derives the Nostr identity the blob is published
+/// under. The effective strength of the pair is the minimum of the two, so leaving one adaptive
+/// while the other is fixed makes that minimum unknown and hardware-dependent. Auto-tuning is
+/// the right default for a lone ciphertext; it is the wrong default when a second derivation
+/// from the same passphrase is also public.
+///
+/// If you raise one, raise the other.
+pub(crate) const BACKUP_LOG_N: u8 = crate::nostr_kit::IDENTITY_LOG_N;
 
 use crate::config::{ServerSigningConfig, WalletConfig};
 
@@ -88,7 +101,8 @@ pub fn export(config_path: &Path, passphrase: &str) -> Result<String> {
     };
     let plaintext = serde_json::to_vec(&payload).context("serializing recovery kit payload")?;
 
-    let recipient = age::scrypt::Recipient::new(SecretString::from(passphrase.to_string()));
+    let mut recipient = age::scrypt::Recipient::new(SecretString::from(passphrase.to_string()));
+    recipient.set_work_factor(BACKUP_LOG_N);
     age::encrypt_and_armor(&recipient, &plaintext).context("age-encrypting recovery kit")
 }
 
@@ -156,7 +170,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let (satochip, _) = test_key_spec_with_xpriv(0x01);
+        let (hardware, _) = test_key_spec_with_xpriv(0x01);
         let (mobile, _) = test_key_spec_with_xpriv(0x02);
         let (server, server_xprv) = test_key_spec_with_xpriv(0x03);
 
@@ -168,7 +182,7 @@ mod tests {
             network = "signet"
             timelock_blocks = 4320
 
-            [keys.satochip]
+            [keys.hardware]
             master_fingerprint = "{}"
             derivation_path = "{}"
             xpub = "{}"
@@ -186,9 +200,9 @@ mod tests {
             [server_signing]
             xprv_file = "{}"
             "#,
-            satochip.master_fingerprint,
-            satochip.derivation_path,
-            satochip.xpub,
+            hardware.master_fingerprint,
+            hardware.derivation_path,
+            hardware.xpub,
             mobile.master_fingerprint,
             mobile.derivation_path,
             mobile.xpub,
@@ -240,7 +254,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let (satochip, _) = test_key_spec_with_xpriv(0x01);
+        let (hardware, _) = test_key_spec_with_xpriv(0x01);
         let (mobile, _) = test_key_spec_with_xpriv(0x02);
         let (server, _) = test_key_spec_with_xpriv(0x03);
         let toml = format!(
@@ -248,7 +262,7 @@ mod tests {
             network = "signet"
             timelock_blocks = 4320
 
-            [keys.satochip]
+            [keys.hardware]
             master_fingerprint = "{}"
             derivation_path = "{}"
             xpub = "{}"
@@ -263,9 +277,9 @@ mod tests {
             derivation_path = "{}"
             xpub = "{}"
             "#,
-            satochip.master_fingerprint,
-            satochip.derivation_path,
-            satochip.xpub,
+            hardware.master_fingerprint,
+            hardware.derivation_path,
+            hardware.xpub,
             mobile.master_fingerprint,
             mobile.derivation_path,
             mobile.xpub,

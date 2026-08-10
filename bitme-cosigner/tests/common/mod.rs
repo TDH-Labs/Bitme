@@ -24,7 +24,7 @@ use cosigner::signing::ServerSigningKey;
 
 pub const GAP_LIMIT: u32 = 20;
 pub const TIMELOCK_BLOCKS: u16 = 6;
-pub const SATOCHIP_SEED: u8 = 0xA1;
+pub const HARDWARE_SEED: u8 = 0xA1;
 pub const MOBILE_SEED: u8 = 0xA2;
 pub const SERVER_SEED: u8 = 0xA3;
 pub const KEY_PATH: &str = "48h/1h/0h/2h";
@@ -97,7 +97,7 @@ pub fn regtest_wallet_config() -> WalletConfig {
         i_understand_this_is_mainnet: false,
         timelock_blocks: TIMELOCK_BLOCKS,
         keys: KeysConfig {
-            satochip: key_spec(SATOCHIP_SEED, KEY_PATH),
+            hardware: key_spec(HARDWARE_SEED, KEY_PATH),
             mobile: key_spec(MOBILE_SEED, KEY_PATH),
             server: key_spec(SERVER_SEED, KEY_PATH),
         },
@@ -108,13 +108,14 @@ pub fn regtest_wallet_config() -> WalletConfig {
         notify: None,
         recovery: None,
         nostr_transport: None,
+        recovery_contacts: None,
     }
 }
 
 /// Derives the `<chain>/<index>` child xprv of an account-level xprv - the same unhardened
 /// path every role's descriptor key uses (`<0;1>/*`). A test-only re-implementation of
 /// `signing::derive_child_xpriv` (that one's `pub(crate)`, not reachable from an integration
-/// test crate) so SATOCHIP signatures can be produced here the same way the server produces
+/// test crate) so HARDWARE signatures can be produced here the same way the server produces
 /// SERVER ones.
 pub fn derive_child_xpriv(account_xpriv: &Xpriv, chain: u32, index: u32) -> Xpriv {
     let secp = Secp256k1::new();

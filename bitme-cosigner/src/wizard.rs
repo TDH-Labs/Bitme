@@ -87,7 +87,7 @@ pub struct NostrTransportAnswer {
 pub struct WizardAnswers {
     pub network: ChainNetwork,
     pub timelock_blocks: u16,
-    pub satochip: KeyAnswer,
+    pub hardware: KeyAnswer,
     pub mobile: KeyAnswer,
     pub server: KeyAnswer,
     pub server_signing: ServerSigningAnswer,
@@ -304,7 +304,10 @@ pub(crate) fn validate_derivation_path(v: &str) -> Result<(), String> {
 /// Checks the xpub parses, is on the right network, and has the same depth as `path` - the
 /// exact same checks `KeySpec::validate` runs later, surfaced here so a mismatch is caught
 /// immediately instead of at the very end of the wizard.
-pub(crate) fn validate_xpub_for(network: ChainNetwork, path: &str) -> impl Fn(&str) -> Result<(), String> {
+pub(crate) fn validate_xpub_for(
+    network: ChainNetwork,
+    path: &str,
+) -> impl Fn(&str) -> Result<(), String> {
     let path = path.to_string();
     move |v: &str| {
         let xpub: Xpub = v
@@ -430,7 +433,7 @@ pub fn run_interactive<R: BufRead, W: Write>(
         }
     };
 
-    let satochip = prompt_key(input, output, "SATOCHIP", network)?;
+    let hardware = prompt_key(input, output, "HARDWARE", network)?;
     let mobile = prompt_key(input, output, "MOBILE", network)?;
     let server = prompt_key(input, output, "SERVER", network)?;
 
@@ -568,7 +571,7 @@ pub fn run_interactive<R: BufRead, W: Write>(
 
     writeln!(
         output,
-        "\n-- recovery (MOBILE + SERVER, if SATOCHIP is lost) --"
+        "\n-- recovery (MOBILE + SERVER, if HARDWARE is lost) --"
     )?;
     let recovery_hold_seconds = prompt_i64(
         input,
@@ -628,7 +631,7 @@ pub fn run_interactive<R: BufRead, W: Write>(
     Ok(WizardAnswers {
         network,
         timelock_blocks,
-        satochip,
+        hardware,
         mobile,
         server,
         server_signing,
@@ -690,7 +693,7 @@ fn render(a: &WizardAnswers, include_deployment: bool) -> String {
     out.push_str(&format!("timelock_blocks = {}\n\n", a.timelock_blocks));
 
     for (section, key) in [
-        ("satochip", &a.satochip),
+        ("hardware", &a.hardware),
         ("mobile", &a.mobile),
         ("server", &a.server),
     ] {
@@ -729,7 +732,7 @@ fn render(a: &WizardAnswers, include_deployment: bool) -> String {
     out.push_str(
         "# starts against a fresh ledger database - after that the running policy lives\n",
     );
-    out.push_str("# in the database and can only change via a SATOCHIP-authorized POST /policy.\n");
+    out.push_str("# in the database and can only change via a HARDWARE-authorized POST /policy.\n");
     out.push_str("[policy]\n");
     out.push_str(&format!("max_tx_sat = {}\n", a.policy.max_tx_sat));
     out.push_str(&format!("max_daily_sat = {}\n", a.policy.max_daily_sat));
@@ -776,7 +779,7 @@ fn render(a: &WizardAnswers, include_deployment: bool) -> String {
     }
 
     out.push_str(
-        "# MOBILE + SERVER path - used if the SATOCHIP is lost or destroyed. older(N) is a\n",
+        "# MOBILE + SERVER path - used if the HARDWARE is lost or destroyed. older(N) is a\n",
     );
     out.push_str(
         "# *relative* timelock: coins already older than timelock_blocks satisfy it right\n",
@@ -833,7 +836,7 @@ mod tests {
         WizardAnswers {
             network: ChainNetwork::Signet,
             timelock_blocks: 4320,
-            satochip: sample_key(0x01),
+            hardware: sample_key(0x01),
             mobile: sample_key(0x02),
             server: sample_key(0x03),
             server_signing: ServerSigningAnswer::EnvVar("COSIGNER_SERVER_XPRV".to_string()),
@@ -921,7 +924,7 @@ mod tests {
     /// - the actual end-to-end path a real terminal session takes, minus the terminal.
     #[test]
     fn interactive_wizard_produces_a_validating_config_when_every_default_is_accepted() {
-        let (satochip, _) = crate::test_util::test_key_spec_with_xpriv(0x01);
+        let (hardware, _) = crate::test_util::test_key_spec_with_xpriv(0x01);
         let (mobile, _) = crate::test_util::test_key_spec_with_xpriv(0x02);
         let (server, _) = crate::test_util::test_key_spec_with_xpriv(0x03);
 
@@ -929,9 +932,9 @@ mod tests {
         let script = [
             "",                           // network -> default signet
             "4320",                       // timelock (no default accepted for parse safety here)
-            &satochip.master_fingerprint, // SATOCHIP fingerprint
-            "",                           // SATOCHIP path -> default
-            &satochip.xpub,               // SATOCHIP xpub
+            &hardware.master_fingerprint, // HARDWARE fingerprint
+            "",                           // HARDWARE path -> default
+            &hardware.xpub,               // HARDWARE xpub
             &mobile.master_fingerprint,   // MOBILE fingerprint
             "",                           // MOBILE path -> default
             &mobile.xpub,                 // MOBILE xpub
@@ -982,7 +985,7 @@ mod tests {
 
     #[test]
     fn required_field_left_empty_reprompts_instead_of_accepting_blank() {
-        // SATOCHIP fingerprint has no default - an empty line must re-prompt, not silently
+        // HARDWARE fingerprint has no default - an empty line must re-prompt, not silently
         // proceed with an empty fingerprint. Feed one blank line, then a real one.
         let script = "\nAABBCCDD\n";
         let mut input = Cursor::new(script.as_bytes());
@@ -1057,7 +1060,7 @@ mod tests {
 
     #[test]
     fn interactive_wizard_can_enable_nostr_transport() {
-        let (satochip, _) = crate::test_util::test_key_spec_with_xpriv(0x01);
+        let (hardware, _) = crate::test_util::test_key_spec_with_xpriv(0x01);
         let (mobile, _) = crate::test_util::test_key_spec_with_xpriv(0x02);
         let (server, _) = crate::test_util::test_key_spec_with_xpriv(0x03);
         let npub = sample_npub();
@@ -1068,9 +1071,9 @@ mod tests {
         let script = [
             "",                                    // network -> default signet
             "4320",                                // timelock
-            &satochip.master_fingerprint,          // SATOCHIP fingerprint
-            "",                                    // SATOCHIP path -> default
-            &satochip.xpub,                        // SATOCHIP xpub
+            &hardware.master_fingerprint,          // HARDWARE fingerprint
+            "",                                    // HARDWARE path -> default
+            &hardware.xpub,                        // HARDWARE xpub
             &mobile.master_fingerprint,            // MOBILE fingerprint
             "",                                    // MOBILE path -> default
             &mobile.xpub,                          // MOBILE xpub

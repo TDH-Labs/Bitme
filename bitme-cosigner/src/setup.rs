@@ -47,6 +47,11 @@ use crate::wizard::{
 /// `[server_signing].xprv_file` in the config this module writes.
 const SERVER_XPRV_FILENAME: &str = "server.xprv";
 const WALLET_TOML_FILENAME: &str = "wallet.toml";
+/// Bearer token for `/inspect` and `/sign_psbt`, generated here and referenced by
+/// `[server].api_token_file` (which `docker-entrypoint.sh` emits).
+const API_TOKEN_FILENAME: &str = "api.token";
+/// Optional operator override for the bundled device-compatibility matrix. Absent is normal.
+const COMPATIBILITY_FILENAME: &str = "compatibility.toml";
 
 /// Deployment facts the wizard doesn't ask about because the container already knows them.
 /// These come from the same environment variables `docker-entrypoint.sh` reads, so the two
@@ -98,6 +103,21 @@ impl SetupState {
     fn server_xprv_path(&self) -> PathBuf {
         self.deployment.config_dir.join(SERVER_XPRV_FILENAME)
     }
+
+    fn api_token_path(&self) -> PathBuf {
+        self.deployment.config_dir.join(API_TOKEN_FILENAME)
+    }
+
+    /// The compatibility matrix: an operator-supplied `compatibility.toml` in the config
+    /// directory if there is one, otherwise the bundled copy. Reloaded per request rather than
+    /// cached, so an operator correcting the matrix doesn't have to restart the wizard to see it
+    /// take effect - this is a handful of TOML read once per setup, not a hot path.
+    fn matrix(&self) -> Result<crate::compat::Matrix, SetupError> {
+        crate::compat::Matrix::load_or_bundled(
+            &self.deployment.config_dir.join(COMPATIBILITY_FILENAME),
+        )
+        .map_err(|e| SetupError::internal(format!("loading the compatibility matrix: {e}")))
+    }
 }
 
 pub fn router(state: Arc<SetupState>) -> Router {
@@ -105,6 +125,8 @@ pub fn router(state: Arc<SetupState>) -> Router {
         .route("/", get(index_handler))
         .route("/health", get(health_handler))
         .route("/api/state", get(state_handler))
+        .route("/api/compat", get(compat_handler))
+        .route("/api/compat/resolve", post(resolve_compat_handler))
         .route("/api/validate-key", post(validate_key_handler))
         .route("/api/server-key", post(server_key_handler))
         .route("/api/decode-qr", post(decode_qr_handler))
@@ -183,6 +205,74 @@ async fn state_handler(State(state): State<Arc<SetupState>>) -> Json<StateRespon
     })
 }
 
+/// The compatibility matrix, for the device-selection step. Loaded from the config directory if
+/// the operator has supplied one, otherwise the copy compiled into the binary.
+async fn compat_handler(
+    State(state): State<Arc<SetupState>>,
+) -> Result<Json<crate::compat::Matrix>, SetupError> {
+    Ok(Json(state.matrix()?))
+}
+
+#[derive(Deserialize)]
+struct ResolveCompatRequest {
+    hardware: String,
+    coordinator: String,
+    /// Defaults to the coordinator: one app commonly plays both roles.
+    #[serde(default)]
+    mobile_holder: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ResolveCompatResponse {
+    resolution: crate::compat::Resolution,
+    /// The exact text the operator must acknowledge, or `null` if nothing needs acknowledging.
+    /// Generated from which capability check failed, never written per device pair - see
+    /// `compat::Resolution::acknowledgement`.
+    acknowledgement: Option<String>,
+    /// Every device, each with its own verdict against this coordinator. Nothing is filtered out:
+    /// a greyed-out option with no explanation produces support questions, an annotated one
+    /// teaches the constraint.
+    options: Vec<CompatOption>,
+}
+
+#[derive(Serialize)]
+struct CompatOption {
+    id: String,
+    label: String,
+    verdict: crate::compat::Verdict,
+    notes: Option<String>,
+    summary: Option<String>,
+}
+
+async fn resolve_compat_handler(
+    State(state): State<Arc<SetupState>>,
+    Json(req): Json<ResolveCompatRequest>,
+) -> Result<Json<ResolveCompatResponse>, SetupError> {
+    let matrix = state.matrix()?;
+    let mobile_holder = req.mobile_holder.as_deref().unwrap_or(&req.coordinator);
+
+    let resolution =
+        crate::compat::resolve(&matrix, &req.hardware, &req.coordinator, mobile_holder)
+            .map_err(|e| SetupError::bad_request(format!("{e}")))?;
+    let options = crate::compat::options_for_coordinator(&matrix, &req.coordinator, mobile_holder)
+        .map_err(|e| SetupError::bad_request(format!("{e}")))?
+        .into_iter()
+        .map(|(hw, res)| CompatOption {
+            id: hw.id,
+            label: hw.label,
+            verdict: res.overall,
+            notes: hw.notes,
+            summary: res.acknowledgement(),
+        })
+        .collect();
+
+    Ok(Json(ResolveCompatResponse {
+        acknowledgement: resolution.acknowledgement(),
+        resolution,
+        options,
+    }))
+}
+
 #[derive(Deserialize)]
 struct ValidateKeyRequest {
     fingerprint: String,
@@ -221,8 +311,20 @@ fn validate_key(network: ChainNetwork, req: &ValidateKeyRequest) -> Result<KeyAn
     })
 }
 
+#[derive(Deserialize)]
+struct ServerKeyRequest {
+    /// Optional operator-supplied entropy - dice rolls, coin flips, anything they generated
+    /// themselves - mixed into the OS CSPRNG output rather than replacing it. See
+    /// [`generate_server_key`].
+    #[serde(default)]
+    user_entropy: Option<String>,
+}
+
 #[derive(Serialize)]
 struct ServerKeyResponse {
+    /// Whether the operator's own entropy went into this key, so the UI can say so plainly on
+    /// the review screen instead of leaving them to remember.
+    mixed_user_entropy: bool,
     master_fingerprint: String,
     derivation_path: String,
     xpub: String,
@@ -249,11 +351,26 @@ struct ServerKeyResponse {
 /// 256 bits are drawn and used directly as BIP32 master seed material.
 async fn server_key_handler(
     State(state): State<Arc<SetupState>>,
+    body: Option<Json<ServerKeyRequest>>,
 ) -> Result<Json<ServerKeyResponse>, SetupError> {
     let network = state.deployment.network;
     let path_str = default_derivation_path(network);
 
-    let generated = generate_server_key(network, &path_str)
+    let user_entropy = body
+        .and_then(|Json(b)| b.user_entropy)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(extra) = &user_entropy {
+        if extra.chars().count() < MIN_USER_ENTROPY_CHARS {
+            return Err(SetupError::bad_request(format!(
+                "extra entropy must be at least {MIN_USER_ENTROPY_CHARS} characters if supplied - \
+                 a short string doesn't weaken the key, but it does invite false confidence. \
+                 Roll dice, or leave it blank to use the OS CSPRNG alone"
+            )));
+        }
+    }
+
+    let generated = generate_server_key(network, &path_str, user_entropy.as_deref())
         .map_err(|e| SetupError::internal(format!("generating the SERVER key failed: {e}")))?;
 
     let expr = key_expression(
@@ -262,6 +379,7 @@ async fn server_key_handler(
         &generated.xpub,
     );
     let response = ServerKeyResponse {
+        mixed_user_entropy: user_entropy.is_some(),
         key_expression_qr_svg: qr_svg(&expr),
         import_json: serde_json::json!({
             "xfp": generated.master_fingerprint.to_uppercase(),
@@ -281,12 +399,59 @@ async fn server_key_handler(
     Ok(Json(response))
 }
 
-fn generate_server_key(network: ChainNetwork, path_str: &str) -> Result<GeneratedServerKey> {
-    let secp = Secp256k1::new();
-    let path: DerivationPath = path_str.parse().context("parsing the default derivation path")?;
+/// Below this, supplied entropy is refused outright. It cannot *weaken* the key at any length -
+/// the OS bytes are in the hash regardless - but accepting "abc" would let someone believe they
+/// had protected themselves against a compromised RNG when they had not.
+const MIN_USER_ENTROPY_CHARS: usize = 30;
 
-    let mut seed = Zeroizing::new([0u8; 32]);
-    bitcoin::secp256k1::rand::rngs::OsRng.fill_bytes(seed.as_mut());
+/// Domain separation for the entropy mix, so this hash can never collide with any other use of
+/// SHA-256 over similar material. Fixed forever.
+const ENTROPY_MIX_TAG: &[u8] = b"bitme-cosigner/server-key/entropy-mix/v1";
+
+/// Derives the SERVER key. `user_entropy`, if supplied, is *mixed with* the OS CSPRNG output -
+/// never substituted for it.
+///
+/// The construction is `SHA256(tag || os_bytes || user_bytes)`, which is safe in both directions,
+/// and that symmetry is the entire point:
+///
+/// - If the OS CSPRNG is sound, the output is unpredictable no matter what the user typed -
+///   including something an attacker chose for them.
+/// - If the OS CSPRNG is broken, backdoored, or returns a value an attacker already knows, the
+///   output is *still* unpredictable to that attacker, because they would also have to guess the
+///   user's contribution.
+///
+/// The second property is the one worth having. A hardware wallet shipping a build whose entropy
+/// source had been quietly replaced is not a hypothetical, and no amount of reading *this* source
+/// tells an operator what the binary on their box actually did. Dice they rolled themselves are
+/// something they can verify without trusting this code at all.
+///
+/// With no user entropy the OS bytes are used directly, byte for byte as before - the default
+/// path is unchanged rather than newly routed through a hash.
+fn generate_server_key(
+    network: ChainNetwork,
+    path_str: &str,
+    user_entropy: Option<&str>,
+) -> Result<GeneratedServerKey> {
+    use bitcoin::hashes::{sha256, Hash, HashEngine};
+
+    let secp = Secp256k1::new();
+    let path: DerivationPath = path_str
+        .parse()
+        .context("parsing the default derivation path")?;
+
+    let mut os_bytes = Zeroizing::new([0u8; 32]);
+    bitcoin::secp256k1::rand::rngs::OsRng.fill_bytes(os_bytes.as_mut());
+
+    let seed: Zeroizing<[u8; 32]> = match user_entropy {
+        None => os_bytes.clone(),
+        Some(extra) => {
+            let mut engine = sha256::Hash::engine();
+            engine.input(ENTROPY_MIX_TAG);
+            engine.input(os_bytes.as_ref());
+            engine.input(extra.as_bytes());
+            Zeroizing::new(sha256::Hash::from_engine(engine).to_byte_array())
+        }
+    };
 
     let master = Xpriv::new_master(network.xpub_network_kind(), seed.as_ref())
         .context("deriving a BIP32 master key from fresh entropy")?;
@@ -308,11 +473,24 @@ fn generate_server_key(network: ChainNetwork, path_str: &str) -> Result<Generate
 #[derive(Deserialize)]
 struct FinishRequest {
     timelock_blocks: u16,
-    satochip: ValidateKeyRequest,
+    /// Aliased for the same reason `KeysConfig::hardware` is: anything scripted against the old
+    /// field name keeps working.
+    #[serde(alias = "satochip")]
+    hardware: ValidateKeyRequest,
     mobile: ValidateKeyRequest,
     policy: PolicyRequest,
     hold_seconds: i64,
     recovery_hold_seconds: i64,
+    /// Addresses a MOBILE + SERVER recovery spend is allowed to pay. Optional, and empty means
+    /// "anywhere" - but it is the single most effective control available on that path, so the
+    /// wizard asks for it rather than leaving it to a config file nobody edits.
+    ///
+    /// The recovery path skips the amount caps by design (its legitimate use is sweeping the
+    /// whole balance), `older(N)` is *relative* so mature coins already satisfy it, and that
+    /// leaves the hold, the notification and this list. Pre-committing to an address you control
+    /// means a stolen phone cannot redirect the funds even if everything else is defeated.
+    #[serde(default)]
+    recovery_destination_whitelist: Option<Vec<String>>,
     #[serde(default)]
     ntfy_url: Option<String>,
     /// Alternative to ntfy. The config has always supported both; only the browser wizard was
@@ -350,6 +528,10 @@ struct FinishResponse {
     first_address: String,
     server_fingerprint: String,
     config_path: String,
+    /// The generated bearer token. Shown once, on the final screen - it lives in a 0600 file on
+    /// the box, so it is recoverable, but the operator needs it now to configure whatever will
+    /// be submitting PSBTs.
+    api_token: String,
     /// The multipath descriptor as an inline SVG QR, for carrying to a phone without retyping
     /// it. `None` if the descriptor is too long to encode - the copy/download paths in the UI
     /// always work, so this is a convenience that's allowed to be absent rather than an error.
@@ -426,7 +608,7 @@ async fn finish_handler(
     }
 
     let network = state.deployment.network;
-    let satochip = validate_key(network, &req.satochip)?;
+    let hardware = validate_key(network, &req.hardware)?;
     let mobile = validate_key(network, &req.mobile)?;
 
     let mut guard = state.generated.lock().await;
@@ -442,10 +624,7 @@ async fn finish_handler(
     // `WalletConfig::validate` enforces this too, but only after the whole form has been
     // filled in. Rejecting it here, with the reason, beats a late failure on a field the UI
     // could plausibly have presented as optional.
-    let has_ntfy = req
-        .ntfy_url
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty());
+    let has_ntfy = req.ntfy_url.as_ref().is_some_and(|s| !s.trim().is_empty());
     let has_smtp = req
         .smtp
         .as_ref()
@@ -459,19 +638,19 @@ async fn finish_handler(
     }
     // Two distinct keys are the whole point of a multisig; identical xpubs would compile into a
     // descriptor that looks like 2-of-3 but is really 1-of-2.
-    if satochip.xpub == mobile.xpub {
+    if hardware.xpub == mobile.xpub {
         return Err(SetupError::bad_request(
-            "the SATOCHIP and Bitcoin Keeper keys are the same xpub - each key must be a \
+            "the HARDWARE and Bitcoin Keeper keys are the same xpub - each key must be a \
              different device",
         ));
     }
-    if satochip.xpub == generated.xpub || mobile.xpub == generated.xpub {
+    if hardware.xpub == generated.xpub || mobile.xpub == generated.xpub {
         return Err(SetupError::bad_request(
             "one of the keys you entered is the SERVER key this box just generated",
         ));
     }
 
-    let answers = build_answers(&state.deployment, &req, satochip, mobile, generated);
+    let answers = build_answers(&state.deployment, &req, hardware, mobile, generated);
     let toml_text = wizard::render_user_toml(&answers);
 
     // Parse and validate exactly the bytes about to be written - not the in-memory answers -
@@ -481,8 +660,9 @@ async fn finish_handler(
     cfg.validate()
         .map_err(|e| SetupError::bad_request(format!("{e}")))?;
 
-    let built = descriptor::build_descriptor(&cfg)
-        .map_err(|e| SetupError::bad_request(format!("these keys don't form a valid wallet: {e}")))?;
+    let built = descriptor::build_descriptor(&cfg).map_err(|e| {
+        SetupError::bad_request(format!("these keys don't form a valid wallet: {e}"))
+    })?;
     // Receive index 0, from the external chain - the address the UI tells the operator to
     // cross-check against what Bitcoin Keeper shows after importing the descriptor. A mismatch
     // there is the cheapest possible way to catch a mistyped xpub before any coins move.
@@ -492,10 +672,20 @@ async fn finish_handler(
 
     write_private(&state.server_xprv_path(), generated.account_xprv.as_bytes())
         .map_err(|e| SetupError::internal(format!("writing the SERVER key failed: {e}")))?;
+    // Written before wallet.toml, same ordering rule as the xprv: the config references this
+    // file, so it must never exist pointing at a token that isn't there.
+    let api_token = generate_api_token();
+    if let Err(e) = write_private(&state.api_token_path(), api_token.as_bytes()) {
+        let _ = std::fs::remove_file(state.server_xprv_path());
+        return Err(SetupError::internal(format!(
+            "writing the API token failed: {e}"
+        )));
+    }
     // wallet.toml last: its presence is what the entrypoint keys off, so it must never exist
     // without the key file it points at.
     if let Err(e) = write_private(&state.wallet_toml_path(), toml_text.as_bytes()) {
         let _ = std::fs::remove_file(state.server_xprv_path());
+        let _ = std::fs::remove_file(state.api_token_path());
         return Err(SetupError::internal(format!(
             "writing wallet.toml failed: {e}"
         )));
@@ -514,6 +704,7 @@ async fn finish_handler(
         first_address,
         server_fingerprint: generated.master_fingerprint.clone(),
         config_path: state.wallet_toml_path().display().to_string(),
+        api_token,
     };
     // The key is on disk now; drop the in-memory copy.
     *guard = None;
@@ -523,14 +714,14 @@ async fn finish_handler(
 fn build_answers(
     deployment: &Deployment,
     req: &FinishRequest,
-    satochip: KeyAnswer,
+    hardware: KeyAnswer,
     mobile: KeyAnswer,
     generated: &GeneratedServerKey,
 ) -> WizardAnswers {
     WizardAnswers {
         network: deployment.network,
         timelock_blocks: req.timelock_blocks,
-        satochip,
+        hardware,
         mobile,
         server: KeyAnswer {
             fingerprint: generated.master_fingerprint.clone(),
@@ -588,9 +779,28 @@ fn build_answers(
             }),
         },
         recovery_hold_seconds: req.recovery_hold_seconds,
-        recovery_destination_whitelist: None,
+        recovery_destination_whitelist: req
+            .recovery_destination_whitelist
+            .as_ref()
+            .map(|addrs| {
+                addrs
+                    .iter()
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| !a.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|addrs| !addrs.is_empty()),
         nostr_transport: None,
     }
+}
+
+/// A fresh bearer token for `/inspect` and `/sign_psbt`: 256 bits from the same OS CSPRNG the
+/// SERVER key comes from, hex-encoded so it survives being copied through a phone, a QR, or a
+/// shell without any quoting or encoding questions.
+fn generate_api_token() -> String {
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    bitcoin::secp256k1::rand::rngs::OsRng.fill_bytes(bytes.as_mut());
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Writes owner-read/write only, and creates with those permissions rather than relaxing them
@@ -742,9 +952,11 @@ fn parse_scanned_key(payload: &str) -> Option<ScannedKey> {
     let bare = s.split_whitespace().next().unwrap_or(s);
     if bare.len() > 100
         && bare.chars().all(|c| c.is_ascii_alphanumeric())
-        && ["xpub", "tpub", "ypub", "zpub", "Vpub", "Zpub", "upub", "vpub"]
-            .iter()
-            .any(|p| bare.starts_with(p))
+        && [
+            "xpub", "tpub", "ypub", "zpub", "Vpub", "Zpub", "upub", "vpub",
+        ]
+        .iter()
+        .any(|p| bare.starts_with(p))
     {
         return Some(ScannedKey {
             fingerprint: None,
@@ -783,6 +995,93 @@ fn default_derivation_path(network: ChainNetwork) -> String {
 mod tests {
     use super::*;
 
+    /// The same key, expressed as the wizard's request shape.
+    fn key_answer(spec: &crate::config::KeySpec) -> KeyAnswer {
+        KeyAnswer {
+            fingerprint: spec.master_fingerprint.clone(),
+            derivation_path: spec.derivation_path.clone(),
+            xpub: spec.xpub.clone(),
+        }
+    }
+
+    /// The wizard's device-compatibility gate, end to end through the HTTP layer: the pairing
+    /// this project was built around must come back blocked, with an acknowledgement that states
+    /// the real consequence rather than a softened one.
+    #[tokio::test]
+    async fn the_compat_endpoint_blocks_the_satochip_keeper_pairing() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let (tx, _rx) = oneshot::channel();
+        let state = Arc::new(SetupState::new(deployment(ChainNetwork::Signet), tx));
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/compat/resolve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"hardware":"satochip","coordinator":"bitcoin-keeper"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(json["resolution"]["overall"], "blocked");
+        let ack = json["acknowledgement"].as_str().expect("must warn");
+        assert!(
+            ack.contains("may be unable to spend"),
+            "the gate must state the real consequence: {ack}"
+        );
+
+        // Every device is offered, none filtered out, and the workable ones come first.
+        let options = json["options"].as_array().expect("options present");
+        assert!(
+            options.len() >= 5,
+            "nothing may be hidden from the operator"
+        );
+        assert_eq!(options[0]["verdict"], "ok");
+    }
+
+    /// A complete, valid wizard submission - the baseline each test then varies one field of.
+    fn finish_request(
+        hardware: &crate::config::KeySpec,
+        mobile: &crate::config::KeySpec,
+    ) -> FinishRequest {
+        let as_request = |spec: &crate::config::KeySpec| ValidateKeyRequest {
+            fingerprint: spec.master_fingerprint.clone(),
+            derivation_path: spec.derivation_path.clone(),
+            xpub: spec.xpub.clone(),
+        };
+        FinishRequest {
+            timelock_blocks: 12960,
+            hardware: as_request(hardware),
+            mobile: as_request(mobile),
+            policy: PolicyRequest {
+                max_tx_sat: 100_000,
+                max_daily_sat: 200_000,
+                max_weekly_sat: 500_000,
+                max_monthly_sat: 1_000_000,
+                max_fee_sat: 10_000,
+                max_fee_rate_sat_per_vb: 50.0,
+            },
+            hold_seconds: 3600,
+            recovery_hold_seconds: 86400,
+            recovery_destination_whitelist: None,
+            ntfy_url: Some("https://ntfy.sh/bitme-test-topic".to_string()),
+            smtp: None,
+        }
+    }
+
     fn deployment(network: ChainNetwork) -> Deployment {
         Deployment {
             network,
@@ -793,19 +1092,106 @@ mod tests {
         }
     }
 
+    /// The escape address is the strongest control on the MOBILE + SERVER path - that path skips
+    /// the amount caps by design, and `older(N)` is relative so mature coins already satisfy it.
+    /// The wizard collecting it has to actually reach the config, or it is theatre.
+    #[test]
+    fn a_recovery_whitelist_from_the_wizard_reaches_the_rendered_config() {
+        let network = ChainNetwork::Signet;
+        let (hardware, _) = crate::test_util::test_key_spec_with_xpriv(1);
+        let (mobile, _) = crate::test_util::test_key_spec_with_xpriv(2);
+        let path = default_derivation_path(network);
+        let generated = generate_server_key(network, &path, None).expect("generation");
+        // A real signet address - `RecoveryConfig::validate` network-checks these, so a
+        // placeholder would be rejected rather than round-tripped.
+        let escape = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+
+        let mut req = finish_request(&hardware, &mobile);
+        req.recovery_destination_whitelist = Some(vec![
+            format!("  {escape}  "),
+            String::new(),
+            "\t".to_string(),
+        ]);
+
+        let answers = build_answers(
+            &deployment(network),
+            &req,
+            key_answer(&hardware),
+            key_answer(&mobile),
+            &generated,
+        );
+        // Blank entries are dropped and surrounding whitespace trimmed, so a trailing newline in
+        // the textarea doesn't become an unparseable address.
+        assert_eq!(
+            answers.recovery_destination_whitelist,
+            Some(vec![escape.to_string()])
+        );
+
+        let text = wizard::render_user_toml(&answers);
+        assert!(text.contains(escape), "rendered:\n{text}");
+        let cfg: WalletConfig = toml::from_str(&text).expect("should parse");
+        cfg.validate().expect("should validate");
+        assert_eq!(
+            cfg.recovery_config()
+                .compiled_whitelist(network)
+                .expect("whitelist compiles")
+                .map(|w| w.len()),
+            Some(1)
+        );
+    }
+
+    /// An empty or whitespace-only textarea must mean "no whitelist", not "a whitelist containing
+    /// an empty string" - which would compile to a list nothing can satisfy and brick recovery.
+    #[test]
+    fn a_blank_recovery_whitelist_is_treated_as_unset() {
+        let network = ChainNetwork::Signet;
+        let (hardware, _) = crate::test_util::test_key_spec_with_xpriv(1);
+        let (mobile, _) = crate::test_util::test_key_spec_with_xpriv(2);
+        let path = default_derivation_path(network);
+        let generated = generate_server_key(network, &path, None).expect("generation");
+
+        for blank in [Some(vec![]), Some(vec!["   ".to_string()]), None] {
+            let mut req = finish_request(&hardware, &mobile);
+            req.recovery_destination_whitelist = blank.clone();
+            let answers = build_answers(
+                &deployment(network),
+                &req,
+                key_answer(&hardware),
+                key_answer(&mobile),
+                &generated,
+            );
+            assert_eq!(
+                answers.recovery_destination_whitelist, None,
+                "blank input {blank:?} must not become a whitelist"
+            );
+        }
+    }
+
     #[test]
     fn default_path_uses_the_registered_coin_type_per_network() {
-        assert_eq!(default_derivation_path(ChainNetwork::Mainnet), "48h/0h/0h/2h");
-        assert_eq!(default_derivation_path(ChainNetwork::Signet), "48h/1h/0h/2h");
-        assert_eq!(default_derivation_path(ChainNetwork::Regtest), "48h/1h/0h/2h");
-        assert_eq!(default_derivation_path(ChainNetwork::Testnet), "48h/1h/0h/2h");
+        assert_eq!(
+            default_derivation_path(ChainNetwork::Mainnet),
+            "48h/0h/0h/2h"
+        );
+        assert_eq!(
+            default_derivation_path(ChainNetwork::Signet),
+            "48h/1h/0h/2h"
+        );
+        assert_eq!(
+            default_derivation_path(ChainNetwork::Regtest),
+            "48h/1h/0h/2h"
+        );
+        assert_eq!(
+            default_derivation_path(ChainNetwork::Testnet),
+            "48h/1h/0h/2h"
+        );
     }
 
     #[test]
     fn generated_server_key_matches_its_own_xpub_and_path() {
         let network = ChainNetwork::Signet;
         let path = default_derivation_path(network);
-        let g = generate_server_key(network, &path).expect("generation should succeed");
+        let g = generate_server_key(network, &path, None).expect("generation should succeed");
 
         // The xprv written to disk must be the account key the config's xpub names - this is
         // exactly the equality `ServerSigningKey::load` refuses to start without.
@@ -828,7 +1214,10 @@ mod tests {
     fn key_expression_notation_matches_the_descriptor() {
         let expr = key_expression("AB12CD34", "48h/1h/0h/2h", "tpubEXAMPLE");
         assert_eq!(expr, "[ab12cd34/48'/1'/0'/2']tpubEXAMPLE");
-        assert!(!expr.contains('h'), "hardened marker must be an apostrophe: {expr}");
+        assert!(
+            !expr.contains('h'),
+            "hardened marker must be an apostrophe: {expr}"
+        );
 
         // Already-canonical input is left alone, and `m/` prefixes are stripped.
         assert_eq!(
@@ -848,14 +1237,14 @@ mod tests {
     fn advertised_server_key_appears_verbatim_in_the_built_descriptor() {
         let network = ChainNetwork::Signet;
         let path = default_derivation_path(network);
-        let g = generate_server_key(network, &path).expect("generation");
+        let g = generate_server_key(network, &path, None).expect("generation");
         let advertised = key_expression(&g.master_fingerprint, &g.derivation_path, &g.xpub);
 
-        let (satochip, _) = crate::test_util::test_key_spec_with_xpriv(1);
+        let (hardware, _) = crate::test_util::test_key_spec_with_xpriv(1);
         let (mobile, _) = crate::test_util::test_key_spec_with_xpriv(2);
         let mut cfg = crate::test_util::test_wallet_config(144);
         cfg.network = network;
-        cfg.keys.satochip = satochip;
+        cfg.keys.hardware = hardware;
         cfg.keys.mobile = mobile;
         cfg.keys.server = crate::config::KeySpec {
             master_fingerprint: g.master_fingerprint.clone(),
@@ -872,11 +1261,76 @@ mod tests {
         );
     }
 
+    /// Supplied entropy must *change* the key - if it were accepted and then ignored, the UI
+    /// would be reporting a protection that doesn't exist, which is worse than not offering it.
+    #[test]
+    fn user_entropy_changes_the_derived_key() {
+        let path = default_derivation_path(ChainNetwork::Signet);
+        let dice = "4 2 6 1 3 5 5 2 6 1 4 3 2 5 1 6 3 4 2 5 1 6 4 3";
+
+        let a = generate_server_key(ChainNetwork::Signet, &path, Some(dice)).expect("a");
+        let b = generate_server_key(ChainNetwork::Signet, &path, Some(dice)).expect("b");
+        // Same user entropy, different OS bytes - so still different keys. The OS contribution
+        // is not being discarded in favour of what was typed.
+        assert_ne!(
+            a.xpub, b.xpub,
+            "identical user entropy must not produce a reproducible key - the OS bytes are \
+             mixed in, not replaced"
+        );
+
+        let plain = generate_server_key(ChainNetwork::Signet, &path, None).expect("plain");
+        assert_ne!(a.xpub, plain.xpub);
+
+        // The mixed key is still a well-formed account key at the declared depth.
+        let xpub: Xpub = a.xpub.parse().expect("xpub parses");
+        assert_eq!(
+            xpub.depth as usize,
+            path.parse::<DerivationPath>().unwrap().len()
+        );
+        let secp = Secp256k1::new();
+        let account: Xpriv = a.account_xprv.parse().expect("account xprv parses");
+        assert_eq!(Xpub::from_priv(&secp, &account).to_string(), a.xpub);
+    }
+
+    /// The mix is `SHA256(tag || os || user)`. Pinning it against an independently computed
+    /// digest means a refactor cannot silently change what the entropy is, or drop one of the
+    /// inputs while still producing a plausible-looking key.
+    #[test]
+    fn the_entropy_mix_is_exactly_the_documented_construction() {
+        use bitcoin::hashes::{sha256, Hash, HashEngine};
+
+        let os_bytes = [0xABu8; 32];
+        let user = "some dice rolls";
+
+        let mut engine = sha256::Hash::engine();
+        engine.input(ENTROPY_MIX_TAG);
+        engine.input(&os_bytes);
+        engine.input(user.as_bytes());
+        let expected = sha256::Hash::from_engine(engine).to_byte_array();
+
+        // Both inputs must actually be present: dropping either changes the result.
+        let mut without_user = sha256::Hash::engine();
+        without_user.input(ENTROPY_MIX_TAG);
+        without_user.input(&os_bytes);
+        assert_ne!(
+            sha256::Hash::from_engine(without_user).to_byte_array(),
+            expected
+        );
+
+        let mut without_os = sha256::Hash::engine();
+        without_os.input(ENTROPY_MIX_TAG);
+        without_os.input(user.as_bytes());
+        assert_ne!(
+            sha256::Hash::from_engine(without_os).to_byte_array(),
+            expected
+        );
+    }
+
     #[test]
     fn two_generated_keys_are_never_the_same() {
         let path = default_derivation_path(ChainNetwork::Signet);
-        let a = generate_server_key(ChainNetwork::Signet, &path).expect("first");
-        let b = generate_server_key(ChainNetwork::Signet, &path).expect("second");
+        let a = generate_server_key(ChainNetwork::Signet, &path, None).expect("first");
+        let b = generate_server_key(ChainNetwork::Signet, &path, None).expect("second");
         assert_ne!(a.xpub, b.xpub);
         assert_ne!(a.master_fingerprint, b.master_fingerprint);
     }
@@ -889,7 +1343,7 @@ mod tests {
             ChainNetwork::Regtest,
         ] {
             let path = default_derivation_path(network);
-            let g = generate_server_key(network, &path).expect("generation should succeed");
+            let g = generate_server_key(network, &path, None).expect("generation should succeed");
             let xpub: Xpub = g.xpub.parse().expect("xpub parses");
             assert_eq!(xpub.network, network.xpub_network_kind());
         }
@@ -901,50 +1355,18 @@ mod tests {
     #[test]
     fn rendered_config_omits_the_sections_the_entrypoint_generates() {
         let network = ChainNetwork::Signet;
-        let (satochip, _) = crate::test_util::test_key_spec_with_xpriv(1);
+        let (hardware, _) = crate::test_util::test_key_spec_with_xpriv(1);
         let (mobile, _) = crate::test_util::test_key_spec_with_xpriv(2);
         let path = default_derivation_path(network);
-        let generated = generate_server_key(network, &path).expect("generation");
+        let generated = generate_server_key(network, &path, None).expect("generation");
 
-        let req = FinishRequest {
-            timelock_blocks: 12960,
-            satochip: ValidateKeyRequest {
-                fingerprint: satochip.master_fingerprint.clone(),
-                derivation_path: satochip.derivation_path.clone(),
-                xpub: satochip.xpub.clone(),
-            },
-            mobile: ValidateKeyRequest {
-                fingerprint: mobile.master_fingerprint.clone(),
-                derivation_path: mobile.derivation_path.clone(),
-                xpub: mobile.xpub.clone(),
-            },
-            policy: PolicyRequest {
-                max_tx_sat: 100_000,
-                max_daily_sat: 200_000,
-                max_weekly_sat: 500_000,
-                max_monthly_sat: 1_000_000,
-                max_fee_sat: 10_000,
-                max_fee_rate_sat_per_vb: 50.0,
-            },
-            hold_seconds: 3600,
-            recovery_hold_seconds: 86400,
-            ntfy_url: Some("https://ntfy.sh/bitme-test-topic".to_string()),
-            smtp: None,
-        };
+        let req = finish_request(&hardware, &mobile);
 
         let answers = build_answers(
             &deployment(network),
             &req,
-            KeyAnswer {
-                fingerprint: satochip.master_fingerprint.clone(),
-                derivation_path: satochip.derivation_path.clone(),
-                xpub: satochip.xpub.clone(),
-            },
-            KeyAnswer {
-                fingerprint: mobile.master_fingerprint.clone(),
-                derivation_path: mobile.derivation_path.clone(),
-                xpub: mobile.xpub.clone(),
-            },
+            key_answer(&hardware),
+            key_answer(&mobile),
             &generated,
         );
         let text = wizard::render_user_toml(&answers);

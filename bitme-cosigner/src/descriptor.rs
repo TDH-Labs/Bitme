@@ -3,30 +3,32 @@
 //! Policy: **any two of the three keys can spend, but any spend involving the MOBILE key waits
 //! `N` blocks.**
 //!
-//!   wsh(thresh(2,pk(SATOCHIP),s:pk(SERVER),snj:and_v(v:pk(MOBILE),older(N))))
+//!   wsh(thresh(2,pk(HARDWARE),s:pk(SERVER),snj:and_v(v:pk(MOBILE),older(N))))
 //!
 //! Which gives exactly three spending combinations:
 //!
-//!   - SATOCHIP + SERVER, immediately - the "HOT" path, and the only one this service
+//!   - HARDWARE + SERVER, immediately - the "HOT" path, and the only one this service
 //!     co-signs on demand, subject to the policy engine.
-//!   - SATOCHIP + MOBILE, after `N` blocks - recovery when *this service* is gone.
-//!   - MOBILE + SERVER, after `N` blocks - recovery when the *SATOCHIP* is gone.
+//!   - HARDWARE + MOBILE, after `N` blocks - recovery when *this service* is gone.
+//!   - MOBILE + SERVER, after `N` blocks - recovery when the *HARDWARE* is gone.
 //!
-//! That third combination is the reason for this shape. An earlier revision made SATOCHIP
+//! That third combination is the reason for this shape. An earlier revision made HARDWARE
 //! mandatory in both branches
-//! (`and_v(v:pk(SATOCHIP),or_d(pk(SERVER),and_v(v:pk(MOBILE),older(N))))`), which meant losing
-//! the SATOCHIP seed lost the funds outright - a single point of catastrophic failure with no
+//! (`and_v(v:pk(HARDWARE),or_d(pk(SERVER),and_v(v:pk(MOBILE),older(N))))`), which meant losing
+//! the HARDWARE seed lost the funds outright - a single point of catastrophic failure with no
 //! recourse. Every single-device loss is now survivable, which is the property Bitkey's 2-of-3
 //! has and that one lacked.
 //!
 //! The timelock on the MOBILE branch is what keeps this service meaningful: the *only* way to
-//! spend without waiting `N` blocks is SATOCHIP + SERVER, so the policy engine cannot be
+//! spend without waiting `N` blocks is HARDWARE + SERVER, so the policy engine cannot be
 //! side-stepped for day-to-day spending. And unlike Bitkey - whose "Delay & Notify" waiting
 //! period is enforced by their server and therefore evaporates if that server is compromised or
 //! shut down - this delay is a consensus rule. It holds even if this service is rooted, seized,
 //! or deleted.
 
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use bitcoin::Address;
@@ -46,6 +48,22 @@ pub struct BuiltDescriptor {
     /// Change addresses (multipath index 1).
     pub internal: Descriptor<DescriptorPublicKey>,
     pub timelock_blocks: u16,
+    /// Lazily-built `scriptPubkey -> (chain, index)` map, so ownership is a hash lookup rather
+    /// than a linear scan. See [`find_owner`].
+    ///
+    /// `Arc<Mutex<..>>` rather than `OnceLock`: clones of a `BuiltDescriptor` (the signing path
+    /// clones one into `spawn_blocking` on every request) must share the work rather than each
+    /// redo it, and the cache has to be invalidated when `gap_limit` changes - which only
+    /// happens in tests, but silently returning results for the wrong gap limit would be a
+    /// nasty way to find that out.
+    spk_index: Arc<Mutex<Option<ScriptIndex>>>,
+}
+
+/// Every scriptPubkey this wallet can produce up to a gap limit, and where it sits.
+#[derive(Debug)]
+struct ScriptIndex {
+    gap_limit: u32,
+    by_script: HashMap<bitcoin::ScriptBuf, Owned>,
 }
 
 fn key_expr(key: &KeySpec) -> Result<String> {
@@ -70,25 +88,25 @@ fn key_expr(key: &KeySpec) -> Result<String> {
 /// compiler emits for `thresh(2,pk(A),pk(B),and(pk(C),older(N)))`, kept literal here so the
 /// deployed script is deterministic rather than dependent on a compiler's cost heuristics.
 pub fn policy_string(
-    satochip_expr: &str,
+    hardware_expr: &str,
     server_expr: &str,
     mobile_expr: &str,
     timelock_blocks: u16,
 ) -> String {
     format!(
-        "wsh(thresh(2,pk({satochip_expr}),s:pk({server_expr}),snj:and_v(v:pk({mobile_expr}),older({timelock_blocks}))))"
+        "wsh(thresh(2,pk({hardware_expr}),s:pk({server_expr}),snj:and_v(v:pk({mobile_expr}),older({timelock_blocks}))))"
     )
 }
 
 pub fn build_descriptor(cfg: &WalletConfig) -> Result<BuiltDescriptor> {
     cfg.validate()?;
 
-    let satochip_expr = key_expr(&cfg.keys.satochip).context("keys.satochip")?;
+    let hardware_expr = key_expr(&cfg.keys.hardware).context("keys.hardware")?;
     let server_expr = key_expr(&cfg.keys.server).context("keys.server")?;
     let mobile_expr = key_expr(&cfg.keys.mobile).context("keys.mobile")?;
 
     let desc_str = policy_string(
-        &satochip_expr,
+        &hardware_expr,
         &server_expr,
         &mobile_expr,
         cfg.timelock_blocks,
@@ -131,6 +149,7 @@ pub fn build_descriptor(cfg: &WalletConfig) -> Result<BuiltDescriptor> {
         external,
         internal,
         timelock_blocks: cfg.timelock_blocks,
+        spk_index: Arc::new(Mutex::new(None)),
     })
 }
 
@@ -172,54 +191,73 @@ pub struct Owned {
     pub index: u32,
 }
 
-/// Searches `desc` at indices `0..gap_limit` for one whose scriptPubkey equals `target`.
-///
-/// This is the only trustworthy way to answer "is this scriptPubkey ours": PSBT metadata
-/// (bip32_derivation, the "this is change" convention some wallets use) is supplied by
-/// whoever built the PSBT and must never be taken on faith - see `inspect.rs`.
-fn find_on_chain(
-    desc: &Descriptor<DescriptorPublicKey>,
-    target: &bitcoin::ScriptBuf,
-    gap_limit: u32,
-) -> Result<Option<u32>> {
-    for index in 0..gap_limit {
-        let definite = at_index(desc, index)?;
-        if &definite.script_pubkey() == target {
-            return Ok(Some(index));
-        }
-    }
-    Ok(None)
-}
-
 /// Searches both the external and internal chains of `wallet` for `target`, up to
 /// `gap_limit` indices on each. Checks external first: an address a caller is *spending
 /// from* is at least as likely to be a receive address as a change one, and either way both
 /// chains resolve to the same policy, so the order only affects which `Chain` gets reported
 /// when (pathologically) both happened to match.
+///
+/// Backed by a cache built once per `(wallet, gap_limit)`.
+///
+/// **Invariant: ownership lookup is O(1) in the gap limit.** This is called once per PSBT input,
+/// with a default gap limit of 1000, so deriving a key and hashing a script for every index on
+/// both chains per call would make the work per request scale with both the gap limit and the
+/// input count. Building the map once turns each subsequent lookup into a hash probe. Do not put
+/// the scan back.
 pub fn find_owner(
     wallet: &BuiltDescriptor,
     target: &bitcoin::ScriptBuf,
     gap_limit: u32,
 ) -> Result<Option<Owned>> {
-    if let Some(index) = find_on_chain(&wallet.external, target, gap_limit)? {
-        return Ok(Some(Owned {
-            chain: Chain::External,
-            index,
-        }));
+    let mut guard = wallet
+        .spk_index
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // Rebuild when the gap limit differs from what the cache was built for. In production that
+    // never happens - it comes from config and does not change while the process runs - but
+    // answering from a map built for a *different* gap limit would silently report a script as
+    // foreign (or as ours) depending on call order, which is precisely the kind of bug that only
+    // shows up once real coins are involved.
+    let needs_build = match guard.as_ref() {
+        Some(index) => index.gap_limit != gap_limit,
+        None => true,
+    };
+    if needs_build {
+        *guard = Some(build_script_index(wallet, gap_limit)?);
     }
-    if let Some(index) = find_on_chain(&wallet.internal, target, gap_limit)? {
-        return Ok(Some(Owned {
-            chain: Chain::Internal,
-            index,
-        }));
+
+    Ok(guard
+        .as_ref()
+        .expect("just built")
+        .by_script
+        .get(target)
+        .copied())
+}
+
+fn build_script_index(wallet: &BuiltDescriptor, gap_limit: u32) -> Result<ScriptIndex> {
+    let mut by_script = HashMap::with_capacity(gap_limit as usize * 2);
+    // Internal first, then external, so that external wins on the (pathological) collision -
+    // preserving the ordering the linear scan had.
+    for (chain, desc) in [
+        (Chain::Internal, &wallet.internal),
+        (Chain::External, &wallet.external),
+    ] {
+        for index in 0..gap_limit {
+            let definite = at_index(desc, index)?;
+            by_script.insert(definite.script_pubkey(), Owned { chain, index });
+        }
     }
-    Ok(None)
+    Ok(ScriptIndex {
+        gap_limit,
+        by_script,
+    })
 }
 
 /// Every key in a fully-derived (non-wildcard) descriptor, paired with its own key
 /// expression string - used to pick a specific role's key back out by matching against the
 /// xpub that role was configured with (the only stable identifier we have for "which key is
-/// SATOCHIP" once everything's been derived down to raw public keys).
+/// HARDWARE" once everything's been derived down to raw public keys).
 pub fn definite_keys(
     desc: &Descriptor<DefiniteDescriptorKey>,
 ) -> Vec<(String, DefiniteDescriptorKey)> {
@@ -232,21 +270,42 @@ pub fn definite_keys(
 }
 
 /// Picks the key belonging to `xpub` out of `keys` (as produced by [`definite_keys`]).
+///
+/// Matches on the key expression's parsed extended key rather than by substring. Substring
+/// matching happened to work - real xpubs are fixed-length base58 and one is not a substring of
+/// another - but this function decides *which key is the SERVER key* immediately before signing
+/// with it, and "happens to work" is the wrong standard for that. An exact comparison cannot be
+/// fooled by a prefix relationship that a future key format might permit.
 pub fn find_role_key(
     keys: &[(String, DefiniteDescriptorKey)],
     xpub: &str,
 ) -> Result<DefiniteDescriptorKey> {
     let xpub = xpub.trim();
+    let wanted: bitcoin::bip32::Xpub = xpub
+        .parse()
+        .with_context(|| format!("role xpub {xpub} is not a valid extended public key"))?;
+
     keys.iter()
-        .find(|(s, _)| s.contains(xpub))
+        .find(|(expr, _)| key_expr_xpub(expr).is_some_and(|found| found == wanted))
         .map(|(_, k)| k.clone())
         .with_context(|| format!("key for xpub {xpub} not found in descriptor"))
+}
+
+/// Extracts the extended key from a descriptor key expression - `[origin]xpub/0/5` and friends.
+/// Returns `None` for anything that isn't an xpub-derived expression (e.g. a raw public key),
+/// which simply means it can never match a role.
+fn key_expr_xpub(expr: &str) -> Option<bitcoin::bip32::Xpub> {
+    let after_origin = match expr.split_once(']') {
+        Some((_, rest)) => rest,
+        None => expr,
+    };
+    after_origin.split('/').next()?.parse().ok()
 }
 
 /// The three role keys (as concrete, spendable public keys - not descriptor key
 /// expressions) at one derivation index, for matching against a PSBT's `partial_sigs`.
 pub struct RoleKeys {
-    pub satochip: bitcoin::PublicKey,
+    pub hardware: bitcoin::PublicKey,
     pub server: bitcoin::PublicKey,
     pub mobile: bitcoin::PublicKey,
 }
@@ -264,7 +323,7 @@ pub fn role_keys_at(
     let definite = at_index(desc, index)?;
     let keys = definite_keys(&definite);
     Ok(RoleKeys {
-        satochip: find_role_key(&keys, &cfg.keys.satochip.xpub)?.to_public_key(),
+        hardware: find_role_key(&keys, &cfg.keys.hardware.xpub)?.to_public_key(),
         server: find_role_key(&keys, &cfg.keys.server.xpub)?.to_public_key(),
         mobile: find_role_key(&keys, &cfg.keys.mobile.xpub)?.to_public_key(),
     })
@@ -413,6 +472,54 @@ mod tests {
         let receive50 = at_index(&built.external, 50).unwrap().script_pubkey();
         assert!(find_owner(&built, &receive50, 10).unwrap().is_none());
         assert!(find_owner(&built, &receive50, 51).unwrap().is_some());
+    }
+
+    /// The hazard the cache introduces: answering from a map built for a *different* gap limit.
+    /// A script beyond the current limit must read as foreign even if a previous call with a
+    /// larger limit put it in the map, and vice versa - otherwise ownership would depend on call
+    /// order, which is the sort of bug that only surfaces once real coins are involved.
+    #[test]
+    fn changing_the_gap_limit_invalidates_the_cache_in_both_directions() {
+        let cfg = test_wallet_config(12960);
+        let built = build_descriptor(&cfg).unwrap();
+        let far = at_index(&built.external, 40).unwrap().script_pubkey();
+
+        // Wide first, so index 40 is cached as ours...
+        assert!(find_owner(&built, &far, 50).unwrap().is_some());
+        // ...then narrow: it must stop being ours.
+        assert!(
+            find_owner(&built, &far, 10).unwrap().is_none(),
+            "a narrower gap limit must not answer from a wider cache"
+        );
+        // ...and widening again must find it once more.
+        assert!(
+            find_owner(&built, &far, 50).unwrap().is_some(),
+            "a wider gap limit must rebuild rather than answer from the narrow cache"
+        );
+    }
+
+    /// Clones share the cache rather than each rebuilding it - the signing path clones a
+    /// `BuiltDescriptor` into `spawn_blocking` on every request, so per-clone rebuilds would put
+    /// the cost straight back.
+    #[test]
+    fn a_clone_shares_the_built_index() {
+        let cfg = test_wallet_config(12960);
+        let built = build_descriptor(&cfg).unwrap();
+        let script = at_index(&built.external, 3).unwrap().script_pubkey();
+
+        find_owner(&built, &script, 25).unwrap();
+        let clone = built.clone();
+        assert!(
+            clone.spk_index.lock().unwrap().is_some(),
+            "the clone must see the already-built index, not an empty one"
+        );
+        assert_eq!(
+            find_owner(&clone, &script, 25).unwrap(),
+            Some(Owned {
+                chain: Chain::External,
+                index: 3
+            })
+        );
     }
 
     #[test]

@@ -32,19 +32,19 @@ enum TopCommand {
     },
     /// Run the HTTP API (POST /inspect, /sign_psbt, /veto/{id}, /policy).
     Serve(ServeArgs),
-    /// Helpers for the SATOCHIP-authorized runtime policy change flow (`POST /policy`).
+    /// Helpers for the HARDWARE-authorized runtime policy change flow (`POST /policy`).
     Policy {
         #[command(subcommand)]
         command: PolicyCommand,
     },
-    /// Lift a freeze using direct server access instead of a SATOCHIP signature.
+    /// Lift a freeze using direct server access instead of a HARDWARE signature.
     ///
     /// `POST /unfreeze` needs the hardware; this does not. That's deliberate and it is not a
     /// hole: anyone who can run this already has the server and therefore the SERVER key, so
     /// requiring hardware here would buy nothing while making a freeze permanent in exactly
-    /// the case the lost-SATOCHIP recovery path exists for.
+    /// the case the lost-HARDWARE recovery path exists for.
     Unfreeze(UnfreezeArgs),
-    /// Prints the exact text a human must sign (via SATOCHIP's "Sign Message" feature) to
+    /// Prints the exact text a human must sign (via HARDWARE's "Sign Message" feature) to
     /// authorize lifting the CURRENT freeze via `POST /unfreeze` - see `policy_auth.rs`. Reads
     /// the freeze generation straight from the ledger, so this works even if the HTTP server
     /// isn't reachable (freezing never stops it running, but this doesn't depend on that
@@ -57,8 +57,8 @@ enum TopCommand {
         command: RecoveryKitCommand,
     },
     /// Builds an unsigned sweep PSBT moving funds off an OLD descriptor - for replacing a lost
-    /// SATOCHIP, phone, or server without the old device ever needing to work again. Signing
-    /// (SATOCHIP/MOBILE's own apps + the OLD wallet's `/sign_psbt`) and broadcasting still
+    /// HARDWARE, phone, or server without the old device ever needing to work again. Signing
+    /// (HARDWARE/MOBILE's own apps + the OLD wallet's `/sign_psbt`) and broadcasting still
     /// happen through the normal channels; this only builds the PSBT.
     MigrateBuildSweep(MigrateBuildSweepArgs),
     /// Interactive wizard that writes a validated wallet.toml, instead of hand-editing TOML
@@ -135,10 +135,10 @@ struct MigrateBuildSweepArgs {
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum MigrateSweepPath {
-    /// SATOCHIP + SERVER - use when the SATOCHIP is fine and available.
+    /// HARDWARE + SERVER - use when the HARDWARE is fine and available.
     Hot,
-    /// SATOCHIP + MOBILE, or MOBILE + SERVER, after the OLD descriptor's timelock - use when
-    /// the SATOCHIP is the device being replaced.
+    /// HARDWARE + MOBILE, or MOBILE + SERVER, after the OLD descriptor's timelock - use when
+    /// the HARDWARE is the device being replaced.
     Recovery,
 }
 
@@ -235,7 +235,7 @@ struct UnfreezeMessageArgs {
 
 #[derive(Subcommand)]
 enum PolicyCommand {
-    /// Prints the exact text a human must sign (via SATOCHIP's "Sign Message" feature) to
+    /// Prints the exact text a human must sign (via HARDWARE's "Sign Message" feature) to
     /// authorize a proposed policy change - see `policy_auth.rs`. What's printed here is
     /// exactly what the running service recomputes and verifies the signature against.
     Message(PolicyMessageArgs),
@@ -335,7 +335,9 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         "testnet" | "testnet4" | "test" => ChainNetwork::Testnet,
         "signet" => ChainNetwork::Signet,
         "regtest" => ChainNetwork::Regtest,
-        other => bail!("unknown --network {other:?} (expected mainnet, testnet, signet or regtest)"),
+        other => {
+            bail!("unknown --network {other:?} (expected mainnet, testnet, signet or regtest)")
+        }
     };
 
     if !args.config_dir.is_dir() {
@@ -477,7 +479,7 @@ fn cmd_migrate_build_sweep(args: MigrateBuildSweepArgs) -> Result<()> {
     );
     println!("Wrote unsigned PSBT to {}.", args.out.display());
     println!(
-        "Next: sign with the two required keys (SATOCHIP{}), then submit to the OLD wallet's \
+        "Next: sign with the two required keys (HARDWARE{}), then submit to the OLD wallet's \
          /sign_psbt for the SERVER co-sign - it applies the same policy/hold/notify flow as any \
          other spend.",
         match path {
@@ -684,6 +686,9 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
         .ledger_db_path
         .clone()
         .context("config is missing server.ledger_db_path, required for /sign_psbt")?;
+    // Cloned for the same reason as `policy_bootstrap_json` below: `cfg` moves into the async
+    // block, so nothing may still be borrowing it at that point.
+    let api_token_file = server_cfg.api_token_file.clone();
     // [policy] only ever matters as the bootstrap default seeded into the ledger's
     // policy_state table the very first time this database is used - see
     // `Ledger::load_or_seed_policy_state`. Serializing it now (before `cfg` moves into the
@@ -736,6 +741,63 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
             compiled,
         }));
 
+        // Derived once here rather than per request: `POST /policy` and `POST /unfreeze` are
+        // unauthenticated until their signature is checked, and deriving the candidate set on
+        // demand made each bogus attempt cost thousands of EC operations. See
+        // `policy_auth::HardwareAuthKeys`.
+        // Absent, or present-but-missing, means no API authentication - the pre-existing
+        // behaviour. An install that upgrades into this build must not stop answering its own
+        // coordinator because a file it has never heard of isn't there.
+        let api_token: Option<Arc<str>> = match api_token_file.as_deref() {
+            Some(path) if std::path::Path::new(path).exists() => {
+                let token = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading server.api_token_file {path}"))?
+                    .trim()
+                    .to_string();
+                if token.is_empty() {
+                    bail!("server.api_token_file {path} is empty - remove the setting or put a token in it");
+                }
+                tracing::info!("API token loaded: /inspect and /sign_psbt require authentication");
+                Some(Arc::from(token.as_str()))
+            }
+            Some(path) => {
+                tracing::warn!(
+                    path,
+                    "server.api_token_file does not exist - /inspect and /sign_psbt are \
+                     UNAUTHENTICATED. Anything that can reach this port can submit spends and \
+                     consume your rolling limits."
+                );
+                None
+            }
+            None => {
+                tracing::warn!(
+                    "no server.api_token_file configured - /inspect and /sign_psbt are \
+                     UNAUTHENTICATED. Keep this service on a private network."
+                );
+                None
+            }
+        };
+
+        let recovery_contacts = match &cfg.recovery_contacts {
+            Some(rc) => {
+                let compiled = rc.compiled().context("compiling recovery contacts")?;
+                tracing::info!(
+                    contacts = compiled.len(),
+                    threshold = rc.threshold,
+                    "social recovery enabled: a quorum can release a queued spend's remaining hold"
+                );
+                Some(Arc::new((compiled, rc.threshold)))
+            }
+            None => None,
+        };
+
+        let auth_keys = cosigner::policy_auth::HardwareAuthKeys::from_config(&cfg, gap_limit)
+            .context("precomputing hardware authorization keys")?;
+        tracing::debug!(
+            candidates = auth_keys.len(),
+            "precomputed hardware authorization keys"
+        );
+
         let state = AppState {
             wallet: Arc::new(wallet),
             cfg: Arc::new(cfg.clone()),
@@ -744,6 +806,9 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
             server_key: Arc::new(server_key),
             ledger: ledger.clone(),
             policy: policy.clone(),
+            auth_keys: Arc::new(auth_keys),
+            api_token,
+            recovery_contacts,
             notifier,
             hold_seconds,
         };
@@ -782,6 +847,11 @@ fn cmd_serve(args: ServeArgs) -> Result<()> {
             .context("http server")
     })
 }
+
+/// How long a dispatched Nostr event ID is remembered for replay protection. 30 days is far
+/// past any relay's practical resend horizon on a fresh subscription, while keeping the table
+/// bounded on a box expected to run for years.
+const NOSTR_SEEN_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 /// Runs `sign::sweep_due` on a fixed interval for as long as the server is up. Each pending
 /// spend's outcome is logged, not propagated - a failure processing one row (or even the
@@ -826,6 +896,34 @@ fn spawn_sweeper(
                 Ok(0) => {}
                 Ok(n) => tracing::info!(count = n, "sent hold reminders"),
                 Err(e) => tracing::warn!(error = %e, "re-notification sweep failed"),
+            }
+
+            // Spends held back because no notification was ever confirmed delivered. Failing
+            // closed is correct - a hold nobody heard about is not a hold - but it must never be
+            // silent, or a spend the operator asked for just stops progressing with no
+            // explanation. These keep being retried by `renotify_pending` above.
+            match ledger.due_pending_undelivered(now).await {
+                Ok(stalled) if !stalled.is_empty() => tracing::warn!(
+                    count = stalled.len(),
+                    txids = ?stalled,
+                    "spends are past their hold but NOT being signed: no notification has ever \
+                     been delivered for them. Check the [notify] channel - reminders are still \
+                     being retried."
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "checking for undelivered due spends failed"),
+            }
+
+            // Replay protection only needs to outlive how far back a relay resends on a fresh
+            // subscription. Unpruned, this table is written by inbound messages and grows
+            // without bound.
+            match ledger
+                .prune_nostr_seen_events(now - NOSTR_SEEN_RETENTION_SECONDS)
+                .await
+            {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(count = n, "pruned expired nostr replay records"),
+                Err(e) => tracing::warn!(error = %e, "pruning nostr replay records failed"),
             }
 
             for (txid, outcome) in results {
@@ -939,7 +1037,7 @@ fn run_invariants(built: &BuiltDescriptor, cfg: &WalletConfig) -> Result<Invaria
     invariants::verify_invariants(&definite, &keys, built.timelock_blocks)
 }
 
-/// Labels the descriptor's keys "satochip" / "server" / "mobile" by matching against the
+/// Labels the descriptor's keys "hardware" / "server" / "mobile" by matching against the
 /// key expressions we built from the config, rather than guessing from position.
 fn role_labeled_keys(
     external: &Descriptor<DescriptorPublicKey>,
@@ -949,7 +1047,7 @@ fn role_labeled_keys(
     let keys = descriptor::definite_keys(&definite);
 
     let roles = [
-        ("satochip", &cfg.keys.satochip.xpub),
+        ("hardware", &cfg.keys.hardware.xpub),
         ("server", &cfg.keys.server.xpub),
         ("mobile", &cfg.keys.mobile.xpub),
     ];
