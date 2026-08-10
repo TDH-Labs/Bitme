@@ -335,7 +335,9 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         "testnet" | "testnet4" | "test" => ChainNetwork::Testnet,
         "signet" => ChainNetwork::Signet,
         "regtest" => ChainNetwork::Regtest,
-        other => bail!("unknown --network {other:?} (expected mainnet, testnet, signet or regtest)"),
+        other => {
+            bail!("unknown --network {other:?} (expected mainnet, testnet, signet or regtest)")
+        }
     };
 
     if !args.config_dir.is_dir() {
