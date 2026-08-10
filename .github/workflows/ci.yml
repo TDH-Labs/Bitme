@@ -44,6 +44,30 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+  wizard:
+    name: Setup wizard (browser code)
+    runs-on: ubuntu-latest
+    # The first-run wizard is ~900 lines of JavaScript sitting directly in front of key
+    # generation, and `cargo test` cannot see any of it. This runs it under jsdom with the HTTP
+    # API stubbed, driving every step and asserting behaviour - that the compatibility gate
+    # blocks and releases correctly, that validation fires, and that what the operator typed is
+    # what gets posted.
+    defaults:
+      run:
+        working-directory: bitme-cosigner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Not vendored and not in a package.json: jsdom is a test-only dependency of one file, and
+      # adding a node toolchain to a Rust project's committed dependency set would be a bigger
+      # commitment than this warrants.
+      - name: Install jsdom
+        run: npm install --no-save --no-audit --no-fund jsdom
+      - name: Wizard smoke test
+        run: node --test tests/wizard_smoke.mjs
+
   regtest:
     name: Regtest integration tests
     runs-on: ubuntu-latest

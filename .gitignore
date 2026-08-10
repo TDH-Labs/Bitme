@@ -1,4 +1,7 @@
 bitme-cosigner/target
+# Test-only, installed on demand by the wizard smoke test - never committed.
+bitme-cosigner/node_modules
+bitme-cosigner/package-lock.json
 .env
 config/wallet.toml
 bitme-cosigner/wallet.toml
