@@ -500,7 +500,7 @@ function holdStep() {
       <label>ntfy topic URL
         <span class="hint">The topic name is effectively a password — make it long and random.
         Anyone who knows it can read your notifications.</span></label>
-      <input class="mono" id="ntfy" placeholder="http://10.0.0.108:13119/a-long-random-topic-name" value="${esc(S.ntfy_url)}" autocapitalize="off" spellcheck="false">
+      <input class="mono" id="ntfy" placeholder="https://ntfy.sh/a-long-random-topic-name" value="${esc(S.ntfy_url)}" autocapitalize="off" spellcheck="false">
     </div>
 
     <div id="pane-smtp" class="${S.notify_kind === "smtp" ? "" : "hidden"}">
