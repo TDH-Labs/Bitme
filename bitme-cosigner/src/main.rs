@@ -90,6 +90,14 @@ struct SetupArgs {
     /// value is regenerated into [bitcoind] by the entrypoint on every start.
     #[arg(long, default_value = "")]
     bitcoind_rpc_url: String,
+    /// Optional RPC username for the bitcoind connection. Used during setup to verify the
+    /// node's actual network matches the configured network, preventing a mainnet-node/testnet-
+    /// config mismatch (or vice versa) from being discovered only after the container restarts.
+    #[arg(long, default_value = "")]
+    bitcoind_rpc_user: String,
+    /// Optional RPC password for the bitcoind connection. Same purpose as --bitcoind-rpc-user.
+    #[arg(long, default_value = "")]
+    bitcoind_rpc_password: String,
 }
 
 #[derive(Args)]
@@ -353,6 +361,8 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         data_dir: args.data_dir,
         bind_addr: args.bind.clone(),
         bitcoind_rpc_url: args.bitcoind_rpc_url,
+        bitcoind_rpc_user: args.bitcoind_rpc_user,
+        bitcoind_rpc_password: args.bitcoind_rpc_password,
     };
 
     tokio::runtime::Runtime::new()
