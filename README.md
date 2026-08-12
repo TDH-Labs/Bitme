@@ -7,8 +7,9 @@ sitting on it: two signatures move funds here, and the server only ever holds on
 It's basically the third signer you'd have in an ordinary 2-of-3 wallet. Here, you're the one
 running it. You picked its rules, and the code behind it is sitting in this repo for you to read.
 
-> **Status: signet only.** The service refuses to run on mainnet unless you explicitly opt in,
-> and you shouldn't opt in until you've run the whole thing end to end. See
+> **Status: signet and testnet.** The service runs on signet and testnet out of the box. It
+> refuses to run on mainnet unless you explicitly opt in, and you shouldn't opt in until you've
+> run the whole thing end to end on a test network first. See
 > [Current status](#current-status) for exactly what is and isn't finished.
 
 ---
@@ -386,7 +387,9 @@ Everything after that is API.
 
 ## Running it
 
-- **[docs/DOCKER.md](docs/DOCKER.md)** — Docker Compose, for a Mac or a VPS.
+- **[docs/DOCKER.md](docs/DOCKER.md)** — Docker Compose, for a Mac or a VPS. Supports signet,
+  testnet, and regtest out of the box — see [DOCKER.md](docs/DOCKER.md#testnet-instead-of-signet)
+  for the testnet override.
 - **[docs/UMBREL.md](docs/UMBREL.md)** — installing on Umbrel via a community app store.
 
 Quick look without installing anything (the crate lives in `bitme-cosigner/`, not the repo root —

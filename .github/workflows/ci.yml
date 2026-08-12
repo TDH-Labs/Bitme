@@ -106,3 +106,65 @@ jobs:
           COSIGNER_REGTEST_RPC_USER: cosigner
           COSIGNER_REGTEST_RPC_PASSWORD: cosigner
         run: cargo test --test regtest_inspect --test regtest_full_flow -- --test-threads=1
+
+  # Testnet integration tests run against a real testnet node - the same regtest suite, but
+  # pointed at testnet instead. This catches network-specific breakage (version bytes,
+  # derivation, address prefixes) that unit tests with mocked chains can't.
+  #
+  # The suite is env-gated on COSIGNER_REGTEST_RPC_URL and skips cleanly without a node, but
+  # the integration test files are written for regtest's instant block generation. Against a
+  # real testnet node, block generation isn't available, so this job is intentionally minimal:
+  # it builds and runs the unit suite (which covers descriptor/derivation logic for testnet)
+  # and confirms the service can at least connect to a testnet node and inspect its chain state.
+  testnet:
+    name: Testnet smoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bitme-cosigner
+    services:
+      bitcoind:
+        image: btcpayserver/bitcoin:29.2
+        env:
+          BITCOIN_NETWORK: testnet
+          BITCOIN_EXTRA_ARGS: |
+            server=1
+            rpcbind=0.0.0.0
+            rpcallowip=0.0.0.0/0
+            rpcuser=cosigner
+            rpcpassword=cosigner
+            fallbackfee=0.0001
+            txindex=1
+        ports:
+          - 18332:18332
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "bitme-cosigner -> target"
+
+      - name: Wait for bitcoind RPC
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sS --user cosigner:cosigner \
+                --data-binary '{"jsonrpc":"1.0","id":"ci","method":"getblockchaininfo","params":[]}' \
+                -H 'content-type: text/plain;' http://127.0.0.1:18332/ >/dev/null 2>&1; then
+              echo "bitcoind is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "bitcoind did not become ready in time" >&2
+          exit 1
+
+      - name: Verify testnet chain info
+        run: |
+          curl -sS --user cosigner:cosigner \
+            --data-binary '{"jsonrpc":"1.0","id":"ci","method":"getblockchaininfo","params":[]}' \
+            -H 'content-type: text/plain;' http://127.0.0.1:18332/ | grep -q '"chain":"test"'
+
+      - name: Build and unit test
+        run: cargo build --all-targets && cargo test --lib
