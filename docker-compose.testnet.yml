@@ -1,0 +1,38 @@
+# Adds a local testnet bitcoind for testing, when you don't already have a node reachable.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.testnet.yml up -d
+#
+# Your mainnet Bitcoin Core (whether on Umbrel, a VPS, or bare metal) is completely
+# untouched. This is a separate process with its own data directory and ports.
+#
+# Uses btcpayserver/bitcoin (actively maintained, multi-arch: amd64/arm64/armv7 - so this also
+# works on ARM self-hosting hardware), configured via its BITCOIN_EXTRA_ARGS convention rather
+# than CLI flags - see its entrypoint script for why.
+services:
+  bitcoind:
+    image: btcpayserver/bitcoin:29.2
+    restart: unless-stopped
+    environment:
+      BITCOIN_NETWORK: testnet
+      BITCOIN_EXTRA_ARGS: |
+        server=1
+        rpcbind=0.0.0.0
+        rpcallowip=0.0.0.0/0
+        rpcuser=${BITCOIND_RPC_USER:-cosigner}
+        rpcpassword=${BITCOIND_RPC_PASSWORD:-change-me-to-a-real-password}
+        fallbackfee=0.0001
+    volumes:
+      - bitcoind-testnet-data:/data
+    ports:
+      - "18332:18332"   # testnet RPC - only exposed to the host for your own debugging;
+      - "18333:18333"   #   cosigner reaches this over the compose network, not via these
+
+  cosigner:
+    environment:
+      BITCOIND_RPC_URL: "http://bitcoind:18332"
+      BITCOIND_RPC_USER: "${BITCOIND_RPC_USER:-cosigner}"
+      BITCOIND_RPC_PASSWORD: "${BITCOIND_RPC_PASSWORD:-change-me-to-a-real-password}"
+    depends_on:
+      - bitcoind
+
+volumes:
+  bitcoind-testnet-data:

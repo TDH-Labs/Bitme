@@ -12,7 +12,9 @@
 
 network = "signet"                 # start here. Only move to "mainnet" (with
                                     # i_understand_this_is_mainnet = true below) after you've
-                                    # verified this whole setup end-to-end on signet.
+                                    # verified this whole setup end-to-end on a test network.
+                                    #
+                                    # For testnet, change this to "testnet" (use tpub/tprv keys).
 # i_understand_this_is_mainnet = true
 timelock_blocks = 4320             # ~30 days at 10 min/block. Any spend involving the MOBILE
                                     # key waits this long - that's both recovery paths. It is a

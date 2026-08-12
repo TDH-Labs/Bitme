@@ -172,6 +172,18 @@ function welcome() {
   const mainnetWarning = S.network === "mainnet" ? `
     <div class="note"><b>This is mainnet.</b> The limits you set here govern real money.
     Every one of them can be tightened later, but only with a signature from your Satochip.</div>` : "";
+
+  const testnetNote = S.network === "testnet" ? `
+    <div class="note"><b>Testnet — your Umbrel Bitcoin Core is untouched.</b> This deployment
+    uses its own testnet node, running as a separate container. Your mainnet Bitcoin Core
+    (whether on Umbrel, a VPS, or bare metal) keeps running as-is — it is never stopped,
+    reconfigured, or restarted. The two nodes are completely independent and see different
+    blockchains on different ports. You can run both at the same time.</div>` : "";
+
+  const signetNote = S.network === "signet" ? `
+    <div class="note"><b>Signet — your Umbrel Bitcoin Core is untouched.</b> This deployment
+    uses its own signet node, running as a separate container. Your mainnet Bitcoin Core
+    continues running normally — it is never stopped or reconfigured.</div>` : "";
   const c = el(`<div class="card">
     <h2>Before you start</h2>
     <p>This wallet needs three keys. You will set up two of them yourself; this box generates the third.</p>
@@ -186,6 +198,8 @@ function welcome() {
     <div class="note">Any two of the three can spend. This server will only ever supply the
     <b>second</b> signature, and only when your policy allows it — so losing any single key never
     loses the coins, and compromising this box alone never moves them.</div>
+    ${signetNote}
+    ${testnetNote}
     ${mainnetWarning}
     <div class="actions"><div class="spacer"></div><button id="n">Start setup</button></div>
   </div>`);

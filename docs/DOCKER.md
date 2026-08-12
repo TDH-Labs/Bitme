@@ -5,9 +5,9 @@ testing, or on a VPS for a real deployment. For Umbrel specifically, see
 [`docs/UMBREL.md`](UMBREL.md) instead - it uses the same image but a different compose file that
 plugs into Umbrel's own Bitcoin Core app.
 
-**Start on signet. Always.** This service refuses to run on mainnet unless
+**Start on signet or testnet. Always.** This service refuses to run on mainnet unless
 `i_understand_this_is_mainnet = true` is set in `wallet.toml` - don't set that until you've
-verified the whole setup end-to-end here.
+verified the whole setup end-to-end on a test network first.
 
 ## What you need first
 
@@ -52,6 +52,32 @@ docker compose -f docker-compose.yml -f docker-compose.signet.yml logs -f bitcoi
 
 If you already have a node (your own VPS, home server, etc.), skip this and just make sure
 `BITCOIND_RPC_URL` in `.env` points at it.
+
+### Testnet (instead of signet)
+
+If you'd rather test on testnet (the classic public test network with faucet coins) instead of
+signet, use the testnet override instead:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.testnet.yml up -d bitcoind
+```
+
+Give it a few minutes to sync testnet (significantly faster than mainnet but slower than signet).
+Check progress with:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.testnet.yml logs -f bitcoind
+```
+
+**Your mainnet Bitcoin Core node is never touched.** This testnet node is a completely separate
+process with its own data directory, ports, and blockchain. Whether you run it on Umbrel, a VPS,
+or bare metal, your mainnet node keeps running as-is — it is never stopped, reconfigured, or
+restarted. The two nodes see different chains on different ports and coexist without conflict.
+
+The rest of the steps are the same as signet — just use `docker-compose.testnet.yml` wherever
+the instructions say `docker-compose.signet.yml`. The wizard will show "testnet" when you open
+it, and the xpub validation expects `tpub`-format keys, which both your Satochip and Bitcoin
+Keeper will export when configured for testnet.
 
 ## 3. Write your wallet config
 
@@ -204,6 +230,14 @@ curl http://localhost:8080/health
 
 You should get back `{"service":"cosigner","version":"...","network":"signet","policy_version":1}`.
 
+For testnet, use the testnet override instead:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.testnet.yml up -d
+curl http://localhost:8080/health
+# {"service":"cosigner","version":"...","network":"testnet","policy_version":1}
+```
+
 From here, fund a signet address from your wallet's receive address (get one via
 `docker compose run --rm cosigner descriptor build --config /data/config/wallet.toml` - it prints
 `receive[0]`, etc.), build a PSBT spending it, and try `POST /inspect` and `POST /sign_psbt`
@@ -219,8 +253,8 @@ docker compose up -d --build
 ```
 
 Only change `network` to `"mainnet"` (and set `i_understand_this_is_mainnet = true`) once you've
-verified this entire flow - descriptor, inspect, sign, hold/veto, policy changes - for real on
-signet.
+verified this entire flow - descriptor, inspect, sign, hold/veto, policy changes - for real on a
+test network (signet or testnet) first.
 
 ## Updating
 
