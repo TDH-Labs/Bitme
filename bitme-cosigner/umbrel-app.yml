@@ -3,7 +3,7 @@ id: bitme-cosigner
 name: Bitme Cosigner
 tagline: Policy-gated Bitcoin PSBT co-signing service
 category: bitcoin
-version: "0.2.0"
+version: "0.3.0"
 port: 8080
 description: >-
   Self-hosted signing service for a 3-key miniscript wallet (a SATOCHIP smartcard, a Bitcoin
@@ -46,6 +46,16 @@ gallery:
   - https://raw.githubusercontent.com/TDH-Labs/Bitme/main/docs/screenshots/06-limits.png
   - https://raw.githubusercontent.com/TDH-Labs/Bitme/main/docs/screenshots/10-register-in-keeper.png
 releaseNotes: >-
+  0.3.0: adds testnet support alongside signet, a network-mismatch guard in the setup wizard
+  that catches mainnet/testnet/config mismatches before you finish setup, and a cleaner
+  wizard experience that tells you your Umbrel Bitcoin Core is untouched when running on a test
+  network. The wizard now calls getblockchaininfo on the bitcoind node to verify the actual
+  chain matches the configured network — if they don't match, it shows a blocking error with
+  specific guidance for Umbrel and Docker Compose users rather than waiting until the container
+  restarts to fail. Also adds docker-compose.testnet.yml for standalone deployments, a testnet
+  CI job, and documentation updates throughout.
+
+
   0.2.0: first-run setup now happens in the browser instead of by hand-writing wallet.toml over
   SSH - it collects the two external xpubs, generates the SERVER key on the box from the OS
   CSPRNG, writes the config, and shows the descriptor (plus a QR) to register in Bitcoin Keeper.
