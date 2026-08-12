@@ -184,6 +184,9 @@ function welcome() {
     <div class="note"><b>Signet — your Umbrel Bitcoin Core is untouched.</b> This deployment
     uses its own signet node, running as a separate container. Your mainnet Bitcoin Core
     continues running normally — it is never stopped or reconfigured.</div>` : "";
+
+  const networkCheckSupported = S.network === "mainnet" || S.network === "testnet" || S.network === "signet";
+  S.networkCheck = null;
   const c = el(`<div class="card">
     <h2>Before you start</h2>
     <p>This wallet needs three keys. You will set up two of them yourself; this box generates the third.</p>
@@ -750,6 +753,32 @@ function done() {
         Restart the app to start serving with it.</p></div>`;
       return;
     }
+
+    // Try to verify the node's network matches the deployment. If the check is available
+    // and reports a mismatch, show a blocking error — the user needs to fix this before
+    // proceeding, because a config/network mismatch will fail at startup.
+    try {
+      const netCheck = await api("/api/check-network");
+      S.networkCheck = netCheck;
+      if (!netCheck.ok && netCheck.node_chain !== null) {
+        // The node is reachable and reports a different chain — this is a hard block.
+        // The user must fix the mismatch before proceeding.
+        document.getElementById("panel").innerHTML = `
+          <div class="card">
+            <h2>Network mismatch</h2>
+            <div class="note" style="border-color:var(--danger);background:var(--danger);color:var(--accent-ink);font-weight:600">
+              ⚠ The Bitcoin node reports "` + esc(netCheck.node_chain) + `" but this setup is for ` + esc(netCheck.expected_network) + `.
+            </div>
+            <p>` + esc(netCheck.message || "The node and the config must be on the same network.") + `</p>
+            <p style="font-size:13px;color:var(--muted)">This page will reload automatically when the mismatch is resolved.
+            <a href="javascript:location.reload()">Reload now</a>.</p>
+          </div>`;
+        return;
+      }
+    } catch (_) {
+      // Network check may not be available (e.g. old server, no credentials). Proceed.
+    }
+
     render();
   } catch (e) {
     document.getElementById("panel").innerHTML =

@@ -31,6 +31,7 @@ services:
       BITCOIND_RPC_URL: "http://bitcoind:18332"
       BITCOIND_RPC_USER: "${BITCOIND_RPC_USER:-cosigner}"
       BITCOIND_RPC_PASSWORD: "${BITCOIND_RPC_PASSWORD:-change-me-to-a-real-password}"
+      COSIGNER_NETWORK: "testnet"
     depends_on:
       - bitcoind
 

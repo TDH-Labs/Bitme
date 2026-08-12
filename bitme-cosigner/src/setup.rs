@@ -58,6 +58,13 @@ pub struct Deployment {
     pub data_dir: PathBuf,
     pub bind_addr: String,
     pub bitcoind_rpc_url: String,
+    /// RPC username for the bitcoind node. Used during setup to verify the node's actual
+    /// network matches the configured network. Empty string if not provided (e.g. when
+    /// using cookie auth).
+    pub bitcoind_rpc_user: String,
+    /// RPC password for the bitcoind node. Used during setup to verify the node's actual
+    /// network matches the configured network. Empty string if not provided.
+    pub bitcoind_rpc_password: String,
 }
 
 /// A freshly generated SERVER key, held in memory between "generate" and "finish".
@@ -109,6 +116,7 @@ pub fn router(state: Arc<SetupState>) -> Router {
         .route("/api/server-key", post(server_key_handler))
         .route("/api/decode-qr", post(decode_qr_handler))
         .route("/api/finish", post(finish_handler))
+        .route("/api/check-network", get(check_network_handler))
         .route("/api/start", post(start_handler))
         // Axum's default request body cap is 2 MB; a phone photo of a QR is routinely larger.
         .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024))
@@ -181,6 +189,155 @@ async fn state_handler(State(state): State<Arc<SetupState>>) -> Json<StateRespon
         default_timelock_blocks: 12960,
         bitcoind_rpc_url: state.deployment.bitcoind_rpc_url.clone(),
     })
+}
+
+#[derive(Serialize)]
+struct CheckNetworkResponse {
+    /// Whether the bitcoind node's actual network matches the configured network.
+    ok: bool,
+    /// The chain the node reports (e.g. "main", "test", "signet", "regtest").
+    node_chain: Option<String>,
+    /// The network this deployment expects.
+    expected_network: &'static str,
+    /// Human-readable explanation of what's wrong, if not ok.
+    message: Option<String>,
+}
+
+/// Maps a `bitcoin::Network` (as reported by `getblockchaininfo`) to the chain name string
+/// the rest of this service uses: "main", "test", "signet", "regtest". Testnet4 reports as
+/// "test" at the RPC level even though the config may say "testnet", so this normalises.
+fn chain_network_name(n: bitcoin::Network) -> String {
+    match n {
+        bitcoin::Network::Bitcoin => "main".to_string(),
+        bitcoin::Network::Testnet => "test".to_string(),
+        bitcoin::Network::Signet => "signet".to_string(),
+        bitcoin::Network::Regtest => "regtest".to_string(),
+        // bitcoin 0.32 has only the four variants; keep this exhaustive for future-proofing.
+        _ => n.to_string(),
+    }
+}
+
+/// Verifies that the bitcoind node this deployment is wired to actually serves the
+/// blockchain the config expects. This catches the case where someone points the setup wizard
+/// at a testnet node but the deployment network is signet (or vice versa) — without this check,
+/// the mismatch is only discovered after the wizard finishes and the container restarts into
+/// `serve`, where it connects to the wrong chain.
+///
+/// If the node is unreachable (e.g. not yet synced, or running behind a firewall), the check
+/// returns `ok: false` with a `message` explaining that — the wizard shows a warning but
+/// allows the user to proceed, since the mismatch might be temporary.
+async fn check_network_handler(State(state): State<Arc<SetupState>>) -> Json<CheckNetworkResponse> {
+    let d = &state.deployment;
+    let expected = wizard::network_str(d.network);
+
+    if d.bitcoind_rpc_url.is_empty() {
+        return Json(CheckNetworkResponse {
+            ok: false,
+            node_chain: None,
+            expected_network: expected,
+            message: Some(
+                "No bitcoind RPC URL is configured — the setup wizard cannot verify the \
+                 node's network. This is expected when the node details are injected at \
+                 startup (e.g. on Umbrel). The entrypoint will verify the network match \
+                 before starting the service."
+                    .to_string(),
+            ),
+        });
+    }
+
+    if d.bitcoind_rpc_user.is_empty() && d.bitcoind_rpc_password.is_empty() {
+        // Without credentials we can't connect; this is expected for some deployments.
+        return Json(CheckNetworkResponse {
+            ok: false,
+            node_chain: None,
+            expected_network: expected,
+            message: Some(
+                "No RPC credentials configured — the setup wizard cannot verify the node's \
+                 network. This is expected when using cookie auth; the entrypoint will \
+                 verify at startup."
+                    .to_string(),
+            ),
+        });
+    }
+
+    // Try to connect to the bitcoind and check its chain. Run on a blocking thread because
+    // bitcoincore-rpc's client is synchronous.
+    let url = d.bitcoind_rpc_url.clone();
+    let url_for_closure = url.clone();
+    let user = d.bitcoind_rpc_user.clone();
+    let pass = d.bitcoind_rpc_password.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        use bitcoincore_rpc::{Auth, Client, RpcApi};
+        let auth = Auth::UserPass(user, pass);
+        match Client::new(&url_for_closure, auth) {
+            Ok(client) => match client.get_blockchain_info() {
+                Ok(info) => Ok(chain_network_name(info.chain)),
+                Err(e) => Err(format!("RPC call failed: {e}")),
+            },
+            Err(e) => Err(format!("Cannot connect: {e}")),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(node_chain_name)) => {
+            let matches = match d.network {
+                ChainNetwork::Mainnet => node_chain_name == "main",
+                ChainNetwork::Testnet => node_chain_name == "test",
+                ChainNetwork::Signet => node_chain_name == "signet",
+                ChainNetwork::Regtest => node_chain_name == "regtest",
+            };
+            if matches {
+                Json(CheckNetworkResponse {
+                    ok: true,
+                    node_chain: Some(node_chain_name),
+                    expected_network: expected,
+                    message: None,
+                })
+            } else {
+                let chain_for_msg = node_chain_name.clone();
+                Json(CheckNetworkResponse {
+                    ok: false,
+                    node_chain: Some(node_chain_name),
+                    expected_network: expected,
+                    message: Some(format!(
+                        "The bitcoind node at {url} reports chain \"{chain_for_msg}\", but this \
+                         deployment is configured for {expected}. These must match — the node \
+                         serves one blockchain and the cosigner can only verify transactions on \
+                         that same chain. \
+                         \n\nIf you are on Umbrel: the Bitcoin Core app is on \"{chain_for_msg}\", \
+                         so this app must also be on {chain_for_msg}. You cannot run it on \
+                         {expected} while the Bitcoin Core app serves {chain_for_msg}. \
+                         \n\nIf you are using Docker Compose: check that you are layering the \
+                         correct compose override (docker-compose.testnet.yml for testnet, \
+                         docker-compose.signet.yml for signet) and that COSIGNER_NETWORK in \
+                         your environment matches."
+                    )),
+                })
+            }
+        }
+        Ok(Err(msg)) => Json(CheckNetworkResponse {
+            ok: false,
+            node_chain: None,
+            expected_network: expected,
+            message: Some(format!(
+                "Could not verify the node's network: {msg}. The setup will still proceed, \
+                 but the network mismatch will be caught at startup if there is one."
+            )),
+        }),
+        Err(_) => Json(CheckNetworkResponse {
+            ok: false,
+            node_chain: None,
+            expected_network: expected,
+            message: Some(
+                "The network check timed out. This is normal if the node is still syncing \
+                 or starting up. The setup will proceed, and the network will be verified \
+                 when the service starts."
+                    .to_string(),
+            ),
+        }),
+    }
 }
 
 #[derive(Deserialize)]
@@ -550,7 +707,10 @@ fn build_answers(
         // describes the actual deployment, rather than carrying placeholders that would be
         // wrong if this struct were ever rendered in full.
         bitcoind_rpc_url: deployment.bitcoind_rpc_url.clone(),
-        bitcoind_auth: BitcoindAuthAnswer::UserPass(String::new(), String::new()),
+        bitcoind_auth: BitcoindAuthAnswer::UserPass(
+            deployment.bitcoind_rpc_user.clone(),
+            deployment.bitcoind_rpc_password.clone(),
+        ),
         bind_addr: deployment.bind_addr.clone(),
         gap_limit: 1000,
         ledger_db_path: deployment
@@ -792,6 +952,8 @@ mod tests {
             data_dir: PathBuf::from("/data"),
             bind_addr: "0.0.0.0:8080".to_string(),
             bitcoind_rpc_url: "http://10.21.21.8:8332".to_string(),
+            bitcoind_rpc_user: String::new(),
+            bitcoind_rpc_password: String::new(),
         }
     }
 

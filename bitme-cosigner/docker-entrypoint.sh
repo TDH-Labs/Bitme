@@ -42,7 +42,9 @@ EOF
         --data-dir "$DATA_DIR" \
         --bind "0.0.0.0:${COSIGNER_HTTP_PORT:-8080}" \
         --network "${APP_BITCOIN_NETWORK:-${COSIGNER_NETWORK:-signet}}" \
-        --bitcoind-rpc-url "${BITCOIND_RPC_URL:-}"
+        --bitcoind-rpc-url "${BITCOIND_RPC_URL:-}" \
+        --bitcoind-rpc-user "${BITCOIND_RPC_USER:-}" \
+        --bitcoind-rpc-password "${BITCOIND_RPC_PASSWORD:-}"
 fi
 
 if [ -z "${BITCOIND_RPC_URL:-}" ]; then
